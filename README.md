@@ -29,7 +29,7 @@ and saving an MP3.
 |---|---|
 | **Drum module** | Finds Yamaha DTX and Roland V-Drums modules by name and opens their ASIO driver automatically. Other USB-MIDI kits should work as plain MIDI inputs (use Pad mapping if the notes differ). |
 | **Drum VST3** | Scans the standard VST3 folder, recognises drum instruments (Superior Drummer, EZdrummer, Addictive Drums, SSD 5, BFD, MT Power Drum Kit …) and loads one automatically. You can add a plugin file or folder by hand. Each plugin keeps its own kit and settings. |
-| **Low latency** | Shows the estimated pad-to-ear latency and tells you which buffer setting to change. About 10 ms measured with a Yamaha DTX-PRO at 128 samples. |
+| **Low latency** | Shows the estimated pad-to-ear latency and tells you which buffer setting to change. About 11 ms measured with a Yamaha DTX-PRO at 128 samples. |
 | **Pad mapping** | For any e-drum kit: press a row (Kick, Snare, Hi-hat closed …), hit the pad, done. The app converts the notes your module sends into the standard General MIDI numbers your VST expects. Saved per module. |
 | **MIDI monitor** | Shows what each pad actually sends (note, velocity, hi-hat pedal, choke) so you can see why a pad plays the wrong sound. |
 | **Play along** | MP3 / WAV / FLAC. Waveform, seek, separate volume, EQ and compressor for drums and song. |
@@ -117,7 +117,7 @@ DAW는 드럼 한 번 치려는 데 쓰기엔 너무 무겁고 번거롭습니�
 쓰는 순서대로(① 드럼 연결 → ② 드럼 소리 → ③ 원곡 → ④ 볼륨 맞추기) 모았습니다.
 
 - 드럼 모듈(Yamaha·Roland 등)과 드럼 VST3를 저절로 찾아 연결, 직접 추가도 가능
-- 지연 시간 표시와 버퍼 안내(DTX-PRO, 128샘플에서 약 10ms)
+- 지연 시간 표시와 버퍼 안내(DTX-PRO, 128샘플에서 약 11ms)
 - 어떤 전자드럼이든 패드를 쳐서 맞추는 '패드 맞추기', 받은 신호를 보여 주는 '신호 보기'
 - 원곡(MP3·WAV·FLAC)에 맞춰 연주, 원곡 박자를 따라가는 메트로놈(2배·절반, 반 박·1/4박·5ms 조정), 원곡 드럼 빼기
 - 한 번에 녹음하고, 볼륨·타이밍·구간을 다듬어 MP3나 WAV로 저장
