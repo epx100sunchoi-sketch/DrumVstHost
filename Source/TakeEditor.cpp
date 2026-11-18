@@ -1,0 +1,775 @@
+#include "TakeEditor.h"
+#include "Widgets.h"
+
+namespace
+{
+constexpr int editorWidth = 860, pad = 24;
+constexpr int formatMp3 = 1, formatWav = 2;
+int rememberedFormat = formatMp3;   // 앱을 켜 둔 동안 마지막에 고른 완성본 형식(처음엔 MP3: 파일이 작다)
+
+juce::String sizeText (juce::int64 bytes)
+{
+    return juce::String ((double) bytes / (1024.0 * 1024.0), 1) + "MB";
+}
+
+juce::String signedMs (double value)
+{
+    const int v = juce::roundToInt (value);
+
+    if (v == 0)
+        return "0ms";
+
+    return (v > 0 ? "+" : "-") + juce::String (std::abs (v)) + "ms";
+}
+
+juce::String describeTake (const TakePlayer& take)
+{
+    juce::StringArray parts;
+    const auto& info = take.info;
+
+    if (info.recordedAt.toMilliseconds() > 0)
+    {
+        const auto t = info.recordedAt;
+        parts.add (juce::String (t.getMonth() + 1) + K ("월 ") + juce::String (t.getDayOfMonth()) + K ("일 ")
+                   + juce::String (t.getHours()).paddedLeft ('0', 2) + ":" + juce::String (t.getMinutes()).paddedLeft ('0', 2) + K (" 녹음"));
+    }
+
+    parts.add (clockText (take.getLengthSeconds()));
+
+    if (info.songName.isNotEmpty())
+        parts.add (info.songName);
+
+    return parts.joinIntoString ("  ·  ");
+}
+} // namespace
+
+//==============================================================================
+// 이름 · [−] 슬라이더 [+] · 값. 버튼을 누르고 있으면 계속 바뀐다.
+class StepSlider final : public juce::Component
+{
+public:
+    StepSlider (const juce::String& nameToUse, double minimum, double maximum, double buttonStep, double defaultValue,
+                bool bipolar, std::function<juce::String (double)> formatter)
+        : name (nameToUse), step (buttonStep), format (std::move (formatter))
+    {
+        slider.setSliderStyle (juce::Slider::LinearHorizontal);
+        slider.setTextBoxStyle (juce::Slider::NoTextBox, false, 0, 0);
+        slider.setRange (minimum, maximum, 1.0);
+        slider.setDoubleClickReturnValue (true, defaultValue);
+        slider.setMouseClickGrabsKeyboardFocus (false);
+        slider.setWantsKeyboardFocus (false);
+
+        if (bipolar)
+            slider.getProperties().set ("bipolar", true);
+
+        slider.onValueChange = [this]
+        {
+            repaint();
+
+            if (onChange != nullptr)
+                onChange (slider.getValue());
+        };
+
+        addAndMakeVisible (slider);
+
+        minus.setButtonText (K ("−"));
+        plus.setButtonText ("+");
+
+        for (auto* button : { &minus, &plus })
+        {
+            styleButton (*button);
+            button->setRepeatSpeed (400, 70);
+            addAndMakeVisible (*button);
+        }
+
+        minus.onClick = [this] { slider.setValue (slider.getValue() - step, juce::sendNotificationSync); };
+        plus.onClick  = [this] { slider.setValue (slider.getValue() + step, juce::sendNotificationSync); };
+    }
+
+    std::function<void (double)> onChange;
+
+    double getValue() const                                     { return slider.getValue(); }
+    void setValue (double value, juce::NotificationType notify) { slider.setValue (value, notify); repaint(); }
+
+    void setTooltips (const juce::String& sliderTip, const juce::String& minusTip, const juce::String& plusTip)
+    {
+        slider.setTooltip (sliderTip);
+        minus.setTooltip (minusTip);
+        plus.setTooltip (plusTip);
+    }
+
+    void resized() override
+    {
+        auto area = getLocalBounds();
+        nameArea = area.removeFromLeft (64);
+        valueArea = area.removeFromRight (70);
+        area.removeFromRight (10);
+        minus.setBounds (area.removeFromLeft (36).withSizeKeepingCentre (36, 32));
+        area.removeFromLeft (12);
+        plus.setBounds (area.removeFromRight (36).withSizeKeepingCentre (36, 32));
+        area.removeFromRight (12);
+        slider.setBounds (area);
+    }
+
+    void paint (juce::Graphics& g) override
+    {
+        g.setFont (ui::font (16.0f));
+        g.setColour (ui::text);
+        g.drawText (name, nameArea, juce::Justification::centredLeft);
+
+        g.setFont (ui::font (16.0f));
+        g.drawText (format (slider.getValue()), valueArea, juce::Justification::centredRight);
+    }
+
+private:
+    juce::String name;
+    double step;
+    std::function<juce::String (double)> format;
+    juce::Slider slider;
+    juce::TextButton minus, plus;
+    juce::Rectangle<int> nameArea, valueArea;
+};
+
+//==============================================================================
+// 원곡(위)·드럼(아래) 파형. 볼륨을 바꾸면 파형 크기도 바뀐다.
+// 양 끝의 손잡이를 끌어 남길 구간을 정하고, 나머지를 누르면 그 위치로 이동한다.
+class TakeWaveform final : public juce::Component
+{
+public:
+    explicit TakeWaveform (TakePlayer& takeToUse) : take (takeToUse)
+    {
+        setMouseCursor (juce::MouseCursor::PointingHandCursor);
+    }
+
+    std::function<void()> onRangeChanged;
+    std::function<void (juce::int64)> onSeek;
+
+    void updatePosition()
+    {
+        const auto pos = take.position.load();
+
+        if (pos != shownPosition)
+        {
+            shownPosition = pos;
+            repaint();
+        }
+    }
+
+    void paint (juce::Graphics& g) override
+    {
+        drawRuler (g);
+
+        const auto lanes = getLanes();
+        g.setColour (ui::track);
+        g.fillRoundedRectangle (lanes.toFloat(), 6.0f);
+
+        const auto songLane = lanes.withHeight (lanes.getHeight() / 2);
+        const auto drumLane = lanes.withTrimmedTop (lanes.getHeight() / 2);
+
+        drawPeaks (g, songLane.reduced (0, 7), take.getSongPeaks(), take.songGain.load(), juce::Colour (0xff7d8593));
+        drawPeaks (g, drumLane.reduced (0, 7), take.getDrumPeaks(), take.drumGain.load(), ui::accent);
+
+        g.setColour (ui::line);
+        g.fillRect (lanes.getX() + 1, songLane.getBottom(), lanes.getWidth() - 2, 1);
+
+        g.setFont (ui::font (12.5f));
+        g.setColour (ui::textDim);
+        g.drawText (K ("원곡"), songLane.reduced (12, 5), juce::Justification::topLeft);
+        g.drawText (K ("드럼"), drumLane.reduced (12, 5), juce::Justification::topLeft);
+
+        // 남기지 않을 부분은 어둡게
+        const float xs = xForSample (take.trimStart.load());
+        const float xe = xForSample (take.trimEnd.load());
+        g.setColour (ui::bg.withAlpha (0.62f));
+        g.fillRect (juce::Rectangle<float> ((float) lanes.getX(), (float) lanes.getY(), xs - (float) lanes.getX(), (float) lanes.getHeight()));
+        g.fillRect (juce::Rectangle<float> (xe, (float) lanes.getY(), (float) lanes.getRight() - xe, (float) lanes.getHeight()));
+
+        drawHandle (g, xs, lanes, true);
+        drawHandle (g, xe, lanes, false);
+
+        const float xp = xForSample (take.position.load());
+        g.setColour (juce::Colours::white);
+        g.fillRect (xp - 1.0f, (float) lanes.getY() + 3.0f, 2.0f, (float) lanes.getHeight() - 6.0f);
+    }
+
+    void mouseMove (const juce::MouseEvent& e) override
+    {
+        setMouseCursor (hitHandle ((float) e.x) != Drag::none ? juce::MouseCursor::LeftRightResizeCursor
+                                                               : juce::MouseCursor::PointingHandCursor);
+    }
+
+    void mouseDown (const juce::MouseEvent& e) override
+    {
+        drag = hitHandle ((float) e.x);
+
+        if (drag == Drag::none)
+        {
+            drag = Drag::seek;
+            seekTo ((float) e.x);
+        }
+    }
+
+    void mouseDrag (const juce::MouseEvent& e) override
+    {
+        const auto x = (float) e.x;
+        const juce::int64 minLength = juce::jmin (take.getLength(), (juce::int64) take.getSampleRate());
+
+        if (drag == Drag::start)
+        {
+            take.trimStart = juce::jlimit<juce::int64> (0, take.trimEnd.load() - minLength, sampleForX (x));
+
+            if (take.position.load() < take.trimStart.load())
+                take.seek (take.trimStart.load());
+        }
+        else if (drag == Drag::end)
+        {
+            take.trimEnd = juce::jlimit<juce::int64> (take.trimStart.load() + minLength, take.getLength(), sampleForX (x));
+
+            if (take.position.load() >= take.trimEnd.load())
+                take.seek (take.trimStart.load());
+        }
+        else if (drag == Drag::seek)
+        {
+            seekTo (x);
+            return;
+        }
+
+        repaint();
+
+        if (onRangeChanged != nullptr)
+            onRangeChanged();
+    }
+
+    void mouseUp (const juce::MouseEvent&) override
+    {
+        drag = Drag::none;
+    }
+
+private:
+    enum class Drag { none, start, end, seek };
+    static constexpr int rulerHeight = 22;
+
+    juce::Rectangle<int> getLanes() const      { return getLocalBounds().withTrimmedTop (rulerHeight); }
+    juce::Rectangle<int> getInner() const      { return getLanes().reduced (10, 0); }
+
+    float xForSample (juce::int64 sample) const
+    {
+        const auto inner = getInner();
+        return (float) inner.getX() + (float) inner.getWidth() * (float) ((double) sample / (double) juce::jmax<juce::int64> (1, take.getLength()));
+    }
+
+    juce::int64 sampleForX (float x) const
+    {
+        const auto inner = getInner();
+        const double p = juce::jlimit (0.0, 1.0, (x - (float) inner.getX()) / (double) juce::jmax (1, inner.getWidth()));
+        return (juce::int64) (p * (double) take.getLength());
+    }
+
+    Drag hitHandle (float x) const
+    {
+        const float xs = xForSample (take.trimStart.load());
+        const float xe = xForSample (take.trimEnd.load());
+        const float ds = std::abs (x - xs), de = std::abs (x - xe);
+
+        if (juce::jmin (ds, de) > 10.0f)
+            return Drag::none;
+
+        return de <= ds ? Drag::end : Drag::start;
+    }
+
+    void seekTo (float x)
+    {
+        if (onSeek != nullptr)
+            onSeek (sampleForX (x));
+    }
+
+    void drawRuler (juce::Graphics& g) const
+    {
+        const double seconds = take.getLengthSeconds();
+        const auto inner = getInner();
+
+        if (seconds <= 0.0)
+            return;
+
+        const double pixelsPerSecond = inner.getWidth() / seconds;
+        double stepSeconds = 600.0;
+
+        for (double candidate : { 1.0, 2.0, 5.0, 10.0, 15.0, 20.0, 30.0, 60.0, 120.0, 300.0 })
+        {
+            if (candidate * pixelsPerSecond >= 70.0)
+            {
+                stepSeconds = candidate;
+                break;
+            }
+        }
+
+        g.setFont (ui::font (12.5f));
+
+        for (double t = 0.0; t <= seconds + 0.001; t += stepSeconds)
+        {
+            const float x = (float) inner.getX() + (float) (t * pixelsPerSecond);
+            g.setColour (ui::outline);
+            g.fillRect (x, (float) rulerHeight - 6.0f, 1.0f, 6.0f);
+            g.setColour (ui::textDim);
+            g.drawText (clockText (t), juce::Rectangle<float> (x + 3.0f, 0.0f, 60.0f, (float) rulerHeight - 4.0f),
+                        juce::Justification::centredLeft, false);
+        }
+    }
+
+    void drawPeaks (juce::Graphics& g, juce::Rectangle<int> area, const std::vector<float>& peaks, float gain, juce::Colour colour) const
+    {
+        const auto inner = getInner();
+        const int bins = (int) peaks.size();
+
+        if (bins == 0 || inner.getWidth() <= 0)
+            return;
+
+        const float centre = (float) area.getCentreY();
+        const float half = (float) area.getHeight() * 0.5f;
+        g.setColour (colour);
+
+        for (int x = 0; x < inner.getWidth(); ++x)
+        {
+            const int from = (int) ((juce::int64) x * bins / inner.getWidth());
+            const int to = juce::jmax (from + 1, (int) ((juce::int64) (x + 1) * bins / inner.getWidth()));
+            float peak = 0.0f;
+
+            for (int b = from; b < juce::jmin (to, bins); ++b)
+                peak = juce::jmax (peak, peaks[(size_t) b]);
+
+            const float h = juce::jmax (0.5f, juce::jmin (1.0f, peak * gain) * half);
+            g.fillRect ((float) (inner.getX() + x), centre - h, 1.0f, h * 2.0f);
+        }
+    }
+
+    static void drawHandle (juce::Graphics& g, float x, juce::Rectangle<int> lanes, bool isStart)
+    {
+        g.setColour (ui::text);
+        g.fillRect (x - 1.0f, (float) lanes.getY(), 2.0f, (float) lanes.getHeight());
+
+        const juce::Rectangle<float> tab (isStart ? x - 1.0f : x - 11.0f, (float) lanes.getY(), 12.0f, 26.0f);
+        g.fillRoundedRectangle (tab, 3.0f);
+
+        g.setColour (ui::bg.withAlpha (0.7f));
+
+        for (int i = -1; i <= 1; ++i)
+            g.fillRect (tab.getCentreX() - 3.0f, tab.getCentreY() + (float) i * 4.0f - 0.5f, 6.0f, 1.0f);
+    }
+
+    TakePlayer& take;
+    Drag drag = Drag::none;
+    juce::int64 shownPosition = -1;
+};
+
+//==============================================================================
+TakeEditor::TakeEditor (Engine& engineToUse, std::shared_ptr<TakePlayer> takeToUse)
+    : engine (engineToUse), take (std::move (takeToUse))
+{
+    setOpaque (true);
+    setWantsKeyboardFocus (true);
+
+    const auto& info = take->info;
+    const float drumStart = info.edited ? info.editDrum : info.drumVolume;
+    const float songStart = info.edited ? info.editSong : info.songVolume;
+
+    // 파형과 재생
+    waveform = std::make_unique<TakeWaveform> (*take);
+    waveform->onSeek = [this] (juce::int64 sample)
+    {
+        const auto start = take->trimStart.load();
+        take->seek (juce::jlimit (start, juce::jmax (start, take->trimEnd.load() - 1), sample));
+    };
+    waveform->onRangeChanged = [this] { rangeChanged(); };
+    addAndMakeVisible (*waveform);
+
+    playButton = std::make_unique<IconButton>();
+    playButton->setContent (IconButton::Icon::play, K ("들어보기"));
+    playButton->setTooltip (K ("지금 값으로 섞은 소리를 들어 봅니다. (스페이스바)"));
+    playButton->onClick = [this] { togglePlay(); };
+    addAndMakeVisible (*playButton);
+
+    rewindButton = std::make_unique<IconButton>();
+    rewindButton->setContent (IconButton::Icon::rewind, K ("처음으로"));
+    rewindButton->setTooltip (K ("남길 구간의 처음으로 돌아갑니다."));
+    rewindButton->onClick = [this] { take->seek (take->trimStart.load()); };
+    addAndMakeVisible (*rewindButton);
+
+    styleLabel (timeLabel, 15.0f, ui::text);
+    addAndMakeVisible (timeLabel);
+
+    styleLabel (rangeLabel, 14.0f, ui::textDim);
+    rangeLabel.setJustificationType (juce::Justification::centredRight);
+    addAndMakeVisible (rangeLabel);
+
+    resetRangeButton.setButtonText (K ("구간 원래대로"));
+    styleButton (resetRangeButton, K ("앞뒤로 자른 것을 없애고 녹음 전체를 남깁니다."));
+    resetRangeButton.onClick = [this]
+    {
+        take->trimStart = 0;
+        take->trimEnd = take->getLength();
+        waveform->repaint();
+        rangeChanged();
+    };
+    addAndMakeVisible (resetRangeButton);
+
+    // 볼륨
+    const auto volumeText = [] (double v) { return juce::String (juce::roundToInt (v)); };
+
+    drumVolume = std::make_unique<StepSlider> (K ("드럼"), 0.0, 100.0, 1.0, std::round (drumStart * 100.0f), false, volumeText);
+    drumVolume->setValue (std::round (drumStart * 100.0f), juce::dontSendNotification);
+    drumVolume->setTooltips (K ("드럼 볼륨입니다. 처음 값은 녹음할 때와 같습니다. 더블클릭하면 처음 값으로 돌아갑니다."),
+                             K ("드럼을 조금 작게"), K ("드럼을 조금 크게"));
+    drumVolume->onChange = [this] (double) { applyVolumes(); };
+    addAndMakeVisible (*drumVolume);
+
+    songVolume = std::make_unique<StepSlider> (K ("원곡"), 0.0, 100.0, 1.0, std::round (songStart * 100.0f), false, volumeText);
+    songVolume->setValue (std::round (songStart * 100.0f), juce::dontSendNotification);
+    songVolume->setTooltips (K ("원곡 볼륨입니다. 처음 값은 녹음할 때와 같습니다. 더블클릭하면 처음 값으로 돌아갑니다."),
+                             K ("원곡을 조금 작게"), K ("원곡을 조금 크게"));
+    songVolume->onChange = [this] (double) { applyVolumes(); };
+    addAndMakeVisible (*songVolume);
+
+    // 타이밍
+    timing = std::make_unique<StepSlider> (K ("드럼"), -150.0, 150.0, 1.0, 0.0, true, signedMs);
+    timing->setValue (info.edited ? (double) info.offsetMs : 0.0, juce::dontSendNotification);
+    timing->setTooltips (K ("드럼 소리 전체를 앞(−)이나 뒤(+)로 옮깁니다. 더블클릭하면 0으로 돌아갑니다."),
+                         K ("드럼을 1ms 앞으로(빠르게)"), K ("드럼을 1ms 뒤로(늦게)"));
+    timing->onChange = [this] (double) { applyTiming(); };
+    addAndMakeVisible (*timing);
+
+    if (info.latencyMs > 0.5f)
+    {
+        const int pull = juce::roundToInt (info.latencyMs);
+        latencyPullMs = pull;
+        latencyButton.setButtonText (K ("지연만큼 당기기 (") + signedMs (-pull) + ")");
+        styleButton (latencyButton, K ("녹음할 때 드럼 소리는 치고 나서 약 ") + juce::String (pull)
+                                        + K ("ms 뒤에 났습니다. 들리는 원곡에 맞춰 쳤다면 그만큼 드럼이 늦게 녹음됩니다."));
+        latencyButton.onClick = [this, pull] { timing->setValue (-pull, juce::sendNotificationSync); };
+        addAndMakeVisible (latencyButton);
+    }
+
+    // 저장
+    styleLabel (statusLabel, 14.0f, ui::textDim);
+    addAndMakeVisible (statusLabel);
+
+    openFolderButton.setButtonText (K ("폴더 열기"));
+    styleButton (openFolderButton, K ("이 녹음의 파일이 있는 폴더를 엽니다."));
+    openFolderButton.onClick = [this]
+    {
+        if (lastExport.existsAsFile())
+            lastExport.revealToUser();
+        else
+            take->getFolder().startAsProcess();
+    };
+    addAndMakeVisible (openFolderButton);
+
+    formatBox.addItem (K ("MP3 (작은 파일)"), formatMp3);
+    formatBox.addItem (K ("WAV (원본 음질)"), formatWav);
+    formatBox.setSelectedId (rememberedFormat, juce::dontSendNotification);
+    formatBox.setTooltip (K ("완성본 파일 형식입니다. MP3(") + juce::String (TakePlayer::mp3Kbps)
+                          + K ("kbps)는 WAV의 약 7분의 1 크기라 올리거나 보내기 좋습니다. 다시 편집하거나 원본 음질 그대로 남기려면 WAV를 고르세요."));
+    formatBox.onChange = [this] { rememberedFormat = formatBox.getSelectedId(); };
+    addAndMakeVisible (formatBox);
+
+    saveButton.setButtonText (K ("완성본 저장"));
+    saveButton.setColour (juce::TextButton::buttonColourId, ui::accent);
+    saveButton.setColour (juce::TextButton::textColourOffId, ui::onAccent);
+    styleButton (saveButton, K ("지금 값으로 섞어서 남길 구간만 저장합니다. 파일 형식(MP3·WAV)은 왼쪽 상자에서 고릅니다."));
+    saveButton.onClick = [this] { exportFinal(); };
+    addAndMakeVisible (saveButton);
+
+    // 처음 값 적용
+    applyVolumes();
+    applyTiming();
+
+    if (info.edited && info.trimEnd > info.trimStart)
+    {
+        take->trimStart = juce::jlimit<juce::int64> (0, take->getLength(), info.trimStart);
+        take->trimEnd = juce::jlimit<juce::int64> (take->trimStart.load() + 1, take->getLength(), info.trimEnd);
+    }
+
+    take->seek (take->trimStart.load());
+    rangeChanged();
+    setStatus (K ("볼륨과 타이밍을 맞춘 뒤 '완성본 저장'을 누르세요."), false);
+
+    setSize (editorWidth, 612);
+    startTimerHz (30);
+}
+
+TakeEditor::~TakeEditor()
+{
+    stopTimer();
+    take->playing = false;
+}
+
+void TakeEditor::stopPreview()
+{
+    take->playing = false;
+}
+
+void TakeEditor::saveEditState()
+{
+    auto& info = take->info;
+    info.edited = true;
+    info.editDrum = (float) (drumVolume->getValue() / 100.0);
+    info.editSong = (float) (songVolume->getValue() / 100.0);
+    info.offsetMs = juce::roundToInt (timing->getValue());
+    info.trimStart = take->trimStart.load();
+    info.trimEnd = take->trimEnd.load();
+
+    if (info.sampleRate <= 0.0)
+        info.sampleRate = take->getSampleRate();
+
+    if (info.lengthSamples <= 0)
+        info.lengthSamples = take->getLength();
+
+    info.save (take->getFolder());
+}
+
+void TakeEditor::runSnapshotDemo()
+{
+    if (latencyPullMs > 0)
+        timing->setValue (-latencyPullMs, juce::sendNotificationSync);
+
+    take->trimStart = take->getLength() * 8 / 100;
+    take->trimEnd = take->getLength() * 92 / 100;
+    take->seek (take->getLength() * 35 / 100);
+    drumVolume->setValue (90.0, juce::sendNotificationSync);
+    rangeChanged();
+    waveform->repaint();
+}
+
+//==============================================================================
+void TakeEditor::applyVolumes()
+{
+    const auto toGain = [] (double v) { const float x = (float) juce::jlimit (0.0, 1.0, v / 100.0); return x * x; };
+    take->drumGain = toGain (drumVolume->getValue());
+    take->songGain = toGain (songVolume->getValue());
+    waveform->repaint();
+}
+
+void TakeEditor::applyTiming()
+{
+    take->offsetSamples = juce::roundToInt (timing->getValue() * take->getSampleRate() / 1000.0);
+}
+
+void TakeEditor::rangeChanged()
+{
+    const double rate = take->getSampleRate();
+    const auto start = take->trimStart.load(), end = take->trimEnd.load();
+    const bool whole = start <= 0 && end >= take->getLength();
+
+    rangeLabel.setText (whole ? K ("파형 양 끝의 손잡이를 끌면 앞뒤를 자를 수 있습니다")
+                              : K ("남길 구간 ") + clockText ((double) start / rate) + " ~ " + clockText ((double) end / rate)
+                                    + "  (" + clockText ((double) (end - start) / rate) + ")",
+                        juce::dontSendNotification);
+    resetRangeButton.setEnabled (! whole);
+}
+
+void TakeEditor::togglePlay()
+{
+    if (take->playing.load())
+    {
+        take->playing = false;
+        return;
+    }
+
+    if (engine.isRecording())
+    {
+        setStatus (K ("녹음하는 동안에는 들어볼 수 없습니다."), true);
+        return;
+    }
+
+    if (! engine.isAudioDeviceOpen())
+    {
+        setStatus (K ("소리 장치가 열려 있지 않습니다. 메인 창의 '소리 장치 설정'을 확인하세요."), true);
+        return;
+    }
+
+    const auto pos = take->position.load();
+
+    if (pos < take->trimStart.load() || pos >= take->trimEnd.load() - 1)
+        take->seek (take->trimStart.load());
+
+    engine.pause();   // 메인 창의 원곡 재생과 겹치지 않게
+    take->playing = true;
+}
+
+void TakeEditor::exportFinal()
+{
+    const auto folder = take->getFolder();
+    const bool asMp3 = formatBox.getSelectedId() != formatWav;
+    const auto format = asMp3 ? TakePlayer::ExportFormat::mp3 : TakePlayer::ExportFormat::wav24;
+    const auto file = folder.getNonexistentChildFile (folder.getFileName() + lang::pick (" 완성", " final"), asMp3 ? ".mp3" : ".wav", true);
+
+    saveButton.setEnabled (false);
+    setStatus (K ("저장하는 중…"), false);
+
+    juce::Component::SafePointer<TakeEditor> safe (this);
+    callOnceAfterDelay (30, [safe, file, format]
+    {
+        if (safe == nullptr)
+            return;
+
+        juce::String error;
+
+        if (safe->take->exportMix (file, format, error))
+        {
+            safe->lastExport = file;
+            safe->saveEditState();
+            safe->setStatus (K ("저장했습니다: ") + file.getFileName() + " (" + sizeText (file.getSize()) + ")", false);
+        }
+        else
+        {
+            safe->setStatus (error, true);
+        }
+
+        safe->saveButton.setEnabled (true);
+    });
+}
+
+void TakeEditor::setStatus (const juce::String& text, bool isError)
+{
+    statusLabel.setColour (juce::Label::textColourId, isError ? ui::red : ui::textDim);
+    statusLabel.setText (text, juce::dontSendNotification);
+}
+
+//==============================================================================
+void TakeEditor::timerCallback()
+{
+    const bool playing = take->playing.load();
+
+    if (playing != shownPlaying)
+    {
+        shownPlaying = playing;
+        playButton->setContent (playing ? IconButton::Icon::pause : IconButton::Icon::play,
+                                playing ? K ("멈추기") : K ("들어보기"));
+    }
+
+    const double rate = take->getSampleRate();
+    const auto text = clockText ((double) take->position.load() / rate) + " / " + clockText (take->getLengthSeconds());
+
+    if (text != shownTime)
+    {
+        shownTime = text;
+        timeLabel.setText (text, juce::dontSendNotification);
+    }
+
+    waveform->updatePosition();
+}
+
+bool TakeEditor::keyPressed (const juce::KeyPress& key)
+{
+    if (key == juce::KeyPress::spaceKey)
+    {
+        togglePlay();
+        return true;
+    }
+
+    return false;
+}
+
+void TakeEditor::visibilityChanged()
+{
+    if (isShowing())
+        grabKeyboardFocus();
+}
+
+//==============================================================================
+void TakeEditor::paint (juce::Graphics& g)
+{
+    g.fillAll (ui::bg);
+
+    g.setColour (ui::text);
+    g.setFont (ui::font (19.0f, true));
+    g.drawText (K ("녹음 다듬기"), headerArea, juce::Justification::centredLeft);
+
+    g.setColour (ui::textDim);
+    g.setFont (ui::font (14.0f));
+    g.drawText (describeTake (*take), headerArea, juce::Justification::centredRight);
+
+    g.setColour (ui::line);
+
+    for (int y : dividers)
+        g.fillRect (0, y, getWidth(), 1);
+
+    g.setColour (ui::text);
+    g.setFont (ui::font (17.0f, true));
+    g.drawText (K ("볼륨 맞추기"), volumeTitleArea, juce::Justification::centredLeft);
+    g.drawText (K ("타이밍 맞추기"), timingTitleArea, juce::Justification::centredLeft);
+
+    g.setColour (ui::textDim);
+    g.setFont (ui::font (14.0f));
+    g.drawText (K ("드럼이 원곡보다 늦게(밀려) 들리면 − 쪽으로, 급하게(당겨) 들리면 + 쪽으로 옮기세요."),
+                hintArea, juce::Justification::centredLeft);
+}
+
+void TakeEditor::resized()
+{
+    const int width = getWidth() - pad * 2;
+    int y = 14;
+
+    headerArea = { pad, y, width, 32 };
+    y += 32 + 10;
+
+    waveform->setBounds (pad, y, width, 150);
+    y += 150 + 10;
+
+    {
+        juce::Rectangle<int> row (pad, y, width, 38);
+        playButton->setBounds (row.removeFromLeft (124));
+        row.removeFromLeft (8);
+        rewindButton->setBounds (row.removeFromLeft (116));
+        row.removeFromLeft (14);
+        timeLabel.setBounds (row.removeFromLeft (110));
+        resetRangeButton.setBounds (row.removeFromRight (124));
+        row.removeFromRight (12);
+        rangeLabel.setBounds (row);
+    }
+
+    y += 38 + 14;
+    dividers[0] = y;
+    y += 14;
+
+    volumeTitleArea = { pad, y, width, 24 };
+    y += 24 + 6;
+    drumVolume->setBounds (pad, y, width, 40);
+    y += 44;
+    songVolume->setBounds (pad, y, width, 40);
+    y += 40 + 12;
+
+    dividers[1] = y;
+    y += 14;
+
+    timingTitleArea = { pad, y, width, 24 };
+    y += 24 + 6;
+    timing->setBounds (pad, y, width, 40);
+    y += 40 + 6;
+
+    {
+        juce::Rectangle<int> row (pad, y, width, 32);
+
+        if (latencyButton.isVisible())
+        {
+            latencyButton.setBounds (row.removeFromRight (196));
+            row.removeFromRight (12);
+        }
+
+        hintArea = row;
+    }
+
+    y += 32 + 12;
+    dividers[2] = y;
+    y += 14;
+
+    {
+        juce::Rectangle<int> row (pad, y, width, 40);
+        saveButton.setBounds (row.removeFromRight (150));
+        row.removeFromRight (8);
+        formatBox.setBounds (row.removeFromRight (150).withSizeKeepingCentre (150, 34));
+        row.removeFromRight (8);
+        openFolderButton.setBounds (row.removeFromRight (100));
+        row.removeFromRight (12);
+        statusLabel.setBounds (row);
+    }
+}

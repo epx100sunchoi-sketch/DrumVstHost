@@ -1,0 +1,188 @@
+#pragma once
+
+#include <JuceHeader.h>
+#include "DrumModules.h"
+#include "Engine.h"
+#include "Look.h"
+#include "PadMap.h"
+
+class WaveformView;
+class ChannelRow;
+class IconButton;
+class ToolWindow;
+class TakeEditor;
+class ProcessJob;
+
+//==============================================================================
+// 화면 전체. 위에서 아래로 ① 드럼 연결 → ② 드럼 소리 → ③ 원곡 → ④ 볼륨 맞추기 순서다.
+class MainComponent final : public juce::Component,
+                            public juce::FileDragAndDropTarget,
+                            private juce::Timer
+{
+public:
+    static constexpr int windowWidth = 860;
+
+    MainComponent (Engine&, juce::PropertiesFile&);
+    ~MainComponent() override;
+
+    void restoreSession();                       // 지난번에 쓰던 플러그인과 곡을 다시 불러온다
+    void saveSession();
+    void setAutosave (bool shouldSave) noexcept  { autosave = shouldSave; }
+    void saveAllNow();                           // 화면·엔진 설정을 지금 바로 파일에 쓴다(autosave일 때만)
+    void setToneOpen (bool drumOpen, bool songOpen);
+    void openPluginWindow()                      { showPluginWindow(); }
+    void openSong (const juce::File& file)       { loadSong (file); }
+    void openTakeEditor (const juce::File& takeFolder);
+    TakeEditor* getTakeEditor() const noexcept   { return takeEditor; }
+    void setRecordFolder (const juce::File& folder);
+    juce::Component* openPadMapForTest();        // 확인용: 패드 맞추기 창을 열고(예시 값을 넣어) 그 내용을 돌려준다
+    void startRecordingForTest();                // 확인용: 녹음 버튼을 누른 것과 같다
+    void stopRecordingForTest();
+
+    void paint (juce::Graphics&) override;
+    void resized() override;
+    bool keyPressed (const juce::KeyPress&) override;
+    void mouseUp (const juce::MouseEvent&) override;
+
+    bool isInterestedInFileDrag (const juce::StringArray& files) override;
+    void filesDropped (const juce::StringArray& files, int x, int y) override;
+
+private:
+    void timerCallback() override;
+    void slowRefresh();
+    int getIdealHeight() const;
+    void updateEnabledStates();
+
+    // ① 소리 장치와 지연
+    void refreshBufferControls (bool force);
+    void bufferChosen();
+    void openDriverPanel();
+    juce::String getLatencyHint (juce::Colour& colour) const;
+    void showSettings();
+
+    // ② 드럼 소리
+    void populatePluginBox();
+    void syncPluginBox();
+    void pluginChosen();
+    void browseForPlugin();
+    void browseForPluginFolder();
+    void showRemovePluginMenu();
+    void startLoadingPlugin (const juce::String& path, bool openWindowAfter);
+    void finishLoadingPlugin (const juce::String& path, bool openWindowAfter);
+    void showPluginWindow();
+    void setDrumStatus (const juce::String& text, bool isError);
+
+    // ③ 원곡과 녹음
+    void browseForSong();
+    void loadSong (const juce::File&);
+    void togglePlay();
+    void toggleRecording();
+    void finishRecording();
+    void showRecordingsMenu();
+    void browseForTake();
+    void closeTakeEditor();
+    void setSongStatus (const juce::String& text, bool isError, int secondsToShow = 0);
+
+    // ③ 연습 도구: 메트로놈(원곡 박자 분석), 원곡 드럼 빼기(분리)
+    void prepareSongTools();
+    void metronomeClicked();
+    void songDrumsClicked();
+    void startBeatAnalysis();
+    void finishBeatAnalysis (bool ok, const juce::String& output);
+    void startSeparation();
+    void finishSeparation (bool ok, const juce::String& output);
+    void applyStems();
+    void ensureAnalysisCopy (std::function<void (bool, const juce::String&)> then);
+    bool showBeatMap();                          // 저장된 박자를 엔진에 넣는다. 파일이 망가졌으면 false
+    void refreshMetronomeStatus();
+    void showMetronomeMenu();
+
+    // 곡마다 기억하는 클릭 빠르기(1·2·0.5)·시점(ms)을 바꾸고 바로 적용한다.
+    struct MetronomeTweakValues
+    {
+        double speed = 1.0;
+        int offsetMs = 0;
+    };
+
+    void changeMetronomeTweak (std::function<void (MetronomeTweakValues&)> change);
+    void setToolStatus (juce::Label&, const juce::String& text, bool isError, const juce::String& details = {});
+    juce::File getAnalysisPython();
+
+    //==============================================================================
+    Engine& engine;
+    juce::PropertiesFile& settings;
+    juce::TooltipWindow tooltips { this, 700 };
+
+    juce::Rectangle<int> sections[4];
+    juce::Rectangle<int> midiRow, deviceRow, latencyRow, bufferTextArea, testLabelArea;
+
+    // ① 드럼 연결
+    juce::TextButton settingsButton, driverButton, monitorButton, padButton, languageButton;
+
+    // 패드 배치(모듈 음 번호 → 드럼 VST 음 번호). 연결된 MIDI 입력 이름마다 따로 기억한다.
+    PadMap padMap;
+    juce::String padMapDevice;
+    bool padMapLoaded = false;
+    juce::uint32 drumStatusHoldUntil = 0;   // 이 시각까지는 드럼 상태 글자를 모듈 안내로 바꾸지 않는다
+    void loadPadMapFor (const juce::String& device);
+    void applyPadMap (bool save);
+    void showPadMap();
+    juce::ComboBox bufferBox;
+    juce::Label latencyLabel;
+    juce::StringArray midiNames;
+    DrumModule connectedModule;            // MIDI 입력에서 알아본 드럼 모듈(Yamaha·Roland 등)
+    juce::String moduleAdvice;             // 연결 안내(예: Roland가 MIDI만 되는 모드)
+    juce::String deviceName, bufferSignature, bufferText, bufferError;
+    float latencyMs = -1.0f;
+    bool deviceOpen = false, ledLit = false, showingXrunWarning = false;
+    juce::uint32 lastNoteCount = 0, ledUntil = 0, xrunWarningUntil = 0, xrunGraceUntil = 0;
+    juce::int64 lastXruns = -1;   // 끊김으로 볼 일의 수(엔진의 getProblemCount)
+    juce::uint32 lastStreamStarts = 0;
+    juce::int64 ignoredRestarts = 0;   // 설정 창에서 사용자가 일으킨 장치 재시작(끊김으로 보지 않는다)
+    bool wasRecording = false;
+
+    // ② 드럼 소리
+    juce::ComboBox pluginBox;
+    juce::TextButton editorButton, kickButton, snareButton, hatButton;
+    juce::Label drumStatus;
+    std::vector<PluginEntry> pluginEntries;
+    juce::StringArray knownPluginPaths;    // 마지막으로 훑었을 때의 플러그인(새로 설치된 것을 알아채려고)
+    juce::String autoLoadNote;             // 저절로 불러온 플러그인 안내(불러오기가 끝나면 보여 준다)
+    bool loadingPlugin = false;
+    int pluginScanCounter = 0;
+    void checkForNewPlugins();
+
+    // ③ 원곡과 녹음
+    juce::TextButton openSongButton, recordingsButton;
+    juce::Label songName, timeLabel, songStatus;
+    std::unique_ptr<WaveformView> waveform;
+    std::unique_ptr<IconButton> playButton, rewindButton, recordButton;
+    juce::File recordFolder;
+    bool shownPlaying = false, recordStartedPlayback = false;
+    juce::uint32 recordStopAt = 0, songStatusUntil = 0;
+    juce::String shownTime;
+
+    // ③ 연습 도구
+    juce::TextButton metronomeButton, songDrumsButton;
+    juce::Slider metronomeVolume;
+    juce::Label metronomeStatus, songDrumsStatus;
+    std::unique_ptr<ProcessJob> beatJob, separationJob;
+    juce::File songCache;
+    std::vector<std::function<void (bool, const juce::String&)>> copyWaiters;
+    bool copyingOriginal = false, stemsPendingAfterRecording = false;
+    int songGeneration = 0;   // 곡을 바꾸면 늘린다. 이전 곡 작업의 결과는 버린다.
+    double beatBpm = 0.0;
+    double clickSpeed = 1.0;   // 지금 곡의 클릭 빠르기(곡 분석 폴더의 metronome.json)
+
+    // ④ 볼륨 맞추기
+    std::unique_ptr<ChannelRow> drumRow, songRow, masterRow;
+
+    std::unique_ptr<ToolWindow> pluginWindow, settingsWindow, takeWindow, monitorWindow, padWindow;
+    void showMidiMonitor();
+    TakeEditor* takeEditor = nullptr;
+    std::unique_ptr<juce::FileChooser> chooser;
+    int tick = 0;
+    bool autosave = false;
+
+    JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (MainComponent)
+};

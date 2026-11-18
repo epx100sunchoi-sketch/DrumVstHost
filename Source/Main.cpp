@@ -1,0 +1,1685 @@
+#include <JuceHeader.h>
+#include "Engine.h"
+#include "Look.h"
+#include "MainComponent.h"
+#include "DrumPlugins.h"
+#include "PadMap.h"
+#include "Platform.h"
+#include "SongTools.h"
+#include "TakeEditor.h"
+
+namespace
+{
+// JUCE가 제공하는 소리 장치 설정 화면의 영어 문구를 한국어로 바꾼다.
+const char* const koreanStrings = R"KO(language: Korean
+countries: kr
+
+"Audio device type:" = "오디오 방식:"
+"Device:" = "장치:"
+"Output:" = "출력 장치:"
+"Input:" = "입력 장치:"
+"Test" = "소리 테스트"
+"Plays a test tone" = "삑 소리를 내서 장치가 동작하는지 확인합니다"
+"Sample rate:" = "샘플 속도:"
+"Audio buffer size:" = "버퍼 크기:"
+"Control Panel" = "드라이버 설정"
+"Opens the device's own control panel" = "장치 드라이버의 설정 창을 엽니다"
+"Reset Device" = "장치 다시 시작"
+"Resets the audio interface - sometimes needed after changing a device's properties in its custom control panel" = "드라이버 설정을 바꾼 뒤 소리가 이상하면 눌러 주세요"
+"Active output channels:" = "사용할 출력:"
+"Active input channels:" = "사용할 입력:"
+"Show advanced settings..." = "고급 설정 보기..."
+"Error when trying to open audio device!" = "소리 장치를 열지 못했습니다"
+"(no audio output channels found)" = "(출력 채널이 없습니다)"
+"(no audio input channels found)" = "(입력 채널이 없습니다)"
+"none" = "없음"
+"OK" = "확인"
+"Cancel" = "취소"
+)KO";
+
+juce::String argAfter (const juce::StringArray& args, const juce::String& flag)
+{
+    const int index = args.indexOf (flag);
+    return index >= 0 && index + 1 < args.size() ? args[index + 1].unquoted() : juce::String();
+}
+
+juce::String dbText (float gain)
+{
+    return juce::String (juce::Decibels::gainToDecibels (gain, -120.0f), 1) + " dB";
+}
+
+// 메시지 스레드에서 fn을 실행하고 끝날 때까지 기다린다(점검 도구용).
+// 시간 제한을 두지 않는다: 먼저 돌아가 버리면 메시지 스레드가 나중에 이미 사라진 fn·done(과 fn이 잡은 지역 변수)을 쓴다.
+// 앱이 끝나는 중이라 보낸 일이 실행되지 않을 때만 포기한다.
+template <typename Fn>
+bool runOnMessageThread (Fn&& fn)
+{
+    juce::WaitableEvent done;
+
+    if (! juce::MessageManager::callAsync ([&fn, &done] { fn(); done.signal(); }))
+        return false;
+
+    while (! done.wait (500))
+    {
+        if (auto* mm = juce::MessageManager::getInstanceWithoutCreating(); mm == nullptr || mm->hasStopMessageBeenSent())
+            return false;
+    }
+
+    return true;
+}
+} // namespace
+
+//==============================================================================
+class MainWindow final : public juce::DocumentWindow
+{
+public:
+    MainWindow (Engine& engine, juce::PropertiesFile& settingsToUse)
+        : juce::DocumentWindow ("Drum VST Host", ui::bg,
+                                juce::DocumentWindow::closeButton | juce::DocumentWindow::minimiseButton),
+          settings (settingsToUse)
+    {
+        setUsingNativeTitleBar (true);
+        main = new MainComponent (engine, settings);
+        setContentOwned (main, true);
+        setResizable (false, false);
+
+        const int x = settings.getIntValue ("windowX", -100000);
+        const int y = settings.getIntValue ("windowY", -100000);
+        const auto screen = juce::Desktop::getInstance().getDisplays().getTotalBounds (true);
+
+        if (x != -100000 && screen.contains (juce::Rectangle<int> (x, y, 240, 120)))
+            setTopLeftPosition (x, y);
+        else
+            centreWithSize (getWidth(), getHeight());
+
+        if (auto* peer = getPeer())
+            setDarkTitleBar (peer->getNativeHandle());
+
+        setVisible (true);
+    }
+
+    void closeButtonPressed() override
+    {
+        juce::JUCEApplication::getInstance()->systemRequestedQuit();
+    }
+
+    MainComponent& getMain() noexcept { return *main; }
+
+    void savePosition()
+    {
+        if (isMinimised())   // 내려 둔 창의 좌표는 화면 밖이다
+            return;
+
+        settings.setValue ("windowX", getX());
+        settings.setValue ("windowY", getY());
+    }
+
+private:
+    juce::PropertiesFile& settings;
+    MainComponent* main = nullptr;
+};
+
+//==============================================================================
+// 소리 장치 없이 엔진 전체(플러그인 → 믹서 → 녹음 → 다듬기 저장)를 돌려 보고 결과를 파일로 남긴다.
+//   DrumVstHost.exe --selftest 결과.txt [--plugin 경로] [--settle 밀리초]
+//   "<결과 파일>.state-in" 파일이 있으면 그 상태로 플러그인을 불러온다.
+class SelfTest final : private juce::Thread
+{
+public:
+    // savedSettings가 있으면 거기 저장된 플러그인 상태(킷)를 쓴다.
+    SelfTest (const juce::File& reportFile, const juce::String& pluginOverride, int settleMsToUse, juce::PropertiesFile* savedSettings)
+        : juce::Thread ("selftest"), report (reportFile), settleMs (settleMsToUse)
+    {
+        engine = std::make_unique<Engine> (false, savedSettings);
+        engine->prepareOffline (sampleRate, blockSize);
+
+        log ("JUCE " + juce::SystemStats::getJUCEVersion());
+
+        for (const auto& device : juce::MidiInput::getAvailableDevices())
+            log ("midi-in: " + device.name);
+
+        for (auto* type : engine->deviceManager.getAvailableDeviceTypes())
+        {
+            type->scanForDevices();
+            log ("audio-out [" + type->getTypeName() + "]: " + type->getDeviceNames (false).joinIntoString (" | "));
+        }
+
+        const auto found = engine->findInstalledPlugins();
+
+        for (const auto& entry : found)
+            log ("vst3: " + entry.name + (entry.isDrum ? " [drum, rank " + juce::String (entry.rank) + "]" : juce::String()) + " @ " + entry.path);
+
+        testDrumKnowledge();
+
+        auto path = pluginOverride;
+
+        if (path.isEmpty() && savedSettings != nullptr)
+            path = engine->getSavedPluginPath();
+
+        if (path.isEmpty() && ! found.empty())
+            path = found.front().path;
+
+        if (path.isNotEmpty())
+        {
+            juce::MemoryBlock stateIn;
+            const auto stateInFile = report.getSiblingFile (report.getFileName() + ".state-in");
+            const bool hasStateIn = stateInFile.existsAsFile() && stateInFile.loadFileAsData (stateIn);
+
+            // 상태 파일이 없으면 nullptr → 저장된 상태(있으면)를 쓴다.
+            juce::String error;
+            const bool remembered = ! hasStateIn && engine->hasRememberedState (path);
+            const auto start = juce::Time::getMillisecondCounterHiRes();
+            const bool ok = engine->loadPlugin (path, hasStateIn ? &stateIn : nullptr, error);
+            const int elapsed = juce::roundToInt (juce::Time::getMillisecondCounterHiRes() - start);
+
+            log ("plugin-load: " + juce::String (ok ? "ok" : "FAILED " + error) + " (" + juce::String (elapsed) + " ms)"
+                 + (hasStateIn ? " with state " + juce::String ((int) stateIn.getSize()) + " bytes" : juce::String())
+                 + (remembered ? " with saved kit" : juce::String()));
+
+            if (ok)
+                log ("plugin: " + engine->getPluginName() + " " + engine->describePluginBuses());
+        }
+        else
+        {
+            log ("plugin-load: no VST3 plugin found");
+        }
+
+        toneFile = report.getSiblingFile ("selftest-tone.wav");
+        writeTone (toneFile);
+
+        juce::String error;
+        log ("song-load: " + juce::String (engine->loadSong (toneFile, error) ? "ok" : "FAILED " + error));
+        log ("song-length: " + juce::String (engine->getLength(), 2) + " s");
+
+        startThread();
+    }
+
+    ~SelfTest() override
+    {
+        stopThread (15000);
+        engine.reset();
+        toneFile.deleteFile();
+    }
+
+private:
+    static constexpr double sampleRate = 48000.0;
+    static constexpr int blockSize = 512;
+
+    void log (const juce::String& line)
+    {
+        const juce::ScopedLock lock (logLock);
+        lines.add (line);
+    }
+
+    static void writeTone (const juce::File& file)
+    {
+        file.deleteFile();
+        std::unique_ptr<juce::OutputStream> stream = file.createOutputStream();
+
+        if (stream == nullptr)
+            return;
+
+        juce::WavAudioFormat wav;
+        auto writer = wav.createWriterFor (stream, juce::AudioFormatWriterOptions()
+                                                       .withSampleRate (44100.0)
+                                                       .withNumChannels (2)
+                                                       .withBitsPerSample (16));
+
+        if (writer == nullptr)
+            return;
+
+        juce::AudioBuffer<float> buffer (2, 44100 * 6);
+
+        for (int i = 0; i < buffer.getNumSamples(); ++i)
+        {
+            const float v = 0.25f * (float) std::sin (2.0 * juce::MathConstants<double>::pi * 440.0 * i / 44100.0);
+            buffer.setSample (0, i, v);
+            buffer.setSample (1, i, v);
+        }
+
+        writer->writeFromAudioSampleBuffer (buffer, 0, buffer.getNumSamples());
+    }
+
+    // 실제 속도에 가깝게 돌린다(원곡은 뒤에서 미리 읽어 두는 방식이라 너무 빨리 돌리면 비어 버린다).
+    void render (double seconds, float& drumPeak, float& mixPeak)
+    {
+        drumPeak = 0.0f;
+        mixPeak = 0.0f;
+        const int blocks = (int) (seconds * sampleRate / blockSize);
+
+        for (int i = 0; i < blocks && ! threadShouldExit(); ++i)
+        {
+            float d = 0.0f, m = 0.0f;
+            engine->renderOffline (blockSize, d, m);
+            drumPeak = juce::jmax (drumPeak, d);
+            mixPeak = juce::jmax (mixPeak, m);
+            wait (9);
+        }
+    }
+
+    void hit (int note)
+    {
+        juce::MessageManager::callAsync ([this, note] { engine->playTestNote (note, 0.9f); });
+    }
+
+    void run() override
+    {
+        wait (settleMs);   // 플러그인이 샘플을 읽을 시간
+
+        float d = 0.0f, m = 0.0f;
+
+        render (0.4, d, m);
+        log ("idle: drum " + dbText (d) + ", mix " + dbText (m));
+
+        const std::pair<int, const char*> notes[] = { { 36, "kick" }, { 38, "snare" }, { 42, "hihat" } };
+
+        for (const auto& [note, label] : notes)
+        {
+            hit (note);
+            render (0.7, d, m);
+            log (juce::String (label) + " (note " + juce::String (note) + "): drum " + dbText (d) + ", mix " + dbText (m));
+        }
+
+        engine->play();
+        render (1.0, d, m);
+        log ("song only (vol 70): mix " + dbText (m) + "  [expected about " + dbText (0.25f * 0.49f) + "]");
+
+        // 값을 바꾼 직후의 전환 구간은 버리고 그 뒤를 잰다.
+        engine->song.mid = 12.0f;
+        render (0.3, d, m);
+        render (0.4, d, m);
+        log ("song + mid EQ +12: mix " + dbText (m));
+        engine->song.mid = 0.0f;
+
+        engine->song.comp = 1.0f;
+        render (0.6, d, m);
+        render (0.4, d, m);
+        log ("song + compressor 100: mix " + dbText (m));
+        engine->song.comp = 0.0f;
+
+        engine->song.mute = true;
+        render (0.3, d, m);
+        render (0.3, d, m);
+        log ("song muted: mix " + dbText (m));
+        engine->song.mute = false;
+        render (0.3, d, m);
+
+        testRecording();
+        testTakeRates();
+        engine->pause();
+        testMidiInput();
+        testMetronome();
+        testStems();
+        log ("done");
+
+        juce::MessageManager::callAsync ([this]
+        {
+            {
+                const juce::ScopedLock lock (logLock);
+                report.replaceWithText (lines.joinIntoString ("\r\n") + "\r\n");
+            }
+
+            juce::JUCEApplication::quit();
+        });
+    }
+
+    // 실제 패드와 같은 경로(MidiInbox)로 스네어를 넣어 드럼 소리가 나는지 본다.
+    // 큰 버퍼(512, 한 블록 지연으로 고르게)와 작은 버퍼(64, 블록 맨 앞에 바로) 두 방식을 모두 확인한다.
+    void testMidiInput()
+    {
+        const auto hitThroughInbox = [this] (const juce::String& label)
+        {
+            float d = 0.0f, m = 0.0f;
+            render (0.2, d, m);   // 앞 소리가 사라지게
+
+            engine->injectMidiForTest (juce::MidiMessage::noteOn (10, 38, (juce::uint8) 110));
+            render (0.5, d, m);
+            engine->injectMidiForTest (juce::MidiMessage::noteOff (10, 38));
+            log ("midi-input " + label + ": drum " + dbText (d) + ", max wait " + juce::String (engine->takeMaxMidiWaitMs(), 1) + " ms");
+        };
+
+        hitThroughInbox ("buffer 512 (steady)");
+
+        engine->prepareOffline (44100.0, 64);
+        hitThroughInbox ("buffer 64 (immediate)");
+    }
+
+    // 녹음(믹스·드럼·원곡) → 테이크 불러오기 → 볼륨·타이밍·구간을 바꿔 저장 → 다시 읽어 확인
+    void testRecording()
+    {
+        const auto folder = report.getSiblingFile ("selftest-recording");
+        folder.deleteRecursively();
+        juce::String error;
+        float d = 0.0f, m = 0.0f;
+
+        if (! engine->startRecording (folder, error))
+        {
+            log ("record: FAILED " + error);
+            return;
+        }
+
+        hit (36);
+        render (1.0, d, m);
+        engine->stopRecording();
+
+        const auto take = engine->getLastTakeFolder();
+        const auto size = [&] (const juce::String& name) { return juce::String (take.getChildFile (name).getSize()); };
+
+        log ("record: " + juce::String (engine->getRecordedSeconds(), 2) + " s in '" + take.getFileName() + "': mix "
+             + size (TakeFiles::mix()) + ", drum " + size (TakeFiles::drum()) + ", song " + size (TakeFiles::song())
+             + ", info " + size (TakeFiles::info()) + " bytes");
+
+        juce::String takeError;
+        auto player = TakePlayer::load (take, takeError);
+
+        if (player == nullptr)
+        {
+            log ("take-load: FAILED " + takeError);
+            folder.deleteRecursively();
+            return;
+        }
+
+        const auto peakOf = [] (const std::vector<float>& peaks)
+        {
+            float peak = 0.0f;
+
+            for (auto p : peaks)
+                peak = juce::jmax (peak, p);
+
+            return peak;
+        };
+
+        log ("take-load: " + juce::String (player->getLength()) + " samples @ " + juce::String (player->getSampleRate(), 0)
+             + " Hz, recorded volumes drum " + juce::String (player->info.drumVolume, 2) + " / song " + juce::String (player->info.songVolume, 2)
+             + ", drum stem peak " + dbText (peakOf (player->getDrumPeaks())) + ", song stem peak " + dbText (peakOf (player->getSongPeaks())));
+
+        player->drumGain = 1.0f;
+        player->songGain = 0.25f;
+        player->offsetSamples = -(int) (player->getSampleRate() * 0.01);   // 드럼을 10ms 앞으로
+        player->trimStart = player->getLength() / 10;
+        player->trimEnd = player->getLength() - player->getLength() / 10;
+
+        const auto out = take.getChildFile (lang::pick ("완성.wav", "final.wav"));
+        juce::String exportError;
+        const bool ok = player->exportMix (out, TakePlayer::ExportFormat::wav24, exportError);
+
+        juce::AudioFormatManager formats;
+        formats.registerBasicFormats();
+        std::unique_ptr<juce::AudioFormatReader> reader (ok ? formats.createReaderFor (out) : nullptr);
+
+        if (reader != nullptr)
+        {
+            juce::Range<float> range[2];
+            reader->readMaxLevels (0, reader->lengthInSamples, range, 2);
+            const float peak = juce::jmax (std::abs (range[0].getStart()), std::abs (range[0].getEnd()));
+            log ("export: ok, " + juce::String (reader->lengthInSamples) + " samples (expected "
+                 + juce::String (player->trimEnd.load() - player->trimStart.load()) + "), peak " + dbText (peak));
+        }
+        else
+        {
+            log ("export: FAILED " + exportError);
+        }
+
+        // 다듬기 창의 '들어보기'와 같은 경로: 엔진 출력에 더해지고 위치가 움직여야 한다.
+        engine->pause();
+        render (0.3, d, m);
+        log ("after pause, no preview: drum " + dbText (d) + ", mix " + dbText (m) + ", song playing " + juce::String ((int) engine->isPlaying()));
+        engine->setPreview (player);
+        player->seek (player->trimStart.load());
+        player->playing = true;
+        const auto before = player->position.load();
+        render (0.3, d, m);
+        log ("preview: mix " + dbText (m) + " (expected about " + dbText (0.25f * 0.25f) + "), moved "
+             + juce::String (player->position.load() - before) + " samples, still playing " + juce::String ((int) player->playing.load()));
+        engine->setPreview (nullptr);
+
+        reader.reset();
+        player.reset();
+        folder.deleteRecursively();
+    }
+
+    // 다듬기 창 미리 듣기가 장치 샘플레이트와 상관없이 녹음 속도 그대로인지, 완성본 MP3가 제대로 써지는지.
+    // 44.1kHz로 녹음된 1kHz 사인파를 48kHz·44.1kHz 장치로 재생해 주파수와 진행 속도를 잰다.
+    void testTakeRates()
+    {
+        const auto folder = report.getSiblingFile ("selftest-take-rates");
+        folder.deleteRecursively();
+        folder.createDirectory();
+
+        constexpr double recordRate = 44100.0, toneHz = 1000.0;
+        const int length = (int) (recordRate * 4.0);
+
+        const auto writeWav = [&] (const juce::String& name, bool tone)
+        {
+            juce::AudioBuffer<float> buffer (2, length);
+            buffer.clear();
+
+            if (tone)
+            {
+                for (int i = 0; i < length; ++i)
+                {
+                    const float v = 0.5f * (float) std::sin (juce::MathConstants<double>::twoPi * toneHz * i / recordRate);
+                    buffer.setSample (0, i, v);
+                    buffer.setSample (1, i, v);
+                }
+            }
+
+            juce::WavAudioFormat wav;
+            std::unique_ptr<juce::OutputStream> stream = folder.getChildFile (name).createOutputStream();
+            auto writer = wav.createWriterFor (stream, juce::AudioFormatWriterOptions().withSampleRate (recordRate).withNumChannels (2).withBitsPerSample (32)
+                                                           .withSampleFormat (juce::AudioFormatWriterOptions::SampleFormat::floatingPoint));
+            return writer != nullptr && writer->writeFromAudioSampleBuffer (buffer, 0, length);
+        };
+
+        if (! writeWav (TakeFiles::song(), true) || ! writeWav (TakeFiles::drum(), false))
+        {
+            log ("take-rates: FAILED to write test take");
+            return;
+        }
+
+        juce::String error;
+        auto player = TakePlayer::load (folder, error);
+
+        if (player == nullptr)
+        {
+            log ("take-rates: FAILED " + error);
+            return;
+        }
+
+        player->songGain = 1.0f;
+        player->drumGain = 1.0f;
+
+        // 위로 지나는 0점 사이 간격으로 주파수를 잰다(선형 보간으로 소수 위치까지).
+        const auto measure = [] (const std::vector<float>& x, double rate)
+        {
+            double first = -1.0, last = -1.0;
+            int crossings = 0;
+
+            for (size_t i = 1; i < x.size(); ++i)
+            {
+                if (x[i - 1] < 0.0f && x[i] >= 0.0f)
+                {
+                    const double t = (double) (i - 1) + (double) (-x[i - 1] / (x[i] - x[i - 1]));
+
+                    if (first < 0.0) first = t;
+                    last = t;
+                    ++crossings;
+                }
+            }
+
+            return crossings > 1 ? (crossings - 1) * rate / (last - first) : 0.0;
+        };
+
+        for (const double deviceRate : { 48000.0, 44100.0, 96000.0 })
+        {
+            player->seek ((juce::int64) (player->getSampleRate() * 0.5));
+            player->playing = true;
+            const auto before = player->position.load();
+            const int n = (int) deviceRate;   // 장치로 1초
+            std::vector<float> left ((size_t) n, 0.0f), right ((size_t) n, 0.0f);
+
+            for (int done = 0; done < n; done += 480)
+            {
+                const int count = juce::jmin (480, n - done);
+                player->renderAdding (left.data() + done, right.data() + done, count, deviceRate);
+            }
+
+            const double hz = measure (left, deviceRate);
+            const double moved = (double) (player->position.load() - before);
+            const bool good = std::abs (hz - toneHz) < 0.5 && std::abs (moved - recordRate) < 2.0;
+            log ("take-rates device " + juce::String (deviceRate, 0) + " Hz: tone " + juce::String (hz, 2) + " Hz (expected 1000), moved "
+                 + juce::String (moved, 0) + " recorded samples per second (expected 44100) " + (good ? "OK" : "CHECK"));
+            player->playing = false;
+        }
+
+        // 완성본: 같은 구간을 WAV와 MP3로 저장해 크기·길이·소리를 비교한다.
+        player->trimStart = (juce::int64) (recordRate * 0.5);
+        player->trimEnd = (juce::int64) (recordRate * 3.5);
+        player->songGain = 0.5f;
+
+        const auto wavFile = folder.getChildFile ("final.wav"), mp3File = folder.getChildFile ("final.mp3");
+        juce::String wavError, mp3Error;
+        const bool wavOk = player->exportMix (wavFile, TakePlayer::ExportFormat::wav24, wavError);
+        const bool mp3Ok = player->exportMix (mp3File, TakePlayer::ExportFormat::mp3, mp3Error);
+
+        juce::AudioFormatManager formats;
+        formats.registerBasicFormats();
+        std::unique_ptr<juce::AudioFormatReader> reader (mp3Ok ? formats.createReaderFor (mp3File) : nullptr);
+        juce::String decoded = "not readable";
+
+        if (reader != nullptr)
+        {
+            juce::AudioBuffer<float> back (2, (int) reader->lengthInSamples);
+            reader->read (&back, 0, back.getNumSamples(), 0, true, true);
+            const int middle = back.getNumSamples() / 2;
+            std::vector<float> tone ((size_t) juce::jmin (back.getNumSamples() - middle, 44100));
+            std::copy (back.getReadPointer (0) + middle, back.getReadPointer (0) + middle + (int) tone.size(), tone.begin());
+            decoded = juce::String (reader->sampleRate, 0) + " Hz, " + juce::String ((double) reader->lengthInSamples / reader->sampleRate, 3)
+                    + " s (expected 3.000 plus encoder padding), tone " + juce::String (measure (tone, reader->sampleRate), 2)
+                    + " Hz, peak " + dbText (back.getMagnitude (0, back.getNumSamples()));
+        }
+
+        log ("final-wav: " + (wavOk ? juce::String (wavFile.getSize()) + " bytes" : "FAILED " + wavError));
+        log ("final-mp3: " + (mp3Ok ? juce::String (mp3File.getSize()) + " bytes (" + juce::String ((double) wavFile.getSize() / juce::jmax<juce::int64> (1, mp3File.getSize()), 1)
+                                          + "x smaller than WAV), decoded " + decoded
+                                    : "FAILED " + mp3Error));
+
+        reader.reset();
+        player.reset();
+
+        if (juce::SystemStats::getEnvironmentVariable ("DVH_KEEP_TEST_FILES", {}).isEmpty())
+            folder.deleteRecursively();
+    }
+
+    //==========================================================================
+    // 드럼 모듈·드라이버·드럼 VST 알아보기와 MIDI 거르기(장치 없이 이름만으로). 이름 형태는 2026-11-18 조사 기준.
+    void testDrumKnowledge()
+    {
+        const auto check = [this] (const juce::String& label, const juce::String& got, const juce::String& expected)
+        {
+            log ("drum-knowledge " + label + ": " + (got == expected ? "OK " : "CHECK ") + got + (got == expected ? juce::String() : "  (expected " + expected + ")"));
+        };
+
+        const auto module = [] (const juce::String& name, const juce::String& id = {})
+        {
+            juce::Array<juce::MidiDeviceInfo> inputs;
+            inputs.add (juce::MidiDeviceInfo (name, id));
+            return identifyDrumModule (inputs);
+        };
+
+        juce::StringArray names;
+        const auto shown = [] (const DrumModule& m) { return m.isKnown() ? m.displayName() + (m.usbAudio ? "" : " (MIDI only)") : juce::String ("-"); };
+
+        for (const auto* name : { "DTX Drums-1", "TD-17", "5- TD-27", "2 - TD-17", "IN (3- TD-50X)", "TD-1DMK", "V71", "Arturia KeyStep" })
+            names.add (shown (module (name)));
+
+        names.add (shown (module ("USB MIDI", "\\\\?\\usb#vid_0582&pid_02e6&mi_00")));
+        check ("modules", names.joinIntoString (" | "),
+               "Yamaha (DTX Drums-1) | Roland TD-17 | Roland TD-27 | Roland TD-17 | Roland TD-50X | Roland TD-1 (MIDI only) | Roland V71 | - | Roland (USB MIDI)");
+
+        juce::StringArray scores;
+        const auto td17 = module ("TD-17");
+
+        for (const auto* driver : { "Yamaha Steinberg USB ASIO", "TD-17", "Roland TD-27", "ASIO4ALL v2", "Realtek ASIO" })
+            scores.add (juce::String (drumDriverScore (driver, td17)));
+
+        check ("driver scores for TD-17", scores.joinIntoString (" "), "10 70 30 0 0");
+
+        juce::StringArray plugins;
+
+        for (const auto* file : { "Superior Drummer 3.vst3", "EZdrummer 3.vst3", "Addictive Drums 2.vst3", "SSDSampler5.vst3",
+                                  "BFDPlayer.vst3", "MT-PowerDrumKit.vst3", "EZkeys 2.vst3", "Addictive Keys.vst3", "ValhallaRoom.vst3" })
+        {
+            const auto info = recogniseDrumPlugin (juce::File ("C:\\Test\\VST3").getChildFile (file));
+            plugins.add (info.isDrum ? info.displayName + "/" + juce::String (info.rank) : juce::String ("-"));
+        }
+
+        check ("plugins", plugins.joinIntoString (" | "),
+               "Superior Drummer 3 (Toontrack)/10 | EZdrummer 3 (Toontrack)/20 | Addictive Drums 2 (XLN Audio)/30 | SSD 5 (Steven Slate Drums)/40 | "
+               "BFD Player/52 | MT Power Drum Kit/60 | - | - | -");
+
+        juce::StringArray forwarded;
+        const juce::uint8 messages[][3] = { { 0x99, 38, 100 }, { 0x89, 38, 64 }, { 0xb9, 4, 90 }, { 0xa9, 49, 127 }, { 0xf8, 0, 0 },
+                                             { 0xfe, 0, 0 }, { 0xc9, 5, 0 }, { 0xb9, 0, 125 }, { 0xb9, 32, 1 } };
+        const int sizes[] = { 3, 3, 3, 3, 1, 1, 2, 3, 3 };
+
+        for (size_t i = 0; i < std::size (sizes); ++i)
+            forwarded.add (MidiInbox::shouldForward (messages[i], sizes[i]) ? "pass" : "drop");
+
+        check ("midi filter (note on, note off, CC4, aftertouch, clock, sensing, program, bank MSB, bank LSB)",
+               forwarded.joinIntoString (" "), "pass pass pass pass drop drop drop drop drop");
+
+        // 패드 배치: 받은 음 번호를 바꿔 넘기고(17 -> 57), '넘기지 않음'으로 둔 음은 거른다. 끄면 그대로 넘긴다.
+        {
+            PadMap map;
+            map.rows[12].sources.add (17);   // Crash 2(57)
+            map.rows[12].sources.add (16);
+            map.rows[1].sources.add (40);    // Snare(38)
+            PadMap copy;
+            copy.fromString (map.toString());
+            check ("pad map text round trip", copy.toString(), map.toString());
+
+            auto table = map.toTable();
+            table[20] = MidiInbox::dropNote;
+            MidiInbox::MonitorEvent events[16];
+            juce::StringArray seen;
+
+            for (const bool on : { true, false })
+            {
+                while (engine->readMidiMonitor (events, 16) > 0) {}
+                engine->setPadMap (table, on);
+
+                for (const int note : { 17, 40, 36, 20 })
+                    engine->injectMidiForTest (juce::MidiMessage::noteOn (10, note, (juce::uint8) 100));
+
+                const int n = engine->readMidiMonitor (events, 16);
+
+                for (int i = 0; i < n; ++i)
+                    seen.add (juce::String ((int) events[i].data[1]) + (events[i].forwarded ? "" : "x")
+                              + (events[i].mappedNote < 128 ? ">" + juce::String ((int) events[i].mappedNote) : juce::String()));
+
+                seen.add ("|");
+            }
+
+            check ("pad map (on, then off)", seen.joinIntoString (" "), "17>57 40>38 36 20x | 17 40 36 20 |");
+        }
+    }
+
+    //==========================================================================
+    // 44.1kHz 32비트 실수 WAV: 110Hz 사인(sineLevel) 위에 한 샘플짜리 펄스(pulse)를 times(초)에 찍는다.
+    static void writePulses (const juce::File& file, double seconds, const std::vector<double>& times, float pulse, float sineLevel)
+    {
+        file.deleteFile();
+        std::unique_ptr<juce::OutputStream> stream = file.createOutputStream();
+
+        if (stream == nullptr)
+            return;
+
+        juce::WavAudioFormat wav;
+        auto writer = wav.createWriterFor (stream, juce::AudioFormatWriterOptions()
+                                                       .withSampleRate (44100.0)
+                                                       .withNumChannels (2)
+                                                       .withBitsPerSample (32)
+                                                       .withSampleFormat (juce::AudioFormatWriterOptions::SampleFormat::floatingPoint));
+
+        if (writer == nullptr)
+            return;
+
+        juce::AudioBuffer<float> buffer (2, (int) (seconds * 44100.0));
+
+        for (int i = 0; i < buffer.getNumSamples(); ++i)
+        {
+            const float v = sineLevel * (float) std::sin (2.0 * juce::MathConstants<double>::pi * 110.0 * i / 44100.0);
+            buffer.setSample (0, i, v);
+            buffer.setSample (1, i, v);
+        }
+
+        for (double t : times)
+        {
+            const int i = juce::roundToInt (t * 44100.0);
+
+            if (i < buffer.getNumSamples())
+            {
+                buffer.addSample (0, i, pulse);
+                buffer.addSample (1, i, pulse);
+            }
+        }
+
+        writer->writeFromAudioSampleBuffer (buffer, 0, buffer.getNumSamples());
+    }
+
+    // 엔진 출력을 seconds초 받는다(한 번에 chunk 샘플씩, 원곡 미리 읽기가 따라오도록 실제 속도에 가깝게).
+    std::vector<float> capture (double seconds, int chunk)
+    {
+        const int total = (int) (seconds * 44100.0);
+        std::vector<float> left ((size_t) total), right ((size_t) total);
+
+        for (int done = 0; done < total && ! threadShouldExit(); done += chunk)
+        {
+            const int n = juce::jmin (chunk, total - done);
+            engine->renderOfflineInto (left.data() + done, right.data() + done, n);
+            wait (juce::jmax (1, n * 850 / 44100));
+        }
+
+        return left;
+    }
+
+    // 조용하다가(0.15초 이상) 소리가 나는 샘플들
+    static std::vector<int> onsetsOf (const std::vector<float>& x, float threshold)
+    {
+        std::vector<int> onsets;
+        int quiet = 1 << 30;
+
+        for (int i = 0; i < (int) x.size(); ++i)
+        {
+            if (std::abs (x[(size_t) i]) > threshold)
+            {
+                if (quiet >= 6615)
+                    onsets.push_back (i);
+
+                quiet = 0;
+            }
+            else
+            {
+                ++quiet;
+            }
+        }
+
+        return onsets;
+    }
+
+    // 메트로놈: 재생을 누르면 원곡 박자에 맞춘 4박을 세고 원곡이 정확한 샘플에서 시작해야 한다.
+    // 같은 조건으로 두 번 돌려 '클릭만'(원곡 끔)과 '원곡만'(클릭 볼륨 0)을 받아 소리가 시작되는 샘플을 비교한다.
+    void testMetronome()
+    {
+        constexpr double rate = 44100.0;
+        const auto songFile = report.getSiblingFile ("selftest-beats.wav");
+        std::vector<double> beats;
+
+        for (int k = 0; k < 15; ++k)
+            beats.push_back (0.5 + 0.5 * k);   // 120 BPM, 첫 박 0.5초, 4박마다 마디 첫 박
+
+        writePulses (songFile, 8.0, beats, 0.8f, 0.0f);
+
+        juce::String error;
+
+        if (! engine->loadSong (songFile, error))
+        {
+            log ("metronome: FAILED to load test song " + error);
+            return;
+        }
+
+        BeatMap map;
+        map.bpm = 120.0;
+        map.beats = beats;
+        map.downbeat.assign (beats.size(), 0);
+
+        for (size_t k = 0; k < beats.size(); k += 4)
+            map.downbeat[k] = 1;
+
+        engine->setBeatMap (map);
+        engine->metronomeOn = true;
+        engine->countInEnabled = true;
+        engine->drum.mute = true;
+
+        // 오프라인에서는 따로 도는 오디오 스레드가 없어서, 멈춘 뒤 한 블록을 돌려야 재생기가 멈춤을 받아들인다
+        // (그러지 않으면 다음 블록에서 한 블록을 더 읽어 위치가 밀린다. 실제 장치에서는 stop()이 이것을 기다린다).
+        const auto settle = [this] { capture (0.05, 512); };
+
+        const auto scenario = [&] (const juce::String& label, double startAt, int chunk, int expectedCountIn)
+        {
+            std::vector<float> outputs[2];
+            int countIn[2] = { 0, 0 };
+
+            for (int pass = 0; pass < 2; ++pass)
+            {
+                const bool clicksOnly = pass == 0;
+                engine->prepareOffline (rate, 512);
+                engine->song.mute = clicksOnly;
+                engine->metronomeVolume = clicksOnly ? 1.0f : 0.0f;
+                engine->setPosition (startAt);
+                capture (0.3, 512);   // 음소거 전환이 끝나게
+
+                engine->play();
+                countIn[pass] = engine->getCountInSamples();
+                outputs[pass] = capture (startAt < 1.0 ? 5.0 : 4.0, chunk);
+                engine->pause();
+                settle();
+            }
+
+            const auto clicks = onsetsOf (outputs[0], 1.0e-6f);
+            const auto pulses = onsetsOf (outputs[1], 0.05f);
+            const int songStart = countIn[1];
+
+            // 클릭의 첫 샘플은 0이라(감싸는 곡선이 0에서 시작) 소리가 나는 샘플보다 한 샘플 앞이 시작이다.
+            juce::String clickText, pulseText, accents;
+            float loudest = 0.0f;
+
+            for (int c : clicks)
+                for (int i = c; i < juce::jmin ((int) outputs[0].size(), c + 1800); ++i)
+                    loudest = juce::jmax (loudest, std::abs (outputs[0][(size_t) i]));
+
+            for (int c : clicks)
+            {
+                float peak = 0.0f;
+
+                for (int i = c; i < juce::jmin ((int) outputs[0].size(), c + 1800); ++i)
+                    peak = juce::jmax (peak, std::abs (outputs[0][(size_t) i]));
+
+                accents << (peak > loudest * 0.85f ? "A" : "n");
+                clickText << " " << (c - 1 - songStart);
+            }
+
+            int worst = 0, matched = 0;
+
+            for (int p : pulses)
+            {
+                pulseText << " " << (p - songStart);
+                int best = 1 << 30;
+
+                for (int c : clicks)
+                    best = std::abs (c - 1 - p) < std::abs (best) ? (c - 1 - p) : best;
+
+                if (std::abs (best) < 1000)
+                {
+                    ++matched;
+                    worst = juce::jmax (worst, std::abs (best));
+                }
+            }
+
+            // 클릭은 원곡보다 최대 3샘플(0.07ms) 이를 수 있다: JUCE 재생기가 보간용으로 3샘플을 미리 읽어 두어
+            // 재생 위치가 그만큼 앞서 보인다. 귀로는 구분할 수 없는 크기라 4샘플까지 통과로 본다.
+            const bool ok = countIn[0] == expectedCountIn && countIn[1] == expectedCountIn
+                            && matched == (int) pulses.size() && ! pulses.empty() && worst <= 4;
+
+            log ("metronome " + label + ": " + (ok ? "OK" : "CHECK") + " count-in " + juce::String (countIn[0]) + "/" + juce::String (countIn[1])
+                 + " smp (expected " + juce::String (expectedCountIn) + " = " + juce::String (expectedCountIn / rate, 3) + " s), clicks "
+                 + juce::String ((int) clicks.size()) + ", song pulses " + juce::String ((int) pulses.size()) + ", pulses with a click "
+                 + juce::String (matched) + ", worst offset " + juce::String (worst) + " smp");
+            log ("  clicks rel. to song start:" + clickText.substring (0, 160));
+            log ("  pulses rel. to song start:" + pulseText.substring (0, 160));
+            log ("  accents: " + accents);
+        };
+
+        // 처음부터: 첫 박(0.5초) 앞이라 박 간격으로 거슬러 센다. 예비박 -2.0 -1.5 -1.0 -0.5초, 0초 클릭, 그다음 원곡 박.
+        // 예비박 2초 = 88200샘플 → 블록(512)의 배수로 올림 = 88576. 강박: nAnnn AnnnA… (마디 첫 박 = -1.5초, 0.5초, 2.5초)
+        scenario ("from 0.0 s, block 512", 0.0, 512, 88576);
+        // 박 사이(3.2초)에서, 블록 크기와 예비박 길이가 맞지 않게(300) → 블록 가운데서 원곡이 시작되는 경로
+        // 예비박 1.5·2.0·2.5·3.0초 → 3.2−1.5 = 1.7초 = 74970샘플 → 75264. 강박: nnAnnnAn (2.5초, 4.5초)
+        scenario ("from 3.2 s, chunk 300", 3.2, 300, 75264);
+
+        // 클릭 빠르기(2배·절반)와 클릭 시점(+20ms): 처음부터 재생해 클릭만 받고, 원곡 시작 기준 클릭 시각과 높은 클릭 자리를 본다.
+        // 원곡 박은 0.5초부터 0.5초 간격, 마디 첫 박은 0.5·2.5초(예비박 자리로는 -1.5초).
+        const auto speedScenario = [&] (const juce::String& label, double speed, float offsetMs, double first, double step, const std::vector<double>& accentTimes)
+        {
+            engine->setBeatMap (map, speed);
+            engine->metronomeOffsetMs = offsetMs;
+            engine->prepareOffline (rate, 512);
+            engine->song.mute = true;
+            engine->metronomeVolume = 1.0f;
+            engine->setPosition (0.0);
+            capture (0.3, 512);
+
+            engine->play();
+            const int countIn = engine->getCountInSamples();
+            const auto out = capture (5.0, 512);
+            engine->pause();
+            settle();
+
+            const auto clicks = onsetsOf (out, 1.0e-6f);
+            const double limit = ((double) out.size() - countIn - 2000) / rate;   // 이 시각 전의 클릭은 모두 받았어야 한다
+            std::vector<double> expected;
+
+            for (double t = first; t + offsetMs * 0.001 < limit; t += step)
+                expected.push_back (t + offsetMs * 0.001);
+
+            float loudest = 0.0f;
+            std::vector<float> peaks;
+
+            for (int c : clicks)
+            {
+                float peak = 0.0f;
+
+                for (int i = c; i < juce::jmin ((int) out.size(), c + 1800); ++i)
+                    peak = juce::jmax (peak, std::abs (out[(size_t) i]));
+
+                peaks.push_back (peak);
+                loudest = juce::jmax (loudest, peak);
+            }
+
+            int worst = 0;
+            bool accentsRight = true;
+            juce::String times, accents;
+
+            for (size_t k = 0; k < clicks.size(); ++k)
+            {
+                const double t = (double) (clicks[k] - 1 - countIn) / rate;
+                const bool accent = peaks[k] > loudest * 0.85f;
+                times << " " << juce::String (t, 3);
+                accents << (accent ? "A" : "n");
+
+                if (k < expected.size())
+                    worst = juce::jmax (worst, juce::roundToInt (std::abs (t - expected[k]) * rate));
+
+                const bool shouldAccent = std::any_of (accentTimes.begin(), accentTimes.end(),
+                                                       [&] (double a) { return std::abs (a + offsetMs * 0.001 - t) < 0.01; });
+                accentsRight = accentsRight && accent == shouldAccent;
+            }
+
+            const bool ok = clicks.size() == expected.size() && worst <= 4 && accentsRight;
+            log ("metronome " + label + ": " + (ok ? "OK" : "CHECK") + " clicks " + juce::String ((int) clicks.size()) + " (expected "
+                 + juce::String ((int) expected.size()) + "), worst offset " + juce::String (worst) + " smp, accents " + (accentsRight ? "right" : "WRONG"));
+            log ("  clicks (s, rel. to song start):" + times.substring (0, 200));
+            log ("  accents: " + accents);
+        };
+
+        speedScenario ("speed x2", 2.0, 0.0f, -2.0, 0.25, { -1.5, 0.5, 2.5 });
+        speedScenario ("speed x0.5", 0.5, 0.0f, -1.5, 1.0, { -1.5, 0.5, 2.5 });
+        speedScenario ("offset +20 ms", 1.0, 20.0f, -2.0, 0.5, { -1.5, 0.5, 2.5 });
+        // 반 박(0.25초) 앞당기기·늦추기: 원곡 시작 근처의 박이 예비박·원곡 쪽 어디서든 빠지거나 두 번 울리지 않아야 한다.
+        speedScenario ("offset -1/2 beat", 1.0, -250.0f, -2.0, 0.5, { -1.5, 0.5, 2.5 });
+        speedScenario ("offset +1/2 beat", 1.0, 250.0f, -2.0, 0.5, { -1.5, 0.5, 2.5 });
+        speedScenario ("offset -1/4 beat, speed x2", 2.0, -125.0f, -2.0, 0.25, { -1.5, 0.5, 2.5 });
+        engine->setBeatMap (map, 1.0);
+        engine->metronomeOffsetMs = 0.0f;
+
+        // 예비박 중에 멈추면 원곡이 시작되지 않아야 한다.
+        engine->prepareOffline (rate, 512);
+        engine->setPosition (1.0);
+        engine->play();
+        capture (0.5, 512);
+        engine->pause();
+        settle();
+        capture (2.5, 512);
+        log ("metronome pause during count-in: playing " + juce::String ((int) engine->isPlaying())
+             + ", position " + juce::String (engine->getPosition(), 3) + " s (expected 1.000)");
+
+        // 예비박 중에 위치를 옮기면 예비박을 그만두고 바로 재생한다.
+        engine->setPosition (1.0);
+        engine->play();
+        capture (0.3, 512);
+        engine->setPosition (2.0);
+        const bool countingAfterSeek = engine->isCountingIn();
+        capture (0.5, 512);
+        log ("metronome seek during count-in: counting " + juce::String ((int) countingAfterSeek) + ", playing " + juce::String ((int) engine->isPlaying())
+             + ", position " + juce::String (engine->getPosition(), 2) + " s (expected about 2.5)");
+        engine->pause();
+        settle();
+
+        engine->metronomeOn = false;
+        engine->metronomeVolume = 0.7f;
+        engine->song.mute = false;
+        engine->drum.mute = false;
+        engine->setBeatMap ({});
+        songFile.deleteFile();
+    }
+
+    // 원곡 드럼 빼기: 나머지 + (원곡 − 나머지)는 원곡과 같고, 드럼을 끄면 나머지만 남는다.
+    // 켜고 끄기는 미리 읽어 둔 소리와 상관없이 바로(30ms) 들려야 한다.
+    void testStems()
+    {
+        constexpr double rate = 44100.0;
+        const auto original = report.getSiblingFile ("selftest-original.wav");
+        const auto rest = report.getSiblingFile ("selftest-rest.wav");
+        const auto drums = report.getSiblingFile ("selftest-drums.wav");
+        std::vector<double> hits;
+
+        for (int k = 0; k < 11; ++k)
+            hits.push_back (0.25 + 0.5 * k);
+
+        writePulses (original, 6.0, hits, 0.6f, 0.2f);   // 사인(드럼 아닌 소리) + 펄스(드럼)
+        writePulses (rest, 6.0, {}, 0.0f, 0.2f);         // 사인만
+
+        juce::String error;
+
+        if (! makeExactDrumStem (original, rest, drums, error))
+        {
+            log ("stems: FAILED to make drum stem " + error);
+            return;
+        }
+
+        engine->metronomeOn = false;
+        engine->drum.mute = true;
+        engine->song.mute = false;
+
+        const auto play = [&] (const juce::File& song, bool stems, bool drumsOn, double from, double seconds)
+        {
+            juce::String e;
+            engine->prepareOffline (rate, 512);
+            engine->loadSong (song, e);
+
+            if (stems)
+                engine->useSongStems (rest, drums, e);
+
+            engine->setSongDrumsOn (drumsOn);
+            engine->setPosition (from);
+            capture (0.3, 512);   // 드럼 켜고 끄기 전환이 끝나게
+            engine->play();
+            auto out = capture (seconds, 512);
+            engine->pause();
+            capture (0.05, 512);   // 멈춤을 받아들이게(위 settle 설명)
+            return out;
+        };
+
+        const auto maxDifference = [] (const std::vector<float>& a, const std::vector<float>& b)
+        {
+            float worst = 0.0f;
+
+            for (size_t i = 0; i < juce::jmin (a.size(), b.size()); ++i)
+                worst = juce::jmax (worst, std::abs (a[i] - b[i]));
+
+            return worst;
+        };
+
+        const auto originalOut = play (original, false, true, 1.0, 2.0);
+        const auto stemsOn = play (original, true, true, 1.0, 2.0);
+        const auto restOut = play (rest, false, true, 1.0, 2.0);
+        const auto stemsOff = play (original, true, false, 1.0, 2.0);
+        const float pulseSize = maxDifference (originalOut, restOut);
+
+        log ("stems: drums on vs original max diff " + dbText (maxDifference (originalOut, stemsOn))
+             + ", drums off vs rest max diff " + dbText (maxDifference (restOut, stemsOff))
+             + " (pulse size " + dbText (pulseSize) + ")");
+
+        // 재생 중에 끄기: 미리 읽어 둔 0.7초와 상관없이 다음 펄스(0.25초 뒤)부터 사라져야 한다.
+        {
+            juce::String e;
+            engine->prepareOffline (rate, 512);
+            engine->loadSong (original, e);
+            engine->useSongStems (rest, drums, e);
+            engine->setSongDrumsOn (true);
+            engine->setPosition (1.0);
+            capture (0.3, 512);
+            engine->play();
+            const auto before = capture (1.0, 512);   // 1.0~2.0초: 펄스 2.25? 아님 → 1.25, 1.75
+            engine->setSongDrumsOn (false);
+            const auto after = capture (1.0, 512);    // 2.0~3.0초: 펄스 2.25, 2.75 → 사라져야 함
+            engine->pause();
+
+            float peakBefore = 0.0f, peakAfter = 0.0f;
+
+            for (auto v : before)
+                peakBefore = juce::jmax (peakBefore, std::abs (v));
+
+            for (auto v : after)
+                peakAfter = juce::jmax (peakAfter, std::abs (v));
+
+            log ("stems toggle while playing: peak before " + dbText (peakBefore) + ", right after turning drums off " + dbText (peakAfter)
+                 + " (sine only would be about " + dbText (0.2f * 0.49f) + ")");
+        }
+
+        // 원곡 그대로 재생하다가 분리한 파일로 바꿔도 위치와 재생 상태가 이어져야 한다.
+        {
+            juce::String e;
+            engine->prepareOffline (rate, 512);
+            engine->loadSong (original, e);
+            engine->setSongDrumsOn (true);
+            engine->setPosition (2.0);
+            engine->play();
+            capture (0.5, 512);
+            const double positionBefore = engine->getPosition();
+            const bool ok = engine->useSongStems (rest, drums, e);
+            log ("stems switch while playing: " + juce::String (ok ? "ok" : "FAILED " + e) + ", position " + juce::String (positionBefore, 3)
+                 + " -> " + juce::String (engine->getPosition(), 3) + " s, playing " + juce::String ((int) engine->isPlaying()));
+            engine->pause();
+        }
+
+        engine->drum.mute = false;
+        engine->setSongDrumsOn (true);
+        juce::String e;
+        engine->loadSong (toneFile, e);   // 다른 점검이 쓰던 곡으로 되돌리고 시험 파일을 지운다
+
+        for (const auto& f : { original, rest, drums })
+            f.deleteFile();
+    }
+
+    juce::File report, toneFile;
+    int settleMs;
+    std::unique_ptr<Engine> engine;
+    juce::CriticalSection logLock;
+    juce::StringArray lines;
+};
+
+//==============================================================================
+// 실제 소리 장치와 저장된 드럼 킷으로 버퍼 크기마다 끊김과 처리 부하를 잰다. 출력은 무음이다.
+//   DrumVstHost.exe --probe-latency 결과.txt [--seconds 초] [--soak 초]
+//   --soak을 주면 저장된 원곡을 재생하는 경우와 녹음까지 하는 경우도 그 시간만큼 잰다.
+class LatencyProbe final : private juce::Thread
+{
+public:
+    LatencyProbe (juce::PropertiesFile& settings, const juce::File& reportFile, int secondsPerSize, int soakSecondsToUse,
+                  const juce::String& songPathToUse)
+        : juce::Thread ("latency probe"), report (reportFile), seconds (juce::jmax (2, secondsPerSize)),
+          soakSeconds (juce::jmax (0, soakSecondsToUse)), songPath (songPathToUse)
+    {
+        engine = std::make_unique<Engine> (true, &settings);
+        engine->master.volume = 0.0f;
+        startThread();
+    }
+
+    ~LatencyProbe() override
+    {
+        stopThread (30000);
+        engine.reset();
+    }
+
+private:
+    void log (const juce::String& line)
+    {
+        const juce::ScopedLock lock (logLock);
+        lines.add (line);
+    }
+
+    static juce::String ms (double value) { return juce::String (value, 1) + " ms"; }
+
+    void describeDevice()
+    {
+        auto* device = engine->deviceManager.getCurrentAudioDevice();
+
+        if (device == nullptr)
+        {
+            log ("device: none");
+            return;
+        }
+
+        juce::StringArray sizes, rates;
+
+        for (auto s : device->getAvailableBufferSizes())
+            sizes.add (juce::String (s));
+
+        for (auto r : device->getAvailableSampleRates())
+            rates.add (juce::String (r, 0));
+
+        log ("device: " + device->getTypeName() + " / " + device->getName()
+             + ", rate " + juce::String (device->getCurrentSampleRate(), 0)
+             + ", buffer " + juce::String (device->getCurrentBufferSizeSamples())
+             + " (driver default " + juce::String (device->getDefaultBufferSize()) + ")"
+             + ", output latency " + juce::String (device->getOutputLatencyInSamples()) + " smp"
+             + ", input latency " + juce::String (device->getInputLatencyInSamples()) + " smp");
+        log ("  buffer sizes: " + sizes.joinIntoString (" "));
+        log ("  sample rates: " + rates.joinIntoString (" "));
+        log ("  midi inputs: " + engine->getMidiInputNames().joinIntoString (", "));
+    }
+
+    void finish()
+    {
+        juce::MessageManager::callAsync ([this]
+        {
+            {
+                const juce::ScopedLock lock (logLock);
+                report.replaceWithText (lines.joinIntoString ("\r\n") + "\r\n");
+            }
+
+            juce::JUCEApplication::quit();
+        });
+    }
+
+    void run() override
+    {
+        int originalSize = 0;
+        bool wantedDevice = false;
+
+        runOnMessageThread ([&]
+        {
+            describeDevice();
+            wantedDevice = engine->isWantedAudioDeviceOpen();
+
+            const int overloads = engine->getDriverOverloads();
+            log ("  driver overload report: " + (overloads < 0 ? juce::String ("not supported by this driver")
+                                                                : juce::String (overloads) + " so far"));
+        });
+
+        // 다른 프로그램(보통 이미 켜 둔 DrumVstHost)이 ASIO를 잡고 있으면 다른 장치로 열리므로 재지 않는다.
+        if (! wantedDevice)
+        {
+            log ("ABORT: the saved sound device could not be opened (is DrumVstHost or another app using it?)");
+            finish();
+            return;
+        }
+
+        runOnMessageThread ([&]
+        {
+            originalSize = engine->getBufferSize();
+
+            auto state = engine->getSavedPluginState();
+            juce::String error;
+            const auto start = juce::Time::getMillisecondCounterHiRes();
+            const bool ok = engine->loadPlugin (engine->getSavedPluginPath(), state.isEmpty() ? nullptr : &state, error);
+
+            log ("plugin: " + (ok ? engine->getPluginName() + " " + engine->describePluginBuses() : "FAILED " + error)
+                 + " (" + juce::String (juce::roundToInt (juce::Time::getMillisecondCounterHiRes() - start)) + " ms, saved state "
+                 + juce::String ((int) state.getSize()) + " bytes)");
+        });
+
+        wait (12000);   // 킷 샘플을 읽을 시간
+
+        // 원곡(장시간 시험용): 저장된 곡
+        if (soakSeconds > 0)
+        {
+            runOnMessageThread ([&]
+            {
+                juce::String error;
+                const auto path = songPath.isNotEmpty() ? songPath : engine->getSavedSongPath();
+                const juce::File song (path);
+                const bool ok = path.isNotEmpty() && engine->loadSong (song, error);
+                log ("song: " + (ok ? song.getFileName() + " (" + juce::String (engine->getLength(), 1) + " s)" : "none " + error));
+            });
+        }
+
+        juce::Array<int> available;
+        runOnMessageThread ([&] { available = engine->getAvailableBufferSizes(); });
+
+        juce::Array<int> sizes;
+
+        for (int size : { 32, 48, 64, 96, 128, 192, 256, 512 })
+            if (available.contains (size))
+                sizes.add (size);
+
+        if (sizes.isEmpty() && ! available.isEmpty())   // 예: Windows Audio의 480
+            sizes.add (available.getFirst());
+
+        for (int size : sizes)
+        {
+            if (threadShouldExit())
+                break;
+
+            int actual = 0;
+            float outputMs = 0.0f, estimatedMs = 0.0f;
+            juce::String error;
+
+            runOnMessageThread ([&]
+            {
+                engine->setBufferSize (size, error);
+                actual = engine->getBufferSize();
+                outputMs = engine->getOutputLatencyMs();
+                estimatedMs = engine->getEstimatedLatencyMs();
+            });
+
+            log ("buffer " + juce::String (size) + " -> " + juce::String (actual) + " smp: output latency " + ms (outputMs)
+                 + ", estimated hit-to-sound " + ms (estimatedMs) + (error.isNotEmpty() ? " | error " + error : juce::String()));
+
+            wait (1500);
+            scenario ("  drums only", seconds, false, false);
+
+            if (soakSeconds > 0 && engine->hasSong())
+            {
+                scenario ("  drums + song", soakSeconds, true, false);
+                scenario ("  drums + song + recording", soakSeconds, true, true);
+            }
+        }
+
+        runOnMessageThread ([&] { juce::String error; engine->setBufferSize (originalSize, error); });   // 설정 파일은 바꾸지 않는다
+        log ("done");
+        finish();
+    }
+
+    // 드럼 패턴을 seconds초 동안 치면서 끊김·CPU·콜백 간격을 잰다. 필요하면 원곡 재생과 녹음을 같이 켠다.
+    void scenario (const juce::String& label, int durationSeconds, bool withSong, bool withRecording)
+    {
+        const auto recordFolder = report.getSiblingFile ("probe-recording");
+
+        if (withSong)
+            runOnMessageThread ([&] { engine->setPosition (juce::jmin (20.0, engine->getLength() * 0.2)); engine->play(); });
+
+        if (withRecording)
+            runOnMessageThread ([&] { juce::String error; engine->startRecording (recordFolder, error); });
+
+        wait (700);
+
+        const auto before = engine->getMonitor();
+        engine->resetMonitorMaxima();
+        engine->takeMaxMidiWaitMs();
+        const int xrunsBefore = engine->getXRunCount();
+        engine->drum.peakL = 0.0f;
+        engine->drum.peakR = 0.0f;
+        engine->song.peakL = 0.0f;
+        engine->song.peakR = 0.0f;
+        double cpuSum = 0.0, cpuMax = 0.0;
+        float midiWaitMax = 0.0f;
+        int count = 0;
+
+        static constexpr int pattern[] = { 36, 42, 38, 42, 36, 46, 38, 49, 48, 45, 43, 51 };
+        const int steps = durationSeconds * 20;
+
+        for (int i = 0; i < steps && ! threadShouldExit(); ++i)
+        {
+            // 실제 드럼 모듈과 같은 MIDI 입력 경로로 넣는다(패드 신호를 기다린 시간도 함께 잰다).
+            const int note = pattern[i % (int) std::size (pattern)];
+            engine->injectMidiForTest (juce::MidiMessage::noteOn (10, note, (juce::uint8) 120));
+            wait (25);
+            engine->injectMidiForTest (juce::MidiMessage::noteOff (10, note));
+            wait (25);
+
+            const double cpu = engine->getCpuUsage();
+            cpuSum += cpu;
+            cpuMax = juce::jmax (cpuMax, cpu);
+            midiWaitMax = juce::jmax (midiWaitMax, engine->takeMaxMidiWaitMs());
+            ++count;
+        }
+
+        const int xruns = engine->getXRunCount() - xrunsBefore;
+        const auto after = engine->getMonitor();
+        const float drumPeak = juce::jmax (engine->drum.peakL.exchange (0.0f), engine->drum.peakR.exchange (0.0f));
+        const float songPeak = juce::jmax (engine->song.peakL.exchange (0.0f), engine->song.peakR.exchange (0.0f));
+        double recorded = 0.0;
+
+        if (withRecording)
+            runOnMessageThread ([&] { recorded = engine->getRecordedSeconds(); engine->stopRecording(); });
+
+        if (withSong)
+            runOnMessageThread ([&] { engine->pause(); });
+
+        recordFolder.deleteRecursively();
+
+        const auto delta = [] (juce::uint32 a, juce::uint32 b) { return juce::String ((juce::int64) (b - a)); };
+
+        log (label + " (" + juce::String (durationSeconds) + " s): juce xruns " + juce::String (xruns)
+             + " | cpu avg " + juce::String (cpuSum / juce::jmax (1, count) * 100.0, 1) + "% max " + juce::String (cpuMax * 100.0, 1) + "%"
+             + " | drum peak " + dbText (drumPeak) + (withSong ? ", song peak " + dbText (songPeak) : juce::String())
+             + (withRecording ? ", recorded " + juce::String (recorded, 1) + " s" : juce::String()));
+        log ("      monitor: callbacks " + delta (before.callbacks, after.callbacks) + " every " + ms (after.blockMs)
+             + " (driver headroom " + ms (after.headroomMs) + ")"
+             + " | likely dropouts " + delta (before.likelyDropouts, after.likelyDropouts)
+             + ", near misses " + delta (before.nearMiss, after.nearMiss)
+             + ", own overruns " + delta (before.ownOverruns, after.ownOverruns)
+             + ", late " + delta (before.late, after.late) + " / slightly late " + delta (before.lateNear, after.lateNear)
+             + ", restarts " + delta (before.streamStarts, after.streamStarts)
+             + ", plugin skips " + delta (before.pluginSkips, after.pluginSkips)
+             + ", warm-up " + delta (before.warmupAnomalies, after.warmupAnomalies)
+             + " | longest callback " + ms (after.maxDurationMs) + ", worst lateness " + ms (after.maxExcessMs)
+             + " | midi wait max " + ms (midiWaitMax));
+    }
+
+    juce::File report;
+    int seconds, soakSeconds;
+    juce::String songPath;
+    std::unique_ptr<Engine> engine;
+    juce::CriticalSection logLock;
+    juce::StringArray lines;
+};
+
+//==============================================================================
+class App final : public juce::JUCEApplication
+{
+public:
+    const juce::String getApplicationName() override       { return "DrumVstHost"; }
+    const juce::String getApplicationVersion() override    { return JUCE_APPLICATION_VERSION_STRING; }
+
+    bool moreThanOneInstanceAllowed() override
+    {
+        const auto commandLine = getCommandLineParameters();
+        return commandLine.contains ("--selftest") || commandLine.contains ("--snapshot") || commandLine.contains ("--probe-latency");
+    }
+
+    void initialise (const juce::String& commandLine) override
+    {
+        // 드럼 분리(파이썬)가 물려받는 환경: 분리 모델은 이미 받아 둔 것만 쓴다(인터넷에서 몰래 받지 않게;
+        // separate.py가 'hf://' 이름으로 불러 받아 둔 것이 없으면 오류로 끝난다).
+        // UTF-8·버퍼 없는 출력은 실행 옵션(-X utf8 -u)으로 준다. -I 때문에 PYTHON* 환경 변수는 무시된다.
+        setProcessEnvironmentVariable ("HF_HUB_OFFLINE", "1");
+
+        const auto args = juce::StringArray::fromTokens (commandLine, true);
+
+        juce::PropertiesFile::Options options;
+        options.applicationName = "DrumVstHost";
+        options.filenameSuffix = ".settings";
+        options.folderName = "DrumVstHost";
+        options.osxLibrarySubFolder = "Application Support";
+        options.storageFormat = juce::PropertiesFile::storeAsXML;
+        properties.setStorageParameters (options);
+
+        auto* settings = properties.getUserSettings();
+
+        //   --settings-file 파일   다른 설정 파일을 쓴다(확인용: 사용자 설정을 건드리지 않게)
+        if (const auto file = argAfter (args, "--settings-file"); file.isNotEmpty())
+        {
+            testSettings = std::make_unique<juce::PropertiesFile> (juce::File (file), options);
+            settings = testSettings.get();
+        }
+
+        // 화면 언어: 설정에서 고른 것(language = ko·en), 없으면 Windows 표시 언어가 한국어일 때만 한국어, 그 밖에는 영어.
+        //   --lang ko|en   이번 실행만 그 언어로(확인용)
+        {
+            auto language = argAfter (args, "--lang");
+
+            if (language.isEmpty())
+                language = settings->getValue ("language");
+
+            if (language.isEmpty())
+                language = juce::SystemStats::getDisplayLanguage().startsWithIgnoreCase ("ko") ? "ko" : "en";
+
+            lang::setEnglish (! language.startsWithIgnoreCase ("ko"));
+        }
+
+        // 비정상 종료되면 원인을 찾을 수 있게 그 순간의 호출 경로를 exe 옆에 남긴다.
+        installCrashReporter (juce::File::getSpecialLocation (juce::File::currentExecutableFile)
+                                  .getParentDirectory().getChildFile (lang::pick ("충돌 기록.txt", "Crash log.txt")));
+
+        if (! lang::isEnglish())   // JUCE에 들어 있는 글자(파일 고르기 창 등)의 한국어 번역
+            juce::LocalisedStrings::setCurrentMappings (new juce::LocalisedStrings (juce::String::fromUTF8 (koreanStrings), false));
+
+        look = std::make_unique<Look>();
+        juce::LookAndFeel::setDefaultLookAndFeel (look.get());
+
+        //   --selftest 결과.txt [--use-saved-kit]   저장된 킷으로 점검하려면 --use-saved-kit (설정은 바꾸지 않는다)
+        if (args.contains ("--selftest"))
+        {
+            const auto settle = argAfter (args, "--settle");
+            selfTest = std::make_unique<SelfTest> (juce::File (argAfter (args, "--selftest")),
+                                                   argAfter (args, "--plugin"),
+                                                   settle.isNotEmpty() ? settle.getIntValue() : 4000,
+                                                   args.contains ("--use-saved-kit") ? settings : nullptr);
+            return;
+        }
+
+        if (args.contains ("--probe-latency"))
+        {
+            const auto seconds = argAfter (args, "--seconds");
+            probe = std::make_unique<LatencyProbe> (*settings, juce::File (argAfter (args, "--probe-latency")),
+                                                    seconds.isNotEmpty() ? seconds.getIntValue() : 6,
+                                                    argAfter (args, "--soak").getIntValue(),
+                                                    argAfter (args, "--song"));
+            return;
+        }
+
+        const bool snapshot = args.contains ("--snapshot");
+        const bool fresh = args.contains ("--fresh");   // 저장된 값 없이 처음 실행한 것처럼
+
+        // --no-audio: 소리 장치·드럼 MIDI를 열지 않는다(사용 중인 앱 옆에서 화면만 확인할 때)
+        engine = std::make_unique<Engine> (! args.contains ("--no-audio"), fresh ? nullptr : settings);
+        window = std::make_unique<MainWindow> (*engine, *settings);
+        saveOnExit = ! snapshot && ! fresh && ! args.contains ("--no-save");
+
+        if (args.contains ("--minimised"))   // 확인용 실행이 사용 중인 화면을 가리지 않게
+            window->setMinimised (true);
+
+        window->getMain().setAutosave (saveOnExit);
+
+        if (! args.contains ("--no-restore"))
+            window->getMain().restoreSession();
+
+        if (snapshot)
+            scheduleSnapshot (juce::File (argAfter (args, "--snapshot")),
+                              juce::jmax (500, argAfter (args, "--delay").getIntValue()),
+                              args.contains ("--tone-open"));
+
+        // 아래는 모양·동작 확인용 옵션이다.
+        if (const auto song = argAfter (args, "--song"); song.isNotEmpty())
+            window->getMain().openSong (juce::File (song));
+
+        if (args.contains ("--play"))
+            engine->play();
+
+        if (args.contains ("--silent"))
+            engine->master.volume = 0.0f;
+
+        if (args.contains ("--editor"))
+            callOnceAfterDelay (5000, [this]
+            {
+                if (window != nullptr)
+                    window->getMain().openPluginWindow();
+            });
+
+        if (args.contains ("--hit"))
+            hitter = std::make_unique<Hitter> (*engine);
+
+        //   --record-folder 폴더   녹음 위치를 이번 실행에서만 바꾼다
+        //   --record-test 초       6초 뒤 녹음을 시작해 정한 시간 뒤 끝낸다(끝나면 다듬기 창이 열린다)
+        //   --open-take 폴더       녹음 다듬기 창을 연다
+        //   --quit-after 초        정한 시간 뒤 정상 종료한다
+        if (const auto folder = argAfter (args, "--record-folder"); folder.isNotEmpty())
+            window->getMain().setRecordFolder (juce::File (folder));
+
+        if (const auto take = argAfter (args, "--open-take"); take.isNotEmpty())
+            callOnceAfterDelay (1500, [this, take]
+            {
+                if (window != nullptr)
+                    window->getMain().openTakeEditor (juce::File (take));
+            });
+
+        if (const auto seconds = argAfter (args, "--record-test"); seconds.isNotEmpty())
+        {
+            const int lengthMs = juce::jmax (1, seconds.getIntValue()) * 1000;
+
+            callOnceAfterDelay (6000, [this, lengthMs]
+            {
+                if (window == nullptr)
+                    return;
+
+                window->getMain().startRecordingForTest();
+
+                callOnceAfterDelay (lengthMs, [this]
+                {
+                    if (window != nullptr)
+                        window->getMain().stopRecordingForTest();
+                });
+            });
+        }
+
+        if (const auto seconds = argAfter (args, "--quit-after"); seconds.isNotEmpty())
+            callOnceAfterDelay (juce::jmax (1, seconds.getIntValue()) * 1000, [] { juce::JUCEApplication::quit(); });
+
+        //   --snapshot-pad 화면.png   패드 맞추기 창을 열어 PNG로 저장한 뒤 끝낸다
+        if (const auto png = argAfter (args, "--snapshot-pad"); png.isNotEmpty())
+            callOnceAfterDelay (2500, [this, png]
+            {
+                if (window == nullptr)
+                    return;
+
+                if (auto* panel = window->getMain().openPadMapForTest())
+                {
+                    const auto image = panel->createComponentSnapshot (panel->getLocalBounds(), true, 2.0f);
+                    const juce::File file (png);
+                    file.deleteFile();
+
+                    if (auto stream = file.createOutputStream())
+                    {
+                        juce::PNGImageFormat format;
+                        format.writeImageToStream (image, *stream);
+                    }
+                }
+
+                quit();
+            });
+
+        //   --snapshot-take 화면.png   다듬기 창이 열리면 예시 값(지연만큼 당기기, 앞뒤 자르기)을 넣고 PNG로 저장한 뒤 끝낸다
+        if (const auto png = argAfter (args, "--snapshot-take"); png.isNotEmpty())
+            waitForTakeEditor (juce::File (png), 120);
+    }
+
+    void waitForTakeEditor (const juce::File& png, int triesLeft)
+    {
+        callOnceAfterDelay (500, [this, png, triesLeft]
+        {
+            if (window == nullptr)
+                return;
+
+            auto* editor = window->getMain().getTakeEditor();
+
+            if (editor == nullptr)
+            {
+                if (triesLeft > 0)
+                    waitForTakeEditor (png, triesLeft - 1);
+                else
+                    quit();
+
+                return;
+            }
+
+            editor->runSnapshotDemo();
+
+            callOnceAfterDelay (600, [this, png]
+            {
+                if (window == nullptr)
+                    return;
+
+                if (auto* ed = window->getMain().getTakeEditor())
+                {
+                    const auto image = ed->createComponentSnapshot (ed->getLocalBounds(), true, 2.0f);
+                    png.deleteFile();
+
+                    if (auto stream = png.createOutputStream())
+                    {
+                        juce::PNGImageFormat format;
+                        format.writeImageToStream (image, *stream);
+                    }
+                }
+
+                quit();
+            });
+        });
+    }
+
+    void shutdown() override
+    {
+        if (saveOnExit && engine != nullptr && window != nullptr)
+        {
+            auto* settings = testSettings != nullptr ? testSettings.get() : properties.getUserSettings();
+            window->getMain().saveSession();
+            window->savePosition();
+            engine->saveState (*settings);
+            settings->saveIfNeeded();
+        }
+
+        hitter.reset();
+        probe.reset();
+        selfTest.reset();
+        window.reset();
+        engine.reset();
+
+        juce::LookAndFeel::setDefaultLookAndFeel (nullptr);
+        look.reset();
+    }
+
+    void systemRequestedQuit() override
+    {
+        quit();
+    }
+
+    void anotherInstanceStarted (const juce::String&) override
+    {
+        if (window != nullptr)
+            window->toFront (true);
+    }
+
+private:
+    // 화면을 PNG로 저장하고 끝낸다(모양 확인용).
+    //   DrumVstHost.exe --snapshot 화면.png [--delay 밀리초] [--tone-open] [--no-restore] [--fresh]
+    void scheduleSnapshot (const juce::File& file, int delayMs, bool toneOpen)
+    {
+        callOnceAfterDelay (delayMs, [this, file, toneOpen]
+        {
+            if (window == nullptr)
+                return;
+
+            if (toneOpen)
+                window->getMain().setToneOpen (true, true);
+
+            callOnceAfterDelay (400, [this, file]
+            {
+                if (window == nullptr)
+                    return;
+
+                auto& main = window->getMain();
+                const auto image = main.createComponentSnapshot (main.getLocalBounds(), true, 2.0f);
+
+                file.deleteFile();
+
+                if (auto stream = file.createOutputStream())
+                {
+                    juce::PNGImageFormat png;
+                    png.writeImageToStream (image, *stream);
+                }
+
+                quit();
+            });
+        });
+    }
+
+    // 0.4초마다 킥·스네어·하이햇을 번갈아 친다(--hit).
+    struct Hitter final : private juce::Timer
+    {
+        explicit Hitter (Engine& e) : engine (e) { startTimer (400); }
+
+        void timerCallback() override
+        {
+            static constexpr int notes[] = { 36, 42, 38, 42 };
+            engine.playTestNote (notes[step++ % 4], 0.9f);
+        }
+
+        Engine& engine;
+        int step = 0;
+    };
+
+    std::unique_ptr<Hitter> hitter;
+    std::unique_ptr<Look> look;
+    juce::ApplicationProperties properties;
+    std::unique_ptr<juce::PropertiesFile> testSettings;
+    std::unique_ptr<Engine> engine;
+    std::unique_ptr<MainWindow> window;
+    std::unique_ptr<SelfTest> selfTest;
+    std::unique_ptr<LatencyProbe> probe;
+    bool saveOnExit = false;
+};
+
+START_JUCE_APPLICATION (App)

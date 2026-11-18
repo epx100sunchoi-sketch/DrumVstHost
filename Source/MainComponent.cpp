@@ -1,0 +1,3114 @@
+#include "MainComponent.h"
+#include "DrumPlugins.h"
+#include "Platform.h"
+#include "SongTools.h"
+#include "TakeEditor.h"
+#include "Widgets.h"
+
+namespace
+{
+constexpr int contentLeft = 62, sidePad = 24;
+constexpr int section1Height = 156, section2Height = 118, section3Height = 256;
+const char* const separationModel = "htdemucs";
+
+juce::String lastLineOf (const juce::String& output)
+{
+    auto lines = juce::StringArray::fromLines (output.replaceCharacter ('\r', '\n'));
+    lines.removeEmptyStrings();
+    return lines.isEmpty() ? juce::String() : lines[lines.size() - 1].trim();
+}
+
+// 분석·분리 도구가 남긴 출력에서 초심자가 알아볼 만한 설명을 고른다.
+juce::String explainToolError (const juce::String& output, const char* fallback)
+{
+    if (output.contains ("too short"))                       return K ("곡이 너무 짧습니다");
+    if (output.contains ("silent"))                          return K ("소리가 거의 없는 파일입니다");
+    if (output.contains ("no steady beat"))                  return K ("일정한 박자를 찾지 못했습니다");
+    if (output.contains ("ModuleNotFoundError"))             return K ("분석 도구 설치가 덜 됐습니다");
+    if (output.contains ("model not downloaded"))            return K ("드럼 분리 모델이 이 PC에 없습니다");
+    if (output.contains ("MemoryError") || output.contains ("out of memory") || output.contains ("not enough memory"))
+        return K ("메모리가 부족합니다. 다른 프로그램을 닫고 다시 눌러 주세요");
+
+    return K (fallback);
+}
+
+// 마디 첫 박 표시를 shift박 뒤로 옮긴다(높은 클릭 위치 고치기). 맨 앞은 4박 주기로 채운다.
+void shiftDownbeats (BeatMap& map, int shift)
+{
+    shift = ((shift % 4) + 4) % 4;
+
+    if (shift == 0 || map.downbeat.empty())
+        return;
+
+    const auto old = map.downbeat;
+    const int n = (int) old.size();
+
+    for (int i = 0; i < n; ++i)
+    {
+        int from = i - shift;
+
+        if (from < 0)
+            from += 4;
+
+        map.downbeat[(size_t) i] = from < n ? old[(size_t) from] : 0;
+    }
+}
+
+juce::File downbeatShiftFile (const juce::File& cache)   { return cache.getChildFile ("downbeat_shift.txt"); }
+int readDownbeatShift (const juce::File& cache)          { return downbeatShiftFile (cache).loadFileAsString().trim().getIntValue(); }
+
+// 곡마다 기억하는 메트로놈 맞춤: 빠르기(1·2·0.5)와 클릭 시점(ms, + 이면 늦게). 곡 분석 폴더의 metronome.json.
+struct MetronomeTweak
+{
+    static constexpr int maxOffsetMs = 2000;   // 느린 곡(30BPM)에서도 한 박까지 옮길 수 있게
+    double speed = 1.0;
+    int offsetMs = 0;
+};
+
+juce::File metronomeTweakFile (const juce::File& cache)  { return cache.getChildFile ("metronome.json"); }
+
+MetronomeTweak readMetronomeTweak (const juce::File& cache)
+{
+    MetronomeTweak tweak;
+    const auto json = juce::JSON::parse (metronomeTweakFile (cache));
+
+    if (json.isObject())
+    {
+        const double speed = (double) json.getProperty ("speed", 1.0);
+        tweak.speed = speed >= 1.5 ? 2.0 : (speed <= 0.75 ? 0.5 : 1.0);
+        tweak.offsetMs = juce::jlimit (-MetronomeTweak::maxOffsetMs, MetronomeTweak::maxOffsetMs, (int) json.getProperty ("offsetMs", 0));
+    }
+
+    return tweak;
+}
+
+void writeMetronomeTweak (const juce::File& cache, const MetronomeTweak& tweak)
+{
+    if (cache == juce::File() || ! cache.createDirectory())
+        return;
+
+    auto* object = new juce::DynamicObject();
+    object->setProperty ("speed", tweak.speed);
+    object->setProperty ("offsetMs", tweak.offsetMs);
+    metronomeTweakFile (cache).replaceWithText (juce::JSON::toString (juce::var (object)));
+}
+
+// 박 길이(ms) 기준으로 1/4박 단위에 맞으면 "½박" 같은 박 단위로, 아니면 ms로 보여 준다.
+juce::String beatFractionText (int offsetMs, double beatMs)
+{
+    if (beatMs <= 0.0)
+        return {};
+
+    const double quarters = std::abs (offsetMs) / (beatMs * 0.25);
+    const int q = juce::roundToInt (quarters);
+
+    if (q == 0 || std::abs (quarters - q) * beatMs * 0.25 > 3.0)   // 3ms 넘게 어긋나면 박 단위가 아니다
+        return {};
+
+    const int whole = q / 4, part = q % 4;
+    const char* const parts[] = { "", "\xc2\xbc", "\xc2\xbd", "\xc2\xbe" };   // ¼ ½ ¾
+    return (whole > 0 ? juce::String (whole) : juce::String()) + juce::String::fromUTF8 (parts[part]) + K ("박");
+}
+
+juce::String clickOffsetText (int offsetMs, double beatMs, bool shortForm)
+{
+    if (offsetMs == 0)
+        return shortForm ? juce::String() : K ("원곡에서 찾은 그대로");
+
+    const auto beats = beatFractionText (offsetMs, beatMs);
+    const auto direction = offsetMs > 0 ? K (" 늦게") : K (" 빠르게");
+
+    if (shortForm)
+        return beats.isNotEmpty() ? beats + direction : (offsetMs > 0 ? "+" : "-") + juce::String (std::abs (offsetMs)) + "ms";
+
+    return (beats.isNotEmpty() ? beats + direction + " (" : juce::String())
+         + juce::String (std::abs (offsetMs)) + (beats.isNotEmpty() ? "ms)" : K ("ms") + direction);
+}
+constexpr int sectionTop = 14, titleHeight = 24, labelColumn = 110;
+constexpr int browseId = 100000, rescanId = 100001, browseFolderId = 100002, removeAddedId = 100003, driverPanelId = 1;
+
+// 패드 배치를 설정에 넣고 꺼낸다: <PADMAPS><MAP device="DTX Drums-1" enabled="1" rows="36=35;38=;…"/></PADMAPS>
+PadMap readPadMap (juce::PropertiesFile& settings, const juce::String& device)
+{
+    PadMap map;
+
+    if (const auto all = settings.getXmlValue ("padMaps"))
+    {
+        for (const auto* entry : all->getChildWithTagNameIterator ("MAP"))
+        {
+            if (entry->getStringAttribute ("device") == device)
+            {
+                map.fromString (entry->getStringAttribute ("rows"));
+                map.enabled = entry->getBoolAttribute ("enabled", false);
+                break;
+            }
+        }
+    }
+
+    return map;
+}
+
+void writePadMap (juce::PropertiesFile& settings, const juce::String& device, const PadMap& map)
+{
+    auto all = settings.getXmlValue ("padMaps");
+
+    if (all == nullptr || ! all->hasTagName ("PADMAPS"))
+        all = std::make_unique<juce::XmlElement> ("PADMAPS");
+
+    juce::XmlElement* target = nullptr;
+
+    for (auto* entry : all->getChildWithTagNameIterator ("MAP"))
+        if (entry->getStringAttribute ("device") == device)
+            target = entry;
+
+    if (target == nullptr)
+    {
+        target = all->createNewChildElement ("MAP");
+        target->setAttribute ("device", device);
+    }
+
+    target->setAttribute ("enabled", map.enabled);
+    target->setAttribute ("rows", map.toString());
+    settings.setValue ("padMaps", all.get());
+}
+
+juce::String describeTakeFolder (const juce::File& folder)
+{
+    TakeInfo info;
+
+    if (! info.load (folder) || info.recordedAt.toMilliseconds() <= 0)
+        return folder.getFileName();
+
+    const auto t = info.recordedAt;
+    return juce::String (t.getMonth() + 1) + K ("월 ") + juce::String (t.getDayOfMonth()) + K ("일 ")
+         + juce::String (t.getHours()).paddedLeft ('0', 2) + ":" + juce::String (t.getMinutes()).paddedLeft ('0', 2)
+         + "   (" + clockText (info.getLengthSeconds()) + ")"
+         + (info.songName.isNotEmpty() ? "   " + info.songName : juce::String());
+}
+} // namespace
+
+//==============================================================================
+// 좌우 두 줄짜리 가로 레벨 미터. 초록 → 주황 → 빨강.
+class LevelMeter final : public juce::Component
+{
+public:
+    LevelMeter() { setInterceptsMouseClicks (false, false); }
+
+    void push (float left, float right)
+    {
+        const auto follow = [] (float shown, float incoming)
+        {
+            const float next = juce::jmax (incoming, shown * 0.84f);
+            return next < 1.0e-4f ? 0.0f : next;
+        };
+
+        const float newLeft = follow (levelL, left), newRight = follow (levelR, right);
+
+        if (newLeft != levelL || newRight != levelR)
+        {
+            levelL = newLeft;
+            levelR = newRight;
+            repaint();
+        }
+    }
+
+    void paint (juce::Graphics& g) override
+    {
+        const auto area = getLocalBounds().toFloat();
+        const float barHeight = 5.0f, gap = 3.0f;
+        const float top = area.getCentreY() - (barHeight * 2.0f + gap) * 0.5f;
+
+        drawBar (g, { area.getX(), top, area.getWidth(), barHeight }, levelL);
+        drawBar (g, { area.getX(), top + barHeight + gap, area.getWidth(), barHeight }, levelR);
+    }
+
+private:
+    static float toProportion (float gain)
+    {
+        const float db = juce::Decibels::gainToDecibels (gain, -80.0f);
+        return juce::jlimit (0.0f, 1.0f, (db + 54.0f) / 54.0f);
+    }
+
+    static void drawBar (juce::Graphics& g, juce::Rectangle<float> bar, float level)
+    {
+        g.setColour (ui::track);
+        g.fillRoundedRectangle (bar, 2.5f);
+
+        const float p = toProportion (level);
+
+        if (p <= 0.0f)
+            return;
+
+        const float amberFrom = 42.0f / 54.0f, redFrom = 51.0f / 54.0f;   // -12dB, -3dB
+
+        juce::Graphics::ScopedSaveState state (g);
+        juce::Path clip;
+        clip.addRoundedRectangle (bar, 2.5f);
+        g.reduceClipRegion (clip);
+
+        const auto fill = [&] (float from, float to, juce::Colour colour)
+        {
+            if (p > from)
+            {
+                g.setColour (colour);
+                g.fillRect (bar.getX() + bar.getWidth() * from, bar.getY(),
+                            bar.getWidth() * (juce::jmin (p, to) - from), bar.getHeight());
+            }
+        };
+
+        fill (0.0f, amberFrom, ui::green);
+        fill (amberFrom, redFrom, ui::accent);
+        fill (redFrom, 1.0f, ui::red);
+    }
+
+    float levelL = 0.0f, levelR = 0.0f;
+};
+
+//==============================================================================
+// 원곡 파형. 지나간 부분은 강조색으로 칠하고, 누르거나 끌면 그 위치로 이동한다.
+class WaveformView final : public juce::Component,
+                           private juce::ChangeListener
+{
+public:
+    explicit WaveformView (juce::AudioThumbnail& thumbnailToUse) : thumbnail (thumbnailToUse)
+    {
+        thumbnail.addChangeListener (this);
+    }
+
+    ~WaveformView() override
+    {
+        thumbnail.removeChangeListener (this);
+    }
+
+    std::function<void (double)> onSeek;
+
+    // 박자 분석이 끝나면 마디 첫 박 자리에 옅은 세로선을 긋는다.
+    void setBars (std::vector<double> barTimes)
+    {
+        bars = std::move (barTimes);
+        repaint();
+    }
+
+    void setPosition (double seconds, double lengthSeconds, bool songLoaded)
+    {
+        const double p = lengthSeconds > 0.0 ? juce::jlimit (0.0, 1.0, seconds / lengthSeconds) : 0.0;
+
+        if (songLoaded != hasSong)
+            setMouseCursor (songLoaded ? juce::MouseCursor::PointingHandCursor : juce::MouseCursor::NormalCursor);
+
+        if (std::abs (p - proportion) > 1.0e-5 || songLoaded != hasSong || lengthSeconds != length)
+        {
+            proportion = p;
+            length = lengthSeconds;
+            hasSong = songLoaded;
+            repaint();
+        }
+    }
+
+    void paint (juce::Graphics& g) override
+    {
+        const auto bounds = getLocalBounds().toFloat();
+        g.setColour (ui::track);
+        g.fillRoundedRectangle (bounds, 6.0f);
+
+        if (! hasSong)
+        {
+            g.setColour (ui::textDim);
+            g.setFont (ui::font (14.5f));
+            g.drawText (K ("음악 파일(MP3·WAV·FLAC)을 여기로 끌어다 놓아도 됩니다"), getLocalBounds(), juce::Justification::centred);
+            return;
+        }
+
+        const auto inner = getInner();
+        const double total = thumbnail.getTotalLength();
+
+        if (length > 0.0 && ! bars.empty())
+        {
+            g.setColour (ui::text.withAlpha (0.13f));
+
+            for (double t : bars)
+                g.fillRect ((float) inner.getX() + (float) (inner.getWidth() * t / length), bounds.getY() + 2.0f, 1.0f, bounds.getHeight() - 4.0f);
+        }
+
+        if (total > 0.0)
+        {
+            g.setColour (juce::Colour (0xff4c525d));
+            thumbnail.drawChannel (g, inner, 0.0, total, 0, 1.0f);
+
+            const int played = juce::roundToInt (inner.getWidth() * proportion);
+
+            if (played > 0)
+            {
+                juce::Graphics::ScopedSaveState state (g);
+                g.reduceClipRegion (inner.withWidth (played));
+                g.setColour (ui::accent);
+                thumbnail.drawChannel (g, inner, 0.0, total, 0, 1.0f);
+            }
+        }
+
+        const float x = (float) inner.getX() + (float) inner.getWidth() * (float) proportion;
+        g.setColour (ui::text);
+        g.fillRect (x - 1.0f, bounds.getY() + 4.0f, 2.0f, bounds.getHeight() - 8.0f);
+    }
+
+    void mouseDown (const juce::MouseEvent& e) override { seekTo (e.x); }
+    void mouseDrag (const juce::MouseEvent& e) override { seekTo (e.x); }
+
+private:
+    juce::Rectangle<int> getInner() const { return getLocalBounds().reduced (10, 6); }
+
+    void seekTo (int x)
+    {
+        if (! hasSong || length <= 0.0)
+            return;
+
+        const auto inner = getInner();
+        const double p = juce::jlimit (0.0, 1.0, (x - inner.getX()) / (double) juce::jmax (1, inner.getWidth()));
+
+        if (onSeek != nullptr)
+            onSeek (p * length);
+    }
+
+    void changeListenerCallback (juce::ChangeBroadcaster*) override { repaint(); }
+
+    juce::AudioThumbnail& thumbnail;
+    double proportion = 0.0, length = 0.0;
+    bool hasSong = false;
+    std::vector<double> bars;
+};
+
+//==============================================================================
+// 노브 하나 + 이름 + 현재 값. 가운데 값(0)이면 효과가 없다.
+class ToneKnob final : public juce::Component
+{
+public:
+    ToneKnob (const juce::String& nameToUse, bool isBipolar, std::atomic<float>& targetToUse, const juce::String& tooltip)
+        : name (nameToUse), bipolar (isBipolar), target (targetToUse)
+    {
+        slider.setSliderStyle (juce::Slider::RotaryHorizontalVerticalDrag);
+        slider.setTextBoxStyle (juce::Slider::NoTextBox, false, 0, 0);
+        slider.setRotaryParameters (juce::MathConstants<float>::pi * 1.25f, juce::MathConstants<float>::pi * 2.75f, true);
+        slider.setMouseClickGrabsKeyboardFocus (false);
+        slider.setWantsKeyboardFocus (false);
+
+        if (bipolar)
+        {
+            slider.setRange (-12.0, 12.0, 0.5);
+            slider.getProperties().set ("bipolar", true);
+        }
+        else
+        {
+            slider.setRange (0.0, 100.0, 1.0);
+        }
+
+        slider.setDoubleClickReturnValue (true, 0.0);
+        slider.setTooltip (tooltip + K (" 더블클릭하면 0으로 돌아갑니다."));
+        refresh();
+
+        slider.onValueChange = [this]
+        {
+            target = (float) (bipolar ? slider.getValue() : slider.getValue() / 100.0);
+            repaint();
+
+            if (onChange != nullptr)
+                onChange();
+        };
+
+        addAndMakeVisible (slider);
+    }
+
+    std::function<void()> onChange;
+
+    void refresh()
+    {
+        slider.setValue (bipolar ? (double) target.load() : std::round ((double) target.load() * 100.0), juce::dontSendNotification);
+        repaint();
+    }
+
+    void resized() override
+    {
+        slider.setBounds (0, 0, getHeight(), getHeight());
+    }
+
+    void paint (juce::Graphics& g) override
+    {
+        const int textX = getHeight() + 8;
+        const int centre = getHeight() / 2;
+        const double value = slider.getValue();
+
+        g.setFont (ui::font (15.0f));
+        g.setColour (ui::text);
+        g.drawText (name, textX, centre - 20, getWidth() - textX, 20, juce::Justification::centredLeft);
+
+        juce::String valueText ("0");
+
+        if (value != 0.0)
+            valueText = bipolar ? (value > 0.0 ? "+" : "") + juce::String (value, 1) : juce::String (juce::roundToInt (value));
+
+        g.setFont (ui::font (13.5f));
+        g.setColour (value != 0.0 ? ui::accent : ui::textDim);
+        g.drawText (valueText, textX, centre + 1, getWidth() - textX, 18, juce::Justification::centredLeft);
+    }
+
+private:
+    juce::String name;
+    bool bipolar;
+    std::atomic<float>& target;
+    juce::Slider slider;
+};
+
+//==============================================================================
+// 믹서 한 줄: 이름 · 음소거 · 볼륨 · 숫자 · 미터 · 소리 다듬기.
+class ChannelRow final : public juce::Component
+{
+public:
+    static constexpr int rowHeight = 44, toneHeight = 62;
+
+    ChannelRow (const juce::String& nameToUse, ChannelSettings& settingsToUse, bool fullControls, double defaultVolume)
+        : name (nameToUse), settings (settingsToUse), full (fullControls)
+    {
+        volume.setSliderStyle (juce::Slider::LinearHorizontal);
+        volume.setTextBoxStyle (juce::Slider::NoTextBox, false, 0, 0);
+        volume.setRange (0.0, 100.0, 1.0);
+        volume.setDoubleClickReturnValue (true, defaultVolume);
+        volume.setValue (std::round ((double) settings.volume.load() * 100.0), juce::dontSendNotification);
+        volume.setMouseClickGrabsKeyboardFocus (false);
+        volume.setWantsKeyboardFocus (false);
+        volume.setTooltip (K ("끌어서 볼륨을 조절합니다. 더블클릭하면 처음 값으로 돌아갑니다."));
+        volume.onValueChange = [this]
+        {
+            settings.volume = (float) (volume.getValue() / 100.0);
+            repaint();
+        };
+
+        addAndMakeVisible (volume);
+        addAndMakeVisible (meter);
+
+        if (! full)
+            return;
+
+        muteButton.setButtonText (K ("음소거"));
+        muteButton.setClickingTogglesState (true);
+        muteButton.setColour (juce::TextButton::buttonOnColourId, ui::red);
+        muteButton.setColour (juce::TextButton::textColourOnId, juce::Colours::white);
+        styleButton (muteButton, K ("이 소리만 잠깐 끕니다."));
+        muteButton.onClick = [this]
+        {
+            settings.mute = muteButton.getToggleState();
+            repaint();
+        };
+        addAndMakeVisible (muteButton);
+
+        toneButton.setButtonText (K ("소리 다듬기"));
+        toneButton.setClickingTogglesState (true);
+        toneButton.setColour (juce::TextButton::buttonOnColourId, ui::controlHi);
+        toneButton.setColour (juce::TextButton::textColourOnId, ui::text);
+        styleButton (toneButton, K ("저음·중음·고음(EQ)과 컴프레서를 조절합니다. 모두 0이면 원래 소리 그대로입니다."));
+        toneButton.onClick = [this]
+        {
+            toneOpen = toneButton.getToggleState();
+            updateToneVisibility();
+
+            if (onLayoutChanged != nullptr)
+                onLayoutChanged();
+        };
+        addAndMakeVisible (toneButton);
+
+        knobs.add (new ToneKnob (K ("저음"), true, settings.low, K ("킥과 베이스처럼 낮은 소리를 키우거나 줄입니다.")));
+        knobs.add (new ToneKnob (K ("중음"), true, settings.mid, K ("스네어와 목소리가 있는 가운데 소리를 키우거나 줄입니다.")));
+        knobs.add (new ToneKnob (K ("고음"), true, settings.high, K ("심벌과 하이햇처럼 높고 밝은 소리를 키우거나 줄입니다.")));
+        knobs.add (new ToneKnob (K ("컴프레서"), false, settings.comp, K ("큰 소리와 작은 소리의 차이를 줄여 더 단단하게 들리게 합니다.")));
+
+        for (auto* knob : knobs)
+        {
+            knob->onChange = [this] { repaint(); };
+            addChildComponent (knob);
+        }
+
+        resetButton.setButtonText (K ("원래대로"));
+        styleButton (resetButton, K ("네 개의 노브를 모두 0으로 되돌립니다."));
+        resetButton.onClick = [this]
+        {
+            settings.low = 0.0f;
+            settings.mid = 0.0f;
+            settings.high = 0.0f;
+            settings.comp = 0.0f;
+
+            for (auto* knob : knobs)
+                knob->refresh();
+
+            repaint();
+        };
+        addChildComponent (resetButton);
+    }
+
+    std::function<void()> onLayoutChanged;
+
+    int getIdealHeight() const noexcept   { return rowHeight + (toneOpen ? toneHeight : 0); }
+    bool isToneOpen() const noexcept      { return toneOpen; }
+
+    void setToneOpen (bool shouldBeOpen)
+    {
+        if (! full)
+            return;
+
+        toneOpen = shouldBeOpen;
+        toneButton.setToggleState (shouldBeOpen, juce::dontSendNotification);
+        updateToneVisibility();
+    }
+
+    void updateMeter()
+    {
+        meter.push (settings.peakL.exchange (0.0f), settings.peakR.exchange (0.0f));
+    }
+
+    void paint (juce::Graphics& g) override
+    {
+        if (toneOpen)
+        {
+            g.setColour (ui::surface);
+            g.fillRoundedRectangle (tonePanel.toFloat(), 8.0f);
+        }
+
+        g.setFont (ui::font (16.0f));
+        g.setColour (ui::text);
+        g.drawText (name, nameArea, juce::Justification::centredLeft);
+
+        const bool muted = full && settings.mute.load();
+        g.setFont (ui::font (15.0f));
+        g.setColour (muted ? ui::textDim : ui::text);
+        g.drawText (juce::String (juce::roundToInt (volume.getValue())), valueArea, juce::Justification::centredRight);
+    }
+
+    void paintOverChildren (juce::Graphics& g) override
+    {
+        // 다듬기 값이 하나라도 들어가 있으면 버튼에 점을 찍어 알려 준다.
+        if (full && ! settings.toneIsNeutral())
+        {
+            const auto b = toneButton.getBounds().toFloat();
+            g.setColour (ui::accent);
+            g.fillEllipse (b.getRight() - 12.0f, b.getY() + 6.0f, 6.0f, 6.0f);
+        }
+    }
+
+    void resized() override
+    {
+        auto area = getLocalBounds();
+        auto top = area.removeFromTop (rowHeight);
+
+        nameArea = top.removeFromLeft (48);
+
+        const auto muteArea = top.removeFromLeft (72);
+        top.removeFromLeft (12);
+        const auto toneArea = top.removeFromRight (112);
+        top.removeFromRight (16);
+        meter.setBounds (top.removeFromRight (150));
+        top.removeFromRight (12);
+        valueArea = top.removeFromRight (34);
+        top.removeFromRight (2);
+        volume.setBounds (top);
+
+        if (! full)
+            return;
+
+        muteButton.setBounds (muteArea.withSizeKeepingCentre (72, 30));
+        toneButton.setBounds (toneArea.withSizeKeepingCentre (112, 30));
+
+        tonePanel = area.withTrimmedLeft (48).withTrimmedBottom (6);
+        auto panel = tonePanel.reduced (14, 6);
+        resetButton.setBounds (panel.removeFromRight (88).withSizeKeepingCentre (88, 30));
+
+        for (auto* knob : knobs)
+            knob->setBounds (panel.removeFromLeft (152));
+    }
+
+private:
+    void updateToneVisibility()
+    {
+        for (auto* knob : knobs)
+            knob->setVisible (toneOpen);
+
+        resetButton.setVisible (toneOpen);
+        repaint();
+    }
+
+    juce::String name;
+    ChannelSettings& settings;
+    bool full, toneOpen = false;
+
+    juce::Slider volume;
+    LevelMeter meter;
+    juce::TextButton muteButton, toneButton, resetButton;
+    juce::OwnedArray<ToneKnob> knobs;
+    juce::Rectangle<int> nameArea, valueArea, tonePanel;
+};
+
+//==============================================================================
+class SettingsPanel final : public juce::Component
+{
+public:
+    explicit SettingsPanel (juce::AudioDeviceManager& manager)
+        : selector (manager, 0, 0, 2, 2, false, false, true, false)
+    {
+        hint.setText (K ("· 드럼 모듈에 꽂은 헤드폰으로 들으려면 오디오 방식을 ASIO, 장치를 모듈 드라이버(Yamaha Steinberg USB, Roland TD-xx 등)로 두세요.\n"
+                         "· 버퍼가 작을수록 빨라집니다. 모듈 드라이버는 '드라이버 설정' 창에서 바꿉니다(Yamaha: ASIO 탭 Buffer Size·Mode, Roland: Audio Buffer Size).\n"
+                         "· 소리가 뚝뚝 끊기면 버퍼를 한 칸 크게 하세요."),
+                      juce::dontSendNotification);
+        hint.setFont (ui::font (14.5f));
+        hint.setColour (juce::Label::textColourId, ui::textDim);
+        hint.setJustificationType (juce::Justification::topLeft);
+
+        selector.setItemHeight (28);
+
+        addAndMakeVisible (hint);
+        addAndMakeVisible (selector);
+        setSize (600, 440);
+    }
+
+    void paint (juce::Graphics& g) override { g.fillAll (ui::surface); }
+
+    void resized() override
+    {
+        auto area = getLocalBounds().reduced (20, 16);
+        hint.setBounds (area.removeFromTop (100));
+        selector.setBounds (area);
+    }
+
+private:
+    juce::Label hint;
+    juce::AudioDeviceSelectorComponent selector;
+};
+
+//==============================================================================
+// '신호 보기': 드럼 모듈에서 받은 MIDI를 사람이 읽을 수 있게 보여 주고, exe 옆 'MIDI 기록.txt'에도 적는다.
+// 특정 패드가 엉뚱하게 나거나 가끔 안 날 때, 그 패드가 어떤 음 번호를 보내는지(부분마다 다르다) 확인하는 데 쓴다.
+class MidiMonitorPanel final : public juce::Component, private juce::Timer
+{
+public:
+    MidiMonitorPanel (Engine& engineToUse, DrumModule::Brand moduleBrand, const juce::String& moduleName, const juce::String& pluginName)
+        : engine (engineToUse), brand (moduleBrand)
+    {
+        hint.setText (K ("드럼을 치면 받은 신호가 아래에 나옵니다. 크래시·라이드처럼 부분(몸통·엣지·벨)이 있는 패드는 부분마다 음 번호가 "
+                         "따로 옵니다. 엉뚱하게 나는 패드를 몇 번 쳐 보면 어느 번호가 문제인지 알 수 있습니다."),
+                      juce::dontSendNotification);
+        hint.setFont (ui::font (14.0f));
+        hint.setColour (juce::Label::textColourId, ui::textDim);
+        hint.setJustificationType (juce::Justification::topLeft);
+        addAndMakeVisible (hint);
+
+        view.setMultiLine (true);
+        view.setReadOnly (true);
+        view.setCaretVisible (false);
+        view.setScrollbarsShown (true);
+        view.setFont (ui::font (14.5f));
+        view.setColour (juce::TextEditor::backgroundColourId, ui::bg);
+        view.setColour (juce::TextEditor::textColourId, ui::text);
+        view.setColour (juce::TextEditor::outlineColourId, ui::line);
+        addAndMakeVisible (view);
+
+        summary.setFont (ui::font (14.0f));
+        summary.setColour (juce::Label::textColourId, ui::text);
+        summary.setJustificationType (juce::Justification::topLeft);
+        addAndMakeVisible (summary);
+
+        clearButton.setButtonText (K ("지우기"));
+        clearButton.onClick = [this] { view.clear(); counts.clear(); summary.setText ({}, juce::dontSendNotification); };
+        addAndMakeVisible (clearButton);
+
+        fileButton.setButtonText (K ("기록 파일 열기"));
+        fileButton.onClick = [this] { logFile.revealToUser(); };
+        addAndMakeVisible (fileButton);
+
+        logFile = juce::File::getSpecialLocation (juce::File::currentExecutableFile).getParentDirectory().getChildFile (lang::pick ("MIDI 기록.txt", "MIDI log.txt"));
+        logFile.replaceWithText (K ("DrumVstHost MIDI 기록 ") + juce::Time::getCurrentTime().toString (true, true) + "\r\n"
+                                 + K ("모듈: ") + moduleName + K (", 플러그인: ") + pluginName + "\r\n");
+
+        MidiInbox::MonitorEvent old[256];
+
+        while (engine.readMidiMonitor (old, 256) > 0) {}   // 창을 열기 전에 쌓인 것은 버린다
+
+        started = juce::Time::getMillisecondCounterHiRes();
+        startTimerHz (20);
+        setSize (680, 520);
+    }
+
+    void paint (juce::Graphics& g) override { g.fillAll (ui::surface); }
+
+    void resized() override
+    {
+        auto area = getLocalBounds().reduced (16, 12);
+        hint.setBounds (area.removeFromTop (44));
+        auto buttons = area.removeFromBottom (34);
+        fileButton.setBounds (buttons.removeFromRight (130));
+        buttons.removeFromRight (8);
+        clearButton.setBounds (buttons.removeFromRight (90));
+        area.removeFromBottom (8);
+        summary.setBounds (area.removeFromBottom (44));
+        area.removeFromBottom (6);
+        view.setBounds (area);
+    }
+
+private:
+    juce::String describe (const MidiInbox::MonitorEvent& e)
+    {
+        const int status = e.data[0] & 0xf0;
+        const int channel = (e.data[0] & 0x0f) + 1;
+        const int a = e.size > 1 ? e.data[1] : 0, b = e.size > 2 ? e.data[2] : 0;
+        juce::String text;
+
+        if (e.data[0] == 0xf8 || e.data[0] == 0xfa || e.data[0] == 0xfb || e.data[0] == 0xfc)
+            return {};   // 클록·시작/정지: 너무 잦아 보여 주지 않는다(플러그인에도 넘기지 않는다)
+
+        if (status == 0x90 && b > 0)
+        {
+            ++counts[a];
+            // 모듈 회사의 기본 음 배치로 패드 이름을 붙인다(예: Yamaha 52 = Ride 엣지. General MIDI 이름 'China'가 아니다).
+            const auto pad = drumPadName (brand, a);
+            text << K ("음 ") << juce::String (a).paddedLeft (' ', 3) << K ("  세기 ") << juce::String (b).paddedLeft (' ', 3)
+                 << (pad.isNotEmpty() ? "   (" + pad + ")" : juce::String())
+                 << (e.mappedNote < 128 ? K ("   패드 배치: ") + juce::String ((int) e.mappedNote) + K ("번으로 넘김") : juce::String());
+        }
+        else if (status == 0x80 || status == 0x90)
+        {
+            text << K ("   음 끔 ") << a;
+        }
+        else if (status == 0xa0)
+        {
+            text << K ("초크(애프터터치) 음 ") << a << " = " << b;
+        }
+        else if (status == 0xb0)
+        {
+            // 하이햇 페달은 움직이는 동안 아주 많이 오므로 0.1초에 한 번만 보여 준다.
+            if (a == 4 && e.time - lastPedalShown < 100.0)
+                return {};
+
+            if (a == 4)
+                lastPedalShown = e.time;
+
+            text << (a == 4 ? K ("하이햇 페달(CC4) = ") + juce::String (b) : "CC " + juce::String (a) + " = " + juce::String (b));
+        }
+        else if (status == 0xc0)
+        {
+            text << K ("킷 바꿈(Program Change) ") << a;
+        }
+        else
+        {
+            text << juce::String::toHexString (e.data, e.size, 1);
+        }
+
+        const double seconds = (e.time - started) / 1000.0;
+        return juce::String (seconds, 2).paddedLeft (' ', 8) + "s  ch" + juce::String (channel).paddedLeft (' ', 2) + "  " + text
+               + (e.forwarded ? juce::String() : K ("   (걸러짐: 플러그인에 안 넘김)"));
+    }
+
+    void timerCallback() override
+    {
+        MidiInbox::MonitorEvent events[256];
+        juce::String added;
+
+        for (int n = engine.readMidiMonitor (events, 256); n > 0; n = engine.readMidiMonitor (events, 256))
+            for (int i = 0; i < n; ++i)
+                if (const auto line = describe (events[i]); line.isNotEmpty())
+                    added << line << "\n";
+
+        if (added.isEmpty())
+            return;
+
+        logFile.appendText (added.replace ("\n", "\r\n"));
+
+        // 너무 길어지면 앞부분을 버린다
+        if (view.getTotalNumChars() > 40000)
+            view.setText (view.getText().getLastCharacters (20000).fromFirstOccurrenceOf ("\n", false, false), false);
+
+        view.moveCaretToEnd();
+        view.insertTextAtCaret (added);
+
+        juce::String text = K ("받은 음 번호(횟수): ");
+
+        for (const auto& [note, count] : counts)
+            text << note << "x" << count << "  ";
+
+        summary.setText (text, juce::dontSendNotification);
+    }
+
+    Engine& engine;
+    DrumModule::Brand brand = DrumModule::Brand::none;
+    juce::Label hint, summary;
+    juce::TextEditor view;
+    juce::TextButton clearButton, fileButton;
+    juce::File logFile;
+    std::map<int, int> counts;
+    double started = 0.0, lastPedalShown = 0.0;
+};
+
+//==============================================================================
+MainComponent::MainComponent (Engine& engineToUse, juce::PropertiesFile& settingsToUse)
+    : engine (engineToUse), settings (settingsToUse)
+{
+    setOpaque (true);
+    setWantsKeyboardFocus (true);
+
+    // ① 드럼 연결
+    monitorButton.setButtonText (K ("신호 보기"));
+    styleButton (monitorButton, K ("드럼 모듈에서 받은 신호(패드마다 음 번호·세기, 하이햇 페달, 초크)를 보여 줍니다. "
+                                   "특정 패드가 엉뚱하게 나거나 안 날 때 어떤 번호가 오는지 확인합니다."));
+    monitorButton.onClick = [this] { showMidiMonitor(); };
+    addAndMakeVisible (monitorButton);
+
+    // 화면 언어 바꾸기: 다른 언어의 이름을 그 언어로 보여 준다(다시 켜면 적용).
+    languageButton.setButtonText (lang::isEnglish() ? juce::String::fromUTF8 ("한국어") : juce::String ("English"));
+    styleButton (languageButton, K ("화면 언어를 영어로 바꿉니다. 앱을 다시 켜면 적용됩니다."));
+    languageButton.onClick = [this]
+    {
+        settings.setValue ("language", lang::isEnglish() ? "ko" : "en");
+        settings.saveIfNeeded();
+        languageButton.setButtonText (K ("다시 켜면 적용"));
+        languageButton.setEnabled (false);
+    };
+    addAndMakeVisible (languageButton);
+
+    padButton.setButtonText (K ("패드 맞추기"));
+    padButton.setColour (juce::TextButton::buttonOnColourId, ui::accent);
+    padButton.setColour (juce::TextButton::textColourOnId, ui::onAccent);
+    styleButton (padButton, K ("어떤 전자드럼이든 쓸 수 있게, 패드를 하나씩 쳐서 드럼 VST의 소리(Kick·Snare·Hi-hat…)에 맞춥니다. "
+                               "패드가 엉뚱한 소리를 내거나 소리가 안 날 때 씁니다. 색이 켜져 있으면 배치를 쓰는 중입니다."));
+    padButton.onClick = [this] { showPadMap(); };
+    addAndMakeVisible (padButton);
+
+    settingsButton.setButtonText (K ("소리 장치 설정"));
+    styleButton (settingsButton, K ("소리가 나올 장치를 고르고, 소리가 늦거나 끊길 때 조절합니다."));
+    settingsButton.onClick = [this] { showSettings(); };
+    addAndMakeVisible (settingsButton);
+
+    styleLabel (latencyLabel, 16.0f, ui::text);
+    latencyLabel.setInterceptsMouseClicks (true, false);
+    latencyLabel.setTooltip (K ("패드 신호가 PC에 도착한 뒤 헤드폰에서 소리가 나기까지 걸리는 시간입니다(버퍼 + 장치 출력 + 신호 대기). "
+                                "드럼 모듈과 USB 전송 시간(대략 1~2ms)은 빠져 있습니다. 10ms 아래면 대부분 느끼지 못합니다."));
+    addAndMakeVisible (latencyLabel);
+
+    bufferBox.setMouseClickGrabsKeyboardFocus (false);
+    bufferBox.setWantsKeyboardFocus (false);
+    bufferBox.setTooltip (K ("버퍼 크기입니다. 작을수록 빠르고, 너무 작으면 소리가 끊깁니다."));
+    bufferBox.onChange = [this] { bufferChosen(); };
+    addChildComponent (bufferBox);
+
+    driverButton.setButtonText (K ("버퍼 바꾸기"));
+    styleButton (driverButton, bufferAdviceLong (engine.getAudioDeviceType(), engine.getAudioDeviceName()));   // 장치가 바뀌면 다시 쓴다
+    driverButton.onClick = [this] { openDriverPanel(); };
+    addChildComponent (driverButton);
+
+    // ② 드럼 소리
+    pluginBox.setTextWhenNothingSelected (K ("드럼 소리 플러그인을 고르세요"));
+    pluginBox.setTextWhenNoChoicesAvailable (K ("설치된 VST3 플러그인이 없습니다"));
+    pluginBox.setMouseClickGrabsKeyboardFocus (false);
+    pluginBox.setWantsKeyboardFocus (false);
+    pluginBox.setTooltip (K ("PC에 설치된 VST3 악기(SSD 5.5, BFD 3.5 등) 중에서 드럼 소리를 낼 것을 고릅니다. "
+                             "플러그인을 바꿔도 각 플러그인의 킷과 설정은 따로 기억됩니다."));
+    pluginBox.onChange = [this] { pluginChosen(); };
+    addAndMakeVisible (pluginBox);
+
+    editorButton.setButtonText (K ("드럼 킷 고르기"));
+    styleButton (editorButton, K ("플러그인 창을 열어 드럼 킷과 MIDI 맵을 고르고 소리를 바꿉니다."));
+    editorButton.onClick = [this] { showPluginWindow(); };
+    addAndMakeVisible (editorButton);
+
+    const auto setupTestButton = [this] (juce::TextButton& button, const char* text, int note)
+    {
+        button.setButtonText (K (text));
+        styleButton (button, K ("드럼 없이도 소리가 나는지 확인합니다."));
+        button.onClick = [this, note] { engine.playTestNote (note); };
+        addAndMakeVisible (button);
+    };
+
+    setupTestButton (kickButton, "킥", 36);
+    setupTestButton (snareButton, "스네어", 38);
+    setupTestButton (hatButton, "하이햇", 42);
+
+    styleLabel (drumStatus, 13.5f, ui::textDim);
+    addAndMakeVisible (drumStatus);
+
+    // ③ 원곡과 녹음
+    openSongButton.setButtonText (K ("파일 열기"));
+    styleButton (openSongButton, K ("같이 연주할 음악 파일을 고릅니다."));
+    openSongButton.onClick = [this] { browseForSong(); };
+    addAndMakeVisible (openSongButton);
+
+    styleLabel (songName, 15.5f, ui::textDim);
+    songName.setText (K ("아직 고른 곡이 없습니다"), juce::dontSendNotification);
+    addAndMakeVisible (songName);
+
+    waveform = std::make_unique<WaveformView> (engine.getThumbnail());
+    waveform->onSeek = [this] (double seconds) { engine.setPosition (seconds); };
+    addAndMakeVisible (*waveform);
+
+    playButton = std::make_unique<IconButton>();
+    playButton->setContent (IconButton::Icon::play, K ("재생"));
+    playButton->setTooltip (K ("원곡을 재생하거나 잠시 멈춥니다. (스페이스바)"));
+    playButton->onClick = [this] { togglePlay(); };
+    addAndMakeVisible (*playButton);
+
+    rewindButton = std::make_unique<IconButton>();
+    rewindButton->setContent (IconButton::Icon::rewind, K ("처음으로"));
+    rewindButton->setTooltip (K ("곡의 맨 앞으로 돌아갑니다."));
+    rewindButton->onClick = [this] { engine.rewind(); };
+    addAndMakeVisible (*rewindButton);
+
+    styleLabel (timeLabel, 15.0f, ui::text);
+    timeLabel.setText ("0:00 / 0:00", juce::dontSendNotification);
+    addAndMakeVisible (timeLabel);
+
+    styleLabel (songStatus, 13.5f, ui::textDim);
+    songStatus.setJustificationType (juce::Justification::centredRight);
+    addAndMakeVisible (songStatus);
+
+    recordingsButton.setButtonText (K ("지난 녹음"));
+    styleButton (recordingsButton, K ("녹음한 연주를 다시 열어 볼륨과 타이밍을 다듬거나, 녹음 폴더를 엽니다."));
+    recordingsButton.onClick = [this] { showRecordingsMenu(); };
+    addAndMakeVisible (recordingsButton);
+
+    recordButton = std::make_unique<IconButton>();
+    recordButton->setContent (IconButton::Icon::record, K ("녹음"));
+    recordButton->setTooltip (K ("지금 들리는 소리를 녹음합니다. 곡이 있으면 재생도 함께 시작하고, 끝나면 다듬기 창이 열립니다."));
+    recordButton->onClick = [this] { toggleRecording(); };
+    addAndMakeVisible (*recordButton);
+
+    // ③ 연습 도구
+    const auto setupToggle = [this] (juce::TextButton& button, const char* text, const char* tooltip)
+    {
+        button.setButtonText (K (text));
+        button.setClickingTogglesState (true);
+        button.setColour (juce::TextButton::buttonOnColourId, ui::accent);
+        button.setColour (juce::TextButton::textColourOnId, ui::onAccent);
+        styleButton (button, K (tooltip));
+        addAndMakeVisible (button);
+    };
+
+    setupToggle (metronomeButton, "메트로놈",
+                 "원곡을 분석해 찾은 박자에 맞춰 클릭 소리를 냅니다. 곡마다 처음 한 번만 분석합니다(수십 초). 클릭은 녹음에 들어가지 않습니다.");
+    metronomeButton.onClick = [this] { metronomeClicked(); };
+
+    setupToggle (songDrumsButton, "원곡 드럼 빼기",
+                 "원곡에서 드럼 소리만 빼고 들려줍니다. 곡마다 처음 한 번 분리합니다(1~3분). 다시 누르면 원곡 드럼이 돌아옵니다.");
+    songDrumsButton.onClick = [this] { songDrumsClicked(); };
+
+    metronomeVolume.setSliderStyle (juce::Slider::LinearHorizontal);
+    metronomeVolume.setTextBoxStyle (juce::Slider::NoTextBox, false, 0, 0);
+    // 0~150(100이 예전 최대). 크게 쳐도 클릭이 잘 들리도록 최대를 키웠다.
+    const double maxVolume = Engine::maxMetronomeVolume * 100.0;
+    metronomeVolume.setRange (0.0, maxVolume, 1.0);
+    metronomeVolume.setDoubleClickReturnValue (true, 70.0);
+    metronomeVolume.setMouseClickGrabsKeyboardFocus (false);
+    metronomeVolume.setWantsKeyboardFocus (false);
+    metronomeVolume.setTooltip (K ("메트로놈 클릭 소리 크기입니다. 오른쪽 끝은 예전 최대보다 약 7dB 큽니다. 더블클릭하면 처음 크기로 돌아갑니다."));
+    metronomeVolume.setValue (juce::jlimit (0.0, maxVolume, settings.getDoubleValue ("metronomeVolume", 70.0)), juce::dontSendNotification);
+    engine.metronomeVolume = (float) (metronomeVolume.getValue() / 100.0);
+    metronomeVolume.onValueChange = [this] { engine.metronomeVolume = (float) (metronomeVolume.getValue() / 100.0); };
+    addAndMakeVisible (metronomeVolume);
+
+    for (auto* label : { &metronomeStatus, &songDrumsStatus })
+    {
+        styleLabel (*label, 13.5f, ui::textDim);
+        label->setInterceptsMouseClicks (true, false);   // 자세한 오류를 말풍선으로
+        addAndMakeVisible (*label);
+    }
+
+    metronomeStatus.addMouseListener (this, false);   // 박자를 찾은 뒤에는 눌러서 예비박·강박 위치를 고친다
+
+    // 지난번 연습 도구 상태(곡을 불러오면 그 곡에 맞춰 다시 적용된다)
+    engine.countInEnabled = settings.getBoolValue ("countIn", true);
+    metronomeButton.setToggleState (settings.getBoolValue ("metronomeOn", false), juce::dontSendNotification);
+    songDrumsButton.setToggleState (settings.getBoolValue ("songDrumsOff", false), juce::dontSendNotification);
+    engine.metronomeOn = metronomeButton.getToggleState();
+
+    // ④ 볼륨 맞추기
+    drumRow = std::make_unique<ChannelRow> (K ("드럼"), engine.drum, true, 100.0);
+    songRow = std::make_unique<ChannelRow> (K ("원곡"), engine.song, true, 70.0);
+    masterRow = std::make_unique<ChannelRow> (K ("전체"), engine.master, false, 100.0);
+
+    for (auto* row : { drumRow.get(), songRow.get(), masterRow.get() })
+    {
+        row->onLayoutChanged = [this] { setSize (windowWidth, getIdealHeight()); resized(); };
+        addAndMakeVisible (*row);
+    }
+
+    drumRow->setToneOpen (settings.getBoolValue ("drumToneOpen", false));
+    songRow->setToneOpen (settings.getBoolValue ("songToneOpen", false));
+
+    const auto defaultFolder = dataChild (juce::File::getSpecialLocation (juce::File::currentExecutableFile).getParentDirectory(),
+                                          "녹음", "Recordings");
+    recordFolder = juce::File (settings.getValue ("recordFolder", defaultFolder.getFullPathName()));
+
+    xrunGraceUntil = juce::Time::getMillisecondCounter() + 5000;
+
+    setDrumStatus ({}, false);
+    updateEnabledStates();
+    setSize (windowWidth, getIdealHeight());
+
+    slowRefresh();
+    refreshBufferControls (true);
+    startTimerHz (30);
+}
+
+MainComponent::~MainComponent()
+{
+    stopTimer();
+    closeTakeEditor();
+
+    if (engine.isRecording())
+        engine.stopRecording();
+
+    pluginWindow.reset();
+    settingsWindow.reset();
+}
+
+//==============================================================================
+void MainComponent::restoreSession()
+{
+    populatePluginBox();
+
+    auto path = engine.getSavedPluginPath();
+    bool openWindow = false;
+
+    // 처음 실행했거나 쓰던 플러그인이 지워졌으면, 설치된 드럼 VST 가운데 가장 알맞은 것(Toontrack·XLN 먼저)을
+    // 저절로 불러온다. 처음 쓰는 플러그인이면 킷과 MIDI 맵을 고를 수 있게 플러그인 창도 함께 연다.
+    if (path.isEmpty() || ! juce::File (path).exists())
+    {
+        const auto missing = path;
+        path.clear();
+
+        for (const auto& entry : pluginEntries)
+        {
+            if (entry.isDrum)
+            {
+                path = entry.path;
+                openWindow = ! engine.hasRememberedState (path);
+                autoLoadNote = (missing.isNotEmpty() ? juce::File (missing).getFileNameWithoutExtension() + K ("이(가) 없어서 ") : juce::String())
+                             + K ("설치된 드럼 VST '") + entry.name + K ("'를 저절로 불러왔습니다.");
+                break;
+            }
+        }
+
+        if (path.isEmpty() && missing.isEmpty() && pluginEntries.size() == 1)   // 드럼으로 알아본 것은 없지만 플러그인이 하나뿐
+        {
+            path = pluginEntries.front().path;
+            openWindow = ! engine.hasRememberedState (path);
+        }
+    }
+
+    // 지난번에 이 플러그인을 불러오다가 앱이 꺼졌으면(플러그인 업데이트·망가진 킷 상태 등) 이번에는 저절로 불러오지 않는다.
+    // 그러지 않으면 켤 때마다 같은 자리에서 꺼져 앱을 쓸 수 없게 된다. 두 번 연달아 그랬으면 저장해 둔 킷 상태를 버린다.
+    if (const auto crashed = settings.getValue ("loadingPlugin"); crashed.isNotEmpty() && crashed == path)
+    {
+        const int times = settings.getIntValue ("loadingPluginCrashes", 0) + 1;
+        const auto name = juce::File (path).getFileNameWithoutExtension();
+
+        if (times >= 2)
+            engine.forgetPluginState (path);
+
+        if (autosave)
+        {
+            settings.setValue ("loadingPluginCrashes", times);
+            settings.removeValue ("loadingPlugin");
+            settings.saveIfNeeded();
+        }
+
+        setDrumStatus (K ("지난번에 '") + name + K ("'을(를) 불러오다가 앱이 꺼져서 이번에는 불러오지 않았습니다. 목록에서 다시 고르면 ")
+                           + (times >= 2 ? K ("킷 상태를 처음으로 돌려 불러옵니다.") : K ("한 번 더 불러옵니다.")), true);
+        drumStatusHoldUntil = juce::Time::getMillisecondCounter() + 60000;   // 모듈 안내로 바로 덮이지 않게
+        path.clear();
+    }
+
+    if (path.isNotEmpty() && juce::File (path).exists())
+        startLoadingPlugin (path, openWindow);
+
+    const juce::File songFile (engine.getSavedSongPath());
+
+    if (engine.getSavedSongPath().isNotEmpty() && songFile.existsAsFile())
+        loadSong (songFile);
+}
+
+void MainComponent::saveSession()
+{
+    settings.setValue ("recordFolder", recordFolder.getFullPathName());
+    settings.setValue ("drumToneOpen", drumRow->isToneOpen());
+    settings.setValue ("songToneOpen", songRow->isToneOpen());
+    settings.setValue ("metronomeVolume", metronomeVolume.getValue());
+    settings.setValue ("metronomeOn", metronomeButton.getToggleState());
+    settings.setValue ("songDrumsOff", songDrumsButton.getToggleState());
+    settings.setValue ("countIn", engine.countInEnabled.load());
+}
+
+void MainComponent::saveAllNow()
+{
+    // 앱을 닫을 때만 저장하면 비정상 종료 때 킷·버퍼 설정을 잃는다. 중요한 순간마다 바로 쓴다.
+    // 플러그인을 불러오는 중에는(그사이 메시지가 돌아 여기로 올 수 있다) 끝난 뒤에 저장한다.
+    if (! autosave || loadingPlugin || engine.isLoadingPlugin())
+        return;
+
+    saveSession();
+    engine.saveState (settings);
+    settings.saveIfNeeded();
+}
+
+void MainComponent::setToneOpen (bool drumOpen, bool songOpen)
+{
+    drumRow->setToneOpen (drumOpen);
+    songRow->setToneOpen (songOpen);
+    setSize (windowWidth, getIdealHeight());
+    resized();
+}
+
+void MainComponent::setRecordFolder (const juce::File& folder)
+{
+    recordFolder = folder;
+}
+
+void MainComponent::startRecordingForTest()
+{
+    if (! engine.isRecording())
+        toggleRecording();
+}
+
+void MainComponent::stopRecordingForTest()
+{
+    if (engine.isRecording())
+        finishRecording();
+}
+
+int MainComponent::getIdealHeight() const
+{
+    return section1Height + section2Height + section3Height
+         + sectionTop + titleHeight + 6
+         + drumRow->getIdealHeight() + songRow->getIdealHeight() + masterRow->getIdealHeight()
+         + 14;
+}
+
+void MainComponent::updateEnabledStates()
+{
+    const bool hasPlugin = engine.getPlugin() != nullptr && ! loadingPlugin;
+    editorButton.setEnabled (hasPlugin);
+    kickButton.setEnabled (hasPlugin);
+    snareButton.setEnabled (hasPlugin);
+    hatButton.setEnabled (hasPlugin);
+    pluginBox.setEnabled (! loadingPlugin);
+
+    const bool hasSong = engine.hasSong();
+    playButton->setEnabled (hasSong);
+    rewindButton->setEnabled (hasSong);
+    metronomeButton.setEnabled (hasSong);
+    songDrumsButton.setEnabled (hasSong);
+}
+
+//==============================================================================
+void MainComponent::paint (juce::Graphics& g)
+{
+    g.fillAll (ui::bg);
+
+    const bool drumConnected = ! midiNames.isEmpty();
+    const bool done[] = { drumConnected && deviceOpen, engine.getPlugin() != nullptr, engine.hasSong(), false };
+    const char* const titles[] = { "드럼 연결", "드럼 소리", "원곡", "볼륨 맞추기" };
+
+    for (int i = 0; i < 4; ++i)
+    {
+        const auto area = sections[i];
+
+        if (i > 0)
+        {
+            g.setColour (ui::line);
+            g.fillRect (0, area.getY(), getWidth(), 1);
+        }
+
+        const juce::Rectangle<float> badge ((float) sidePad, (float) (area.getY() + sectionTop), 24.0f, 24.0f);
+
+        if (done[i])
+        {
+            g.setColour (ui::accent);
+            g.fillEllipse (badge);
+            g.setColour (ui::onAccent);
+        }
+        else
+        {
+            g.setColour (ui::outline);
+            g.drawEllipse (badge.reduced (0.75f), 1.5f);
+            g.setColour (ui::textDim);
+        }
+
+        g.setFont (ui::font (14.5f, true));
+        g.drawText (juce::String (i + 1), badge, juce::Justification::centred);
+
+        g.setColour (ui::text);
+        g.setFont (ui::font (17.0f, true));
+        g.drawText (K (titles[i]), contentLeft, area.getY() + sectionTop, 300, titleHeight, juce::Justification::centredLeft);
+    }
+
+    // ① 드럼 연결: 불빛 + 상태 문장
+    {
+        const float cy = (float) midiRow.getCentreY();
+        const juce::Rectangle<float> led ((float) midiRow.getX(), cy - 5.0f, 10.0f, 10.0f);
+
+        if (drumConnected)
+        {
+            if (ledLit)
+            {
+                g.setColour (ui::accent.withAlpha (0.3f));
+                g.fillEllipse (led.expanded (4.0f));
+            }
+
+            g.setColour (ledLit ? ui::accent : ui::green);
+            g.fillEllipse (led);
+        }
+        else
+        {
+            g.setColour (ui::textDim);
+            g.drawEllipse (led.reduced (0.75f), 1.5f);
+        }
+
+        juce::String primary, secondary;
+
+        if (drumConnected)
+        {
+            if (connectedModule.isKnown())
+            {
+                primary = connectedModule.displayName();   // "Roland TD-17", "Yamaha (DTX Drums-1)"
+            }
+            else
+            {
+                primary = midiNames[0];
+
+                if (midiNames.size() == 2)
+                    primary << ", " << midiNames[1];
+                else if (midiNames.size() > 2)
+                    primary << K (" 외 ") << (midiNames.size() - 1) << K ("개");
+            }
+
+            primary << K (" 연결됨");
+            secondary = moduleAdvice.isNotEmpty() ? moduleAdvice : K ("패드를 치면 왼쪽 불이 깜빡입니다");
+        }
+        else
+        {
+            primary = K ("연결된 드럼이 없습니다");
+            secondary = K ("드럼 모듈의 전원과 USB 케이블을 확인하세요");
+        }
+
+        const auto font = ui::font (15.5f);
+        int x = midiRow.getX() + 20;
+        g.setFont (font);
+        g.setColour (ui::text);
+        g.drawText (primary, x, midiRow.getY(), midiRow.getRight() - x, midiRow.getHeight(), juce::Justification::centredLeft);
+
+        x += juce::GlyphArrangement::getStringWidthInt (font, primary) + 14;
+        g.setFont (ui::font (14.0f));
+        g.setColour (drumConnected && moduleAdvice.isNotEmpty() ? ui::accent : ui::textDim);
+        g.drawText (secondary, x, midiRow.getY(), juce::jmax (0, midiRow.getRight() - x), midiRow.getHeight(), juce::Justification::centredLeft);
+    }
+
+    // ① 소리 나오는 곳
+    {
+        const int labelX = deviceRow.getX() + 20;
+        const int x = labelX + labelColumn;
+
+        g.setFont (ui::font (14.0f));
+        g.setColour (ui::textDim);
+        g.drawText (K ("소리 나오는 곳"), labelX, deviceRow.getY(), labelColumn, deviceRow.getHeight(), juce::Justification::centredLeft);
+
+        g.setFont (ui::font (15.5f));
+        g.setColour (deviceOpen ? ui::text : ui::red);
+        g.drawText (deviceOpen ? deviceName : K ("소리 장치를 열지 못했습니다. 오른쪽 버튼으로 장치를 골라 주세요."),
+                    x, deviceRow.getY(), deviceRow.getRight() - x, deviceRow.getHeight(), juce::Justification::centredLeft);
+    }
+
+    // ① 지연: 이름 · (값은 라벨) · 버퍼 · 안내
+    {
+        const int labelX = latencyRow.getX() + 20;
+
+        g.setFont (ui::font (14.0f));
+        g.setColour (ui::textDim);
+        g.drawText (K ("지연"), labelX, latencyRow.getY(), labelColumn, latencyRow.getHeight(), juce::Justification::centredLeft);
+
+        if (! bufferTextArea.isEmpty())
+        {
+            g.setFont (ui::font (14.5f));
+            g.setColour (ui::text);
+            g.drawText (bufferText, bufferTextArea, juce::Justification::centredLeft);
+        }
+
+        int hintX = bufferTextArea.getRight() + 12;
+
+        if (bufferBox.isVisible())
+            hintX = bufferBox.getRight() + 14;
+        else if (driverButton.isVisible())
+            hintX = driverButton.getRight() + 14;
+
+        juce::Colour colour;
+        const auto hint = getLatencyHint (colour);
+        g.setFont (ui::font (13.5f));
+        g.setColour (colour);
+        g.drawFittedText (hint, hintX, latencyRow.getY(), juce::jmax (0, latencyRow.getRight() - hintX), latencyRow.getHeight(),
+                          juce::Justification::centredLeft, 1, 0.85f);
+    }
+
+    // ② 소리 확인
+    g.setFont (ui::font (14.0f));
+    g.setColour (ui::textDim);
+    g.drawText (K ("소리 확인"), testLabelArea, juce::Justification::centredRight);
+}
+
+void MainComponent::resized()
+{
+    const int right = getWidth() - sidePad;
+    const int contentWidth = right - contentLeft;
+    int y = 0;
+
+    // ① 드럼 연결
+    sections[0] = { 0, y, getWidth(), section1Height };
+    {
+        languageButton.setBounds (right - 112, y + sectionTop - 2, 112, 26);
+
+        int cy = y + sectionTop + titleHeight + 6;
+        midiRow = { contentLeft, cy, contentWidth, 26 };
+        monitorButton.setBounds (midiRow.removeFromRight (96));
+        midiRow.removeFromRight (8);
+        padButton.setBounds (midiRow.removeFromRight (110));
+        midiRow.removeFromRight (8);
+        cy += 26 + 4;
+
+        juce::Rectangle<int> row (contentLeft, cy, contentWidth, 32);
+        settingsButton.setBounds (row.removeFromRight (132));
+        deviceRow = row.withTrimmedRight (12);
+        cy += 32 + 4;
+
+        latencyRow = { contentLeft, cy, contentWidth, 32 };
+        int x = latencyRow.getX() + 20 + labelColumn;
+        latencyLabel.setBounds (x, cy, 76, 32);
+        x += 80;
+
+        if (bufferBox.isVisible())
+        {
+            bufferBox.setBounds (x, cy + 1, 200, 30);
+            bufferTextArea = {};
+        }
+        else
+        {
+            const int textWidth = bufferText.isEmpty() ? 0 : juce::GlyphArrangement::getStringWidthInt (ui::font (14.5f), bufferText) + 4;
+            bufferTextArea = { x, cy, textWidth, 32 };
+            x += textWidth + (textWidth > 0 ? 10 : 0);
+            driverButton.setBounds (x, cy + 1, 104, 30);
+        }
+    }
+    y += section1Height;
+
+    // ② 드럼 소리
+    sections[1] = { 0, y, getWidth(), section2Height };
+    {
+        int cy = y + sectionTop + titleHeight + 8;
+        juce::Rectangle<int> row (contentLeft, cy, contentWidth, 36);
+
+        hatButton.setBounds (row.removeFromRight (74));
+        row.removeFromRight (6);
+        snareButton.setBounds (row.removeFromRight (74));
+        row.removeFromRight (6);
+        kickButton.setBounds (row.removeFromRight (60));
+        row.removeFromRight (10);
+        testLabelArea = row.removeFromRight (70);
+
+        pluginBox.setBounds (row.removeFromLeft (300));
+        row.removeFromLeft (8);
+        editorButton.setBounds (row.removeFromLeft (132));
+
+        cy += 36 + 4;
+        drumStatus.setBounds (contentLeft, cy, contentWidth, 18);
+    }
+    y += section2Height;
+
+    // ③ 원곡
+    sections[2] = { 0, y, getWidth(), section3Height };
+    {
+        int cy = y + sectionTop + titleHeight + 8;
+        juce::Rectangle<int> fileRow (contentLeft, cy, contentWidth, 34);
+        openSongButton.setBounds (fileRow.removeFromLeft (104));
+        fileRow.removeFromLeft (12);
+        songName.setBounds (fileRow);
+        cy += 34 + 8;
+
+        waveform->setBounds (contentLeft, cy, contentWidth, 64);
+        cy += 64 + 8;
+
+        {
+            juce::Rectangle<int> tools (contentLeft, cy, contentWidth, 34);
+            metronomeButton.setBounds (tools.removeFromLeft (112));
+            tools.removeFromLeft (10);
+            metronomeVolume.setBounds (tools.removeFromLeft (96));
+            tools.removeFromLeft (10);
+
+            songDrumsStatus.setBounds (tools.removeFromRight (180));
+            tools.removeFromRight (10);
+            songDrumsButton.setBounds (tools.removeFromRight (136));
+            tools.removeFromRight (10);
+            metronomeStatus.setBounds (tools);   // 빠르기·클릭 시점까지 보이도록 남는 자리를 다 쓴다
+        }
+
+        cy += 34 + 8;
+
+        juce::Rectangle<int> row (contentLeft, cy, contentWidth, 38);
+        playButton->setBounds (row.removeFromLeft (112));
+        row.removeFromLeft (8);
+        rewindButton->setBounds (row.removeFromLeft (112));
+        row.removeFromLeft (14);
+        timeLabel.setBounds (row.removeFromLeft (110));
+
+        recordButton->setBounds (row.removeFromRight (150));
+        row.removeFromRight (8);
+        recordingsButton.setBounds (row.removeFromRight (96));
+        row.removeFromRight (12);
+        songStatus.setBounds (row);
+    }
+    y += section3Height;
+
+    // ④ 볼륨 맞추기
+    sections[3] = { 0, y, getWidth(), getHeight() - y };
+    {
+        int cy = y + sectionTop + titleHeight + 6;
+
+        for (auto* row : { drumRow.get(), songRow.get(), masterRow.get() })
+        {
+            row->setBounds (contentLeft, cy, contentWidth, row->getIdealHeight());
+            cy += row->getIdealHeight();
+        }
+    }
+}
+
+bool MainComponent::keyPressed (const juce::KeyPress& key)
+{
+    if (key == juce::KeyPress::spaceKey)
+    {
+        togglePlay();
+        return true;
+    }
+
+    return false;
+}
+
+//==============================================================================
+bool MainComponent::isInterestedInFileDrag (const juce::StringArray& files)
+{
+    return files.size() == 1;
+}
+
+void MainComponent::filesDropped (const juce::StringArray& files, int, int)
+{
+    if (files.isEmpty())
+        return;
+
+    const juce::File file (files[0]);
+
+    if (file.hasFileExtension ("vst3"))
+    {
+        if (! loadingPlugin)
+        {
+            engine.addExtraPluginPath (file.getFullPathName());
+            startLoadingPlugin (file.getFullPathName(), ! engine.hasRememberedState (file.getFullPathName()));
+        }
+    }
+    else if (file.isDirectory() && isTakeFolder (file))
+    {
+        openTakeEditor (file);
+    }
+    else
+    {
+        loadSong (file);
+    }
+}
+
+//==============================================================================
+void MainComponent::timerCallback()
+{
+    const auto now = juce::Time::getMillisecondCounter();
+
+    drumRow->updateMeter();
+    songRow->updateMeter();
+    masterRow->updateMeter();
+
+    // 재생 상태
+    const bool playing = engine.isPlaying();
+
+    if (playing != shownPlaying)
+    {
+        shownPlaying = playing;
+        playButton->setContent (playing ? IconButton::Icon::pause : IconButton::Icon::play,
+                                playing ? K ("일시정지") : K ("재생"));
+    }
+
+    const double length = engine.hasSong() ? engine.getLength() : 0.0;
+    const double position = engine.hasSong() ? engine.getPosition() : 0.0;
+    waveform->setPosition (position, length, engine.hasSong());
+
+    const auto timeText = clockText (position) + " / " + clockText (length);
+
+    if (timeText != shownTime)
+    {
+        shownTime = timeText;
+        timeLabel.setText (timeText, juce::dontSendNotification);
+    }
+
+    // 녹음. 장치가 바뀌어(샘플 속도가 달라져) 엔진이 녹음을 스스로 멈췄으면 버튼을 눌러 끝낸 것처럼 마무리한다.
+    if (wasRecording && ! engine.isRecording())
+        finishRecording();
+
+    wasRecording = engine.isRecording();
+
+    if (engine.isRecording())
+    {
+        recordButton->setContent (IconButton::Icon::stop, K ("녹음 끝내기 ") + clockText (engine.getRecordedSeconds()), true);
+
+        // 곡이 끝나면 드럼 여운이 담길 만큼만 더 기다렸다가 저절로 끝낸다.
+        if (recordStartedPlayback && recordStopAt == 0 && engine.hasSongFinished())
+            recordStopAt = now + 1500;
+
+        if (recordStopAt != 0 && now >= recordStopAt)
+            finishRecording();
+    }
+
+    if (songStatusUntil != 0 && now >= songStatusUntil)
+        setSongStatus ({}, false);
+
+    // 드럼을 치면 불빛이 깜빡인다
+    const auto noteCount = engine.getMidiNoteCount();
+
+    if (noteCount != lastNoteCount)
+    {
+        lastNoteCount = noteCount;
+        ledUntil = now + 130;
+    }
+
+    const bool lit = now < ledUntil;
+
+    if (lit != ledLit)
+    {
+        ledLit = lit;
+        repaint (midiRow.withWidth (40).expanded (8));
+    }
+
+    if (++tick % 30 == 0)
+        slowRefresh();
+
+    if (tick % (30 * 120) == 0)   // 2분마다
+        saveAllNow();
+}
+
+void MainComponent::slowRefresh()
+{
+    engine.refreshMidiInputs();
+
+    // 장치·버퍼가 바뀌었으면 여기서 먼저 알아채고 경고 유예를 건다(바꾸면서 장치가 다시 시작되는 것은 끊김이 아니다).
+    refreshBufferControls (false);
+
+    const auto names = engine.getMidiInputNames();
+    const auto newDevice = engine.getAudioDeviceName();
+    const bool open = engine.isAudioDeviceOpen();
+    const float newLatency = engine.getEstimatedLatencyMs();
+    const auto now = juce::Time::getMillisecondCounter();
+
+    // 10초마다 플러그인 폴더를 훑어 새로 설치된 드럼 VST를 알아챈다.
+    if (++pluginScanCounter % 10 == 0)
+        checkForNewPlugins();
+
+    // 연결된 드럼 모듈(Yamaha·Roland 등)과 그 모듈에 맞는 안내
+    {
+        const auto module = identifyDrumModule (engine.getMidiInputDevices());
+        bool driverInstalled = false;
+
+        for (const auto& driver : engine.getAsioDriverNames())
+            if (module.isKnown() && driverBrand (driver) == module.brand)
+                driverInstalled = true;
+
+        const bool driverOpen = engine.getAudioDeviceType() == "ASIO" && module.isKnown()
+                                && driverBrand (engine.getAudioDeviceName()) == module.brand;
+        const auto advice = moduleConnectionAdvice (module, driverInstalled, driverOpen);
+
+        if (module.displayName() != connectedModule.displayName() || advice != moduleAdvice)
+        {
+            connectedModule = module;
+            moduleAdvice = advice;
+
+            if (! loadingPlugin && juce::Time::getMillisecondCounter() >= drumStatusHoldUntil)
+                setDrumStatus ({}, false);   // 모듈에 맞는 맵 안내로 바꾼다
+
+            repaint();
+        }
+
+        // 패드 배치는 MIDI 입력 이름마다 따로 둔다(알아본 모듈이면 그 입력, 아니면 첫 번째 입력).
+        const auto padDevice = module.isKnown() && module.midiInput.isNotEmpty() ? module.midiInput
+                                                                                 : (names.isEmpty() ? juce::String() : names[0]);
+
+        if (! padMapLoaded || padDevice != padMapDevice)
+            loadPadMapFor (padDevice);
+    }
+
+    // 설정 창이 열려 있는 동안의 장치 재시작('장치 다시 시작', 드라이버 설정 등)은 사용자가 한 일이라 끊김으로 보지 않는다.
+    if (const auto starts = engine.getMonitor().streamStarts; starts != lastStreamStarts)
+    {
+        if (settingsWindow != nullptr && settingsWindow->isVisible())
+            ignoredRestarts += (juce::int64) (starts - lastStreamStarts);
+
+        lastStreamStarts = starts;
+    }
+
+    // 소리 끊김: 버퍼가 너무 작거나 컴퓨터가 바쁠 때 생긴다. 장치를 막 열었을 때는 세지 않는다.
+    const auto problems = (juce::int64) engine.getProblemCount() - ignoredRestarts;
+
+    if (now < xrunGraceUntil || lastXruns < 0 || problems < lastXruns)
+        lastXruns = problems;
+    else if (problems > lastXruns)
+    {
+        lastXruns = problems;
+        xrunWarningUntil = now + 8000;
+    }
+
+    const bool warning = now < xrunWarningUntil;
+
+    if (names != midiNames || newDevice != deviceName || open != deviceOpen || warning != showingXrunWarning
+        || std::abs (newLatency - latencyMs) > 0.05f)
+    {
+        midiNames = names;
+        deviceName = newDevice;
+        deviceOpen = open;
+        showingXrunWarning = warning;
+        latencyMs = newLatency;
+
+        if (latencyMs > 0.0f)
+        {
+            latencyLabel.setText (K ("약 ") + juce::String (juce::roundToInt (latencyMs)) + "ms", juce::dontSendNotification);
+            latencyLabel.setColour (juce::Label::textColourId, latencyMs <= 10.0f ? ui::green : (latencyMs <= 20.0f ? ui::accent : ui::red));
+        }
+        else
+        {
+            latencyLabel.setText ("-", juce::dontSendNotification);
+            latencyLabel.setColour (juce::Label::textColourId, ui::textDim);
+        }
+
+        repaint();
+    }
+}
+
+//==============================================================================
+void MainComponent::refreshBufferControls (bool force)
+{
+    const auto sizes = engine.getAvailableBufferSizes();
+    const int current = engine.getBufferSize();
+    const double rate = engine.getDeviceSampleRate();
+    const bool panel = engine.hasDriverPanel();
+
+    // 출력 지연도 넣는다: Yamaha 드라이버 창에서 Mode만 바꿔도 장치가 다시 시작된다.
+    juce::String signature;
+    signature << engine.getAudioDeviceType() << '|' << engine.getAudioDeviceName() << '|' << current << '|' << rate << '|' << (panel ? 1 : 0)
+              << '|' << juce::roundToInt (engine.getOutputLatencyMs() * 10.0f);
+
+    for (auto s : sizes)
+        signature << ',' << s;
+
+    if (! force && signature == bufferSignature)
+        return;
+
+    const bool deviceChanged = bufferSignature.isNotEmpty() && signature != bufferSignature;
+    bufferSignature = signature;
+    driverButton.setTooltip (bufferAdviceLong (engine.getAudioDeviceType(), engine.getAudioDeviceName()));
+
+    if (deviceChanged)
+    {
+        // 사용자가 장치·버퍼를 바꾼 것: 그 때문에 장치가 다시 시작된 것은 끊김 경고로 보이지 않는다.
+        xrunGraceUntil = juce::Time::getMillisecondCounter() + 4000;
+        xrunWarningUntil = 0;
+        lastXruns = -1;
+        saveAllNow();   // 버퍼·장치가 바뀌면 바로 저장
+    }
+
+    const auto describe = [rate] (int size)
+    {
+        return juce::String (size) + K (" 샘플 · ") + juce::String (size * 1000.0 / rate, 1) + "ms";
+    };
+
+    bufferBox.clear (juce::dontSendNotification);
+
+    if (current <= 0 || rate <= 0.0)
+    {
+        bufferText.clear();
+        bufferBox.setVisible (false);
+        driverButton.setVisible (false);
+    }
+    else if (sizes.size() <= 1)
+    {
+        // 드라이버가 크기를 하나만 허용한다(Yamaha 등). 바꾸려면 드라이버 설정 창을 연다.
+        bufferText = K ("버퍼 ") + juce::String (current) + K (" 샘플");
+        bufferBox.setVisible (false);
+        driverButton.setVisible (panel);
+    }
+    else
+    {
+        bufferText.clear();
+
+        for (auto s : sizes)
+            if (s >= 16 && s <= 4096)
+                bufferBox.addItem (describe (s), s);
+
+        if (! sizes.contains (current))
+            bufferBox.addItem (describe (current), current);
+
+        if (panel)
+        {
+            bufferBox.addSeparator();
+            bufferBox.addItem (K ("드라이버 설정 열기…"), driverPanelId);
+        }
+
+        bufferBox.setSelectedId (current, juce::dontSendNotification);
+        bufferBox.setVisible (true);
+        driverButton.setVisible (false);
+    }
+
+    resized();
+    repaint();
+}
+
+void MainComponent::bufferChosen()
+{
+    const int id = bufferBox.getSelectedId();
+
+    if (id == driverPanelId)
+    {
+        bufferBox.setSelectedId (engine.getBufferSize(), juce::dontSendNotification);
+        openDriverPanel();
+        return;
+    }
+
+    if (id < 16 || id == engine.getBufferSize())
+        return;
+
+    engine.stopAudioRetry();
+    juce::String error;
+    bufferError = engine.setBufferSize (id, error) ? juce::String() : K ("버퍼를 바꾸지 못했습니다: ") + error;
+
+    xrunGraceUntil = juce::Time::getMillisecondCounter() + 3000;
+    xrunWarningUntil = 0;
+    lastXruns = -1;
+
+    slowRefresh();
+    refreshBufferControls (true);
+}
+
+void MainComponent::openDriverPanel()
+{
+    engine.stopAudioRetry();
+    engine.setQuietFor (4000);
+
+    juce::Component::SafePointer<MainComponent> safe (this);
+    callOnceAfterDelay (50, [safe]
+    {
+        if (safe == nullptr)
+            return;
+
+        safe->engine.showDriverPanel();
+        safe->xrunGraceUntil = juce::Time::getMillisecondCounter() + 4000;
+        safe->xrunWarningUntil = 0;
+        safe->lastXruns = -1;
+        safe->bufferError.clear();
+        safe->slowRefresh();
+        safe->refreshBufferControls (true);
+    });
+}
+
+juce::String MainComponent::getLatencyHint (juce::Colour& colour) const
+{
+    colour = ui::textDim;
+
+    if (! deviceOpen)
+        return {};
+
+    if (bufferError.isNotEmpty())
+    {
+        colour = ui::red;
+        return bufferError;
+    }
+
+    if (showingXrunWarning)
+    {
+        colour = ui::red;
+        return K ("소리가 끊겼습니다. 버퍼를 한 칸 크게 해 주세요.");
+    }
+
+    if (latencyMs > 20.0f)
+    {
+        colour = ui::accent;
+
+        if (engine.getAudioDeviceType() != "ASIO" || driverButton.isVisible())
+            return bufferAdviceShort (engine.getAudioDeviceType(), engine.getAudioDeviceName());
+
+        return K ("버퍼를 64~128 샘플로 낮춰 보세요.");
+    }
+
+    return K ("버퍼가 작을수록 빠르고, 너무 작으면 소리가 끊깁니다.");
+}
+
+void MainComponent::showMidiMonitor()
+{
+    if (monitorWindow == nullptr)
+    {
+        monitorWindow = std::make_unique<ToolWindow> (K ("신호 보기"),
+                                                      new MidiMonitorPanel (engine, connectedModule.brand, connectedModule.displayName(), engine.getPluginName()), true);
+        monitorWindow->centreAroundComponent (this, monitorWindow->getWidth(), monitorWindow->getHeight());
+
+        // 닫으면 없앤다(받은 신호 쌓기를 멈추고, 다음에 열 때 기록을 새로 시작한다).
+        juce::Component::SafePointer<MainComponent> safe (this);
+        monitorWindow->onClose = [safe]
+        {
+            juce::MessageManager::callAsync ([safe]
+            {
+                if (safe != nullptr)
+                    safe->monitorWindow.reset();
+            });
+        };
+    }
+
+    monitorWindow->setVisible (true);
+    monitorWindow->toFront (true);
+}
+
+void MainComponent::showSettings()
+{
+    engine.stopAudioRetry();
+
+    if (settingsWindow == nullptr)
+    {
+        settingsWindow = std::make_unique<ToolWindow> (K ("소리 장치 설정"), new SettingsPanel (engine.deviceManager), false);
+        settingsWindow->centreAroundComponent (this, settingsWindow->getWidth(), settingsWindow->getHeight());
+
+        // 설정 창에서 고른 장치를 앞으로 다시 연결할 장치로 삼고 바로 저장한다.
+        juce::Component::SafePointer<MainComponent> safe (this);
+        settingsWindow->onClose = [safe]
+        {
+            if (safe == nullptr)
+                return;
+
+            safe->engine.adoptCurrentDeviceAsWanted();
+            safe->xrunGraceUntil = juce::Time::getMillisecondCounter() + 4000;
+            safe->xrunWarningUntil = 0;
+            safe->lastXruns = -1;
+            safe->saveAllNow();
+        };
+    }
+
+    settingsWindow->setVisible (true);
+    settingsWindow->toFront (true);
+}
+
+//==============================================================================
+void MainComponent::populatePluginBox()
+{
+    pluginEntries = engine.findInstalledPlugins();
+    knownPluginPaths.clear();
+
+    for (const auto& entry : pluginEntries)
+        knownPluginPaths.add (entry.path);
+
+    syncPluginBox();
+}
+
+void MainComponent::checkForNewPlugins()
+{
+    // 앱을 켜 둔 채 드럼 VST를 새로 설치해도 목록에 저절로 나타나게 한다(파일만 훑으므로 가볍다).
+    // 목록을 열어 둔 동안에는 항목 번호가 바뀌지 않게 건너뛴다.
+    if (loadingPlugin || engine.isLoadingPlugin() || pluginBox.isPopupActive())
+        return;
+
+    auto entries = engine.findInstalledPlugins();
+    juce::StringArray paths;
+
+    for (const auto& entry : entries)
+        paths.add (entry.path);
+
+    if (paths == knownPluginPaths)
+        return;
+
+    juce::String newDrumName, newDrumPath;
+
+    for (const auto& entry : entries)
+    {
+        if (entry.isDrum && ! knownPluginPaths.contains (entry.path))
+        {
+            newDrumName = entry.name;
+            newDrumPath = entry.path;
+            break;
+        }
+    }
+
+    knownPluginPaths = paths;
+    pluginEntries = std::move (entries);
+    syncPluginBox();
+
+    if (newDrumPath.isEmpty())
+        return;
+
+    if (engine.getPlugin() == nullptr)
+    {
+        // 아직 드럼 소리가 없으면 바로 불러온다(처음 쓰는 것이면 킷을 고를 수 있게 창도 연다).
+        autoLoadNote = K ("새로 설치된 드럼 VST '") + newDrumName + K ("'를 저절로 불러왔습니다.");
+        startLoadingPlugin (newDrumPath, ! engine.hasRememberedState (newDrumPath));
+    }
+    else
+    {
+        setDrumStatus (K ("새로 설치된 드럼 VST '") + newDrumName + K ("'를 찾았습니다. 위 목록에서 고르면 바로 씁니다."), false);
+    }
+}
+
+void MainComponent::syncPluginBox()
+{
+    const auto current = engine.getPluginPath();
+
+    if (current.isNotEmpty()
+        && std::none_of (pluginEntries.begin(), pluginEntries.end(), [&] (const PluginEntry& e) { return e.path == current; }))
+    {
+        const auto drum = recogniseDrumPlugin (juce::File (current));
+        pluginEntries.push_back ({ drum.isDrum ? drum.displayName : juce::File (current).getFileNameWithoutExtension(), current, drum.isDrum, false, drum.rank });
+    }
+
+    pluginBox.clear (juce::dontSendNotification);
+    int selected = 0;
+    bool drumHeading = false, otherHeading = false;
+
+    // 드럼 VST를 위에, 그 밖의 VST3(효과·다른 악기)는 따로 아래에 둔다.
+    for (size_t i = 0; i < pluginEntries.size(); ++i)
+    {
+        const auto& entry = pluginEntries[i];
+
+        if (entry.isDrum && ! drumHeading)
+        {
+            pluginBox.addSectionHeading (K ("드럼 VST"));
+            drumHeading = true;
+        }
+        else if (! entry.isDrum && ! otherHeading)
+        {
+            if (drumHeading)
+                pluginBox.addSeparator();
+
+            pluginBox.addSectionHeading (K ("다른 VST3 (드럼 소리가 아닐 수 있음)"));
+            otherHeading = true;
+        }
+
+        pluginBox.addItem (entry.userAdded ? entry.name + K (" (직접 추가)") : entry.name, (int) i + 1);
+
+        if (entry.path == current)
+            selected = (int) i + 1;
+    }
+
+    pluginBox.addSeparator();
+    pluginBox.addSectionHeading (K ("목록에 없는 드럼 VST"));
+    pluginBox.addItem (K ("드럼 VST 직접 추가… (.vst3 파일 고르기)"), browseId);
+    pluginBox.addItem (K ("VST3가 들어 있는 폴더 추가…"), browseFolderId);
+
+    if (! engine.getExtraPluginPaths().isEmpty())
+        pluginBox.addItem (K ("직접 추가한 것 목록에서 빼기…"), removeAddedId);
+
+    pluginBox.addItem (K ("목록 새로 고치기 (방금 설치한 플러그인)"), rescanId);
+    pluginBox.setSelectedId (selected, juce::dontSendNotification);
+}
+
+void MainComponent::pluginChosen()
+{
+    const int id = pluginBox.getSelectedId();
+
+    if (id == browseId)
+    {
+        syncPluginBox();
+        browseForPlugin();
+        return;
+    }
+
+    if (id == browseFolderId || id == removeAddedId)
+    {
+        syncPluginBox();
+
+        if (id == browseFolderId)
+            browseForPluginFolder();
+        else
+            showRemovePluginMenu();
+
+        return;
+    }
+
+    if (id == rescanId)
+    {
+        populatePluginBox();
+        setDrumStatus (K ("플러그인 목록을 새로 고쳤습니다. 모두 ") + juce::String ((int) pluginEntries.size()) + K ("개입니다."), false);
+        return;
+    }
+
+    if (id >= 1 && id <= (int) pluginEntries.size())
+    {
+        const auto path = pluginEntries[(size_t) id - 1].path;
+
+        if (path != engine.getPluginPath())
+            startLoadingPlugin (path, ! engine.hasRememberedState (path));
+    }
+}
+
+void MainComponent::browseForPlugin()
+{
+    chooser = std::make_unique<juce::FileChooser> (K ("드럼 VST3 플러그인 파일 고르기"),
+                                                   juce::File ("C:\\Program Files\\Common Files\\VST3"),
+                                                   "*.vst3");
+
+    chooser->launchAsync (juce::FileBrowserComponent::openMode | juce::FileBrowserComponent::canSelectFiles,
+                          [this] (const juce::FileChooser& fc)
+                          {
+                              const auto file = fc.getResult();
+
+                              if (file.exists())
+                              {
+                                  engine.addExtraPluginPath (file.getFullPathName());
+                                  startLoadingPlugin (file.getFullPathName(), ! engine.hasRememberedState (file.getFullPathName()));
+                              }
+                          });
+}
+
+void MainComponent::browseForPluginFolder()
+{
+    chooser = std::make_unique<juce::FileChooser> (K ("VST3 플러그인이 들어 있는 폴더 고르기"),
+                                                   juce::File ("C:\\Program Files\\Common Files\\VST3"));
+
+    chooser->launchAsync (juce::FileBrowserComponent::openMode | juce::FileBrowserComponent::canSelectDirectories,
+                          [this] (const juce::FileChooser& fc)
+                          {
+                              const auto folder = fc.getResult();
+
+                              if (! folder.isDirectory())
+                                  return;
+
+                              const int before = (int) pluginEntries.size();
+                              engine.addExtraPluginPath (folder.getFullPathName());
+                              populatePluginBox();
+                              saveAllNow();
+
+                              const int found = (int) pluginEntries.size() - before;
+                              setDrumStatus (found > 0 ? K ("폴더에서 플러그인 ") + juce::String (found) + K ("개를 찾아 목록에 넣었습니다.")
+                                                       : K ("그 폴더에서 새 VST3 플러그인을 찾지 못했습니다."), found <= 0);
+                          });
+}
+
+void MainComponent::showRemovePluginMenu()
+{
+    const auto paths = engine.getExtraPluginPaths();
+    juce::PopupMenu menu;
+    menu.addSectionHeader (K ("목록에서 뺄 것을 고르세요 (파일은 지우지 않습니다)"));
+
+    for (int i = 0; i < paths.size(); ++i)
+        menu.addItem (i + 1, paths[i]);
+
+    juce::Component::SafePointer<MainComponent> safe (this);
+
+    menu.showMenuAsync (juce::PopupMenu::Options().withTargetComponent (pluginBox), [safe, paths] (int result)
+    {
+        if (safe == nullptr || result < 1 || result > paths.size())
+            return;
+
+        safe->engine.removeExtraPluginPath (paths[result - 1]);
+        safe->populatePluginBox();
+        safe->saveAllNow();
+        safe->setDrumStatus (K ("목록에서 뺐습니다: ") + juce::File (paths[result - 1]).getFileName(), false);
+    });
+}
+
+//------------------------------------------------------------------------------ 패드 배치
+void MainComponent::loadPadMapFor (const juce::String& device)
+{
+    padWindow.reset();   // 다른 모듈의 배치를 고치고 있었으면 닫는다
+    padMapDevice = device;
+    padMapLoaded = true;
+    padMap = readPadMap (settings, device);
+    applyPadMap (false);
+}
+
+void MainComponent::applyPadMap (bool save)
+{
+    const bool active = padMap.enabled && padMap.hasSources();
+    engine.setPadMap (padMap.toTable(), active);
+    padButton.setToggleState (active, juce::dontSendNotification);
+
+    if (save && autosave)
+    {
+        writePadMap (settings, padMapDevice, padMap);
+        settings.saveIfNeeded();
+    }
+}
+
+void MainComponent::showPadMap()
+{
+    if (padWindow == nullptr)
+    {
+        auto* panel = new PadMapPanel (engine, padMap, padMapDevice);
+        juce::Component::SafePointer<MainComponent> safe (this);
+        panel->onChanged = [safe]
+        {
+            if (safe != nullptr)
+                safe->applyPadMap (true);
+        };
+
+        padWindow = std::make_unique<ToolWindow> (K ("패드 맞추기"), panel, false);
+        padWindow->centreAroundComponent (this, padWindow->getWidth(), padWindow->getHeight());
+    }
+
+    padWindow->setVisible (true);
+    padWindow->toFront (true);
+}
+
+juce::Component* MainComponent::openPadMapForTest()
+{
+    padMap.rows[0].sources.add (35);
+    padMap.rows[12].sources.addArray ({ 16, 17, 57 });
+    padMap.enabled = true;
+    padWindow.reset();
+    showPadMap();
+    return padWindow != nullptr ? padWindow->getContentComponent() : nullptr;
+}
+
+void MainComponent::startLoadingPlugin (const juce::String& path, bool openWindowAfter)
+{
+    if (loadingPlugin || engine.isLoadingPlugin())   // 이미 불러오는 중(겹치면 앱이 죽을 수 있다)
+        return;
+
+    pluginWindow.reset();
+    loadingPlugin = true;
+    updateEnabledStates();
+    setDrumStatus (K ("플러그인을 불러오는 중입니다. 드럼 샘플이 크면 몇 초 걸립니다…"), false);
+
+    // 안내 문구가 먼저 화면에 그려지도록 잠깐 뒤에 시작한다.
+    juce::Component::SafePointer<MainComponent> safe (this);
+    callOnceAfterDelay (80, [safe, path, openWindowAfter]
+    {
+        if (safe != nullptr)
+            safe->finishLoadingPlugin (path, openWindowAfter);
+    });
+}
+
+void MainComponent::finishLoadingPlugin (const juce::String& path, bool openWindowAfter)
+{
+    // 킷을 읽는 동안 생기는 늦은 콜백은 끊김 경고로 세지 않는다(따로 센다).
+    engine.setQuietFor (10000);
+
+    // 확인용: 킷을 처음 읽을 때처럼 플러그인 불러오기가 오래 걸리는 상황을 흉내 낸다(DVH_TEST_SLOW_PLUGIN=밀리초).
+    // 'pump'가 붙으면 그동안 메시지를 계속 처리한다(불러오는 중에 메시지를 돌리는 플러그인 흉내).
+    if (const auto slow = juce::SystemStats::getEnvironmentVariable ("DVH_TEST_SLOW_PLUGIN", {}); slow.isNotEmpty())
+    {
+        if (slow.containsIgnoreCase ("pump"))
+            pumpMessagesFor (slow.getIntValue());
+        else
+            juce::Thread::sleep (slow.getIntValue());
+    }
+
+    // 불러오는 동안 앱이 꺼지면 다음에 켤 때 알 수 있게 표시를 남긴다(restoreSession이 본다).
+    if (autosave)
+    {
+        settings.setValue ("loadingPlugin", path);
+        settings.saveIfNeeded();
+    }
+
+    juce::String error;
+    const bool ok = engine.loadPlugin (path, nullptr, error);
+
+    if (autosave)
+    {
+        settings.removeValue ("loadingPlugin");
+
+        if (ok)
+            settings.removeValue ("loadingPluginCrashes");
+
+        settings.saveIfNeeded();
+    }
+
+    engine.setQuietFor (6000);   // 플러그인이 샘플을 뒤에서 마저 읽는 동안
+    loadingPlugin = false;
+    xrunGraceUntil = juce::Time::getMillisecondCounter() + 4000;
+    syncPluginBox();
+    updateEnabledStates();
+
+    if (! ok)
+    {
+        setDrumStatus (K ("불러오지 못했습니다: ") + error, true);
+    }
+    else if (! engine.getPlugin()->acceptsMidi())
+    {
+        setDrumStatus (K ("이 플러그인은 MIDI를 받지 않습니다. 드럼 소리를 내는 악기 플러그인을 골라 주세요."), true);
+    }
+    else
+    {
+        setDrumStatus (autoLoadNote, false);
+        saveAllNow();
+
+        if (openWindowAfter)
+            showPluginWindow();
+    }
+
+    autoLoadNote.clear();
+    repaint();
+}
+
+void MainComponent::setDrumStatus (const juce::String& text, bool isError)
+{
+    juce::String shown = text, details;
+
+    // 모듈과 플러그인에 맞는 MIDI 맵 고르는 방법은 말풍선에 둔다(한 줄에 다 들어가지 않는다).
+    if (! isError && engine.getPlugin() != nullptr)
+        details = drumMapAdvice (connectedModule, engine.getPluginPath());
+
+    if (shown.isEmpty())
+    {
+        if (engine.getPlugin() == nullptr)
+        {
+            shown = K ("드럼 소리를 낼 VST3 플러그인(EZdrummer, Superior Drummer, Addictive Drums, SSD, BFD 등)을 목록에서 고르세요.");
+        }
+        else
+        {
+            shown = details.isNotEmpty()
+                        ? K ("패드를 쳐 보세요. 엉뚱한 소리가 나면 플러그인의 MIDI 맵을 ") + connectedModule.brandName()
+                              + K ("용으로 바꿉니다(여기에 마우스를 올리면 방법이 나옵니다).")
+                        : K ("패드를 치거나 '소리 확인'을 눌러 보세요. 소리가 안 나거나 엉뚱하면 '드럼 킷 고르기'에서 킷과 MIDI 맵을 확인합니다.");
+        }
+    }
+
+    drumStatus.setColour (juce::Label::textColourId, isError ? ui::red : ui::textDim);
+    drumStatus.setText (shown, juce::dontSendNotification);
+    drumStatus.setTooltip (details);
+}
+
+void MainComponent::showPluginWindow()
+{
+    auto* plugin = engine.getPlugin();
+
+    if (plugin == nullptr)
+        return;
+
+    if (pluginWindow == nullptr)
+    {
+        engine.setQuietFor (3000);   // 큰 플러그인 화면을 처음 그리는 동안
+        juce::AudioProcessorEditor* editor = plugin->hasEditor() ? plugin->createEditorIfNeeded() : nullptr;
+
+        if (editor == nullptr)
+            editor = new juce::GenericAudioProcessorEditor (*plugin);
+
+        pluginWindow = std::make_unique<ToolWindow> (engine.getPluginName(), editor, editor->isResizable());
+        pluginWindow->centreWithSize (pluginWindow->getWidth(), pluginWindow->getHeight());
+        pluginWindow->onClose = [this] { saveAllNow(); };   // 킷을 바꿨을 테니 바로 저장
+    }
+
+    pluginWindow->setVisible (true);
+    pluginWindow->toFront (true);
+}
+
+//==============================================================================
+void MainComponent::browseForSong()
+{
+    auto startFolder = juce::File (settings.getValue ("lastSongFolder"));
+
+    if (! startFolder.isDirectory())
+        startFolder = juce::File::getSpecialLocation (juce::File::userMusicDirectory);
+
+    chooser = std::make_unique<juce::FileChooser> (K ("같이 연주할 음악 파일 고르기"), startFolder, engine.getSongWildcard());
+
+    chooser->launchAsync (juce::FileBrowserComponent::openMode | juce::FileBrowserComponent::canSelectFiles,
+                          [this] (const juce::FileChooser& fc)
+                          {
+                              const auto file = fc.getResult();
+
+                              if (file.existsAsFile())
+                                  loadSong (file);
+                          });
+}
+
+void MainComponent::loadSong (const juce::File& file)
+{
+    juce::String error;
+
+    if (engine.loadSong (file, error))
+    {
+        songName.setColour (juce::Label::textColourId, ui::text);
+        songName.setText (file.getFileNameWithoutExtension(), juce::dontSendNotification);
+        settings.setValue ("lastSongFolder", file.getParentDirectory().getFullPathName());
+        setSongStatus ({}, false);
+        prepareSongTools();
+    }
+    else
+    {
+        setSongStatus (error, true, 8);
+    }
+
+    updateEnabledStates();
+    repaint();
+}
+
+void MainComponent::togglePlay()
+{
+    if (! engine.hasSong())
+        return;
+
+    if (engine.isPlaying())
+        engine.pause();
+    else
+        engine.play();
+}
+
+void MainComponent::toggleRecording()
+{
+    if (engine.isRecording())
+    {
+        finishRecording();
+        return;
+    }
+
+    if (takeEditor != nullptr)
+        takeEditor->stopPreview();
+
+    juce::String error;
+
+    if (! engine.startRecording (recordFolder, error))
+    {
+        setSongStatus (error, true, 8);
+        return;
+    }
+
+    recordStopAt = 0;
+    recordStartedPlayback = engine.hasSong();
+
+    if (engine.hasSong() && ! engine.isPlaying())
+        engine.play();
+
+    setSongStatus ({}, false);
+}
+
+void MainComponent::finishRecording()
+{
+    wasRecording = false;   // 다음 타이머에서 한 번 더 마무리하지 않게
+    const double seconds = engine.getRecordedSeconds();
+    engine.stopRecording();
+
+    if (recordStartedPlayback)
+        engine.pause();
+
+    recordStopAt = 0;
+    recordStartedPlayback = false;
+    recordButton->setContent (IconButton::Icon::record, K ("녹음"));
+
+    if (stemsPendingAfterRecording)   // 녹음 중에 분리가 끝났으면 이제 적용한다
+    {
+        stemsPendingAfterRecording = false;
+        applyStems();
+    }
+
+    const auto take = engine.getLastTakeFolder();
+
+    if (seconds < 1.0 || ! take.isDirectory())
+    {
+        setSongStatus (K ("녹음이 너무 짧습니다."), true, 6);
+        return;
+    }
+
+    setSongStatus (K ("녹음했습니다 (") + clockText (seconds) + ")", false, 10);
+    openTakeEditor (take);
+}
+
+void MainComponent::showRecordingsMenu()
+{
+    juce::Array<juce::File> takes;
+
+    for (const auto& folder : findRecentTakes (recordFolder, 20))
+    {
+        TakeInfo info;
+
+        if (! info.load (folder) || info.getLengthSeconds() >= 1.0)
+            takes.add (folder);
+
+        if (takes.size() >= 12)
+            break;
+    }
+
+    juce::PopupMenu menu;
+
+    if (takes.isEmpty())
+    {
+        menu.addItem (9999, K ("아직 녹음한 연주가 없습니다"), false);
+    }
+    else
+    {
+        menu.addSectionHeader (K ("다듬을 녹음 고르기"));
+
+        for (int i = 0; i < takes.size(); ++i)
+            menu.addItem (100 + i, describeTakeFolder (takes[i]));
+    }
+
+    menu.addSeparator();
+    menu.addItem (1, K ("다른 녹음 열기…"));
+    menu.addItem (2, K ("녹음 폴더 열기"));
+    menu.addItem (3, K ("저장 위치 바꾸기…"));
+
+    menu.showMenuAsync (juce::PopupMenu::Options().withTargetComponent (recordingsButton),
+                        [this, takes] (int result)
+                        {
+                            if (result >= 100 && result < 100 + takes.size())
+                            {
+                                openTakeEditor (takes[result - 100]);
+                            }
+                            else if (result == 1)
+                            {
+                                browseForTake();
+                            }
+                            else if (result == 2)
+                            {
+                                recordFolder.createDirectory();
+                                recordFolder.startAsProcess();
+                            }
+                            else if (result == 3)
+                            {
+                                chooser = std::make_unique<juce::FileChooser> (K ("녹음을 저장할 폴더 고르기"), recordFolder);
+                                chooser->launchAsync (juce::FileBrowserComponent::openMode | juce::FileBrowserComponent::canSelectDirectories,
+                                                      [this] (const juce::FileChooser& fc)
+                                                      {
+                                                          const auto folder = fc.getResult();
+
+                                                          if (folder.isDirectory())
+                                                              recordFolder = folder;
+                                                      });
+                            }
+                        });
+}
+
+void MainComponent::browseForTake()
+{
+    chooser = std::make_unique<juce::FileChooser> (K ("다듬을 녹음 폴더 고르기 (드럼.wav와 원곡.wav가 있는 폴더)"), recordFolder);
+    chooser->launchAsync (juce::FileBrowserComponent::openMode | juce::FileBrowserComponent::canSelectDirectories,
+                          [this] (const juce::FileChooser& fc)
+                          {
+                              const auto folder = fc.getResult();
+
+                              if (folder == juce::File())
+                                  return;
+
+                              if (isTakeFolder (folder))
+                                  openTakeEditor (folder);
+                              else
+                                  setSongStatus (K ("녹음 폴더가 아닙니다."), true, 6);
+                          });
+}
+
+void MainComponent::openTakeEditor (const juce::File& takeFolder)
+{
+    closeTakeEditor();
+    setSongStatus (K ("녹음을 불러오는 중…"), false);
+
+    // 안내 문구가 먼저 그려지도록 잠깐 뒤에 불러온다(긴 녹음은 1초쯤 걸린다).
+    juce::Component::SafePointer<MainComponent> safe (this);
+    callOnceAfterDelay (40, [safe, takeFolder]
+    {
+        if (safe == nullptr)
+            return;
+
+        juce::String error;
+        auto take = TakePlayer::load (takeFolder, error);
+
+        if (take == nullptr)
+        {
+            safe->setSongStatus (error, true, 8);
+            return;
+        }
+
+        safe->setSongStatus ({}, false);
+        safe->engine.setPreview (take);
+
+        auto* editor = new TakeEditor (safe->engine, take);
+        safe->takeEditor = editor;
+        safe->takeWindow = std::make_unique<ToolWindow> (K ("녹음 다듬기 · ") + takeFolder.getFileName(), editor, false);
+        safe->takeWindow->onClose = [safe]
+        {
+            juce::MessageManager::callAsync ([safe]
+            {
+                if (safe != nullptr)
+                    safe->closeTakeEditor();
+            });
+        };
+
+        auto* top = safe->getTopLevelComponent();
+
+        if (top != nullptr)
+            safe->takeWindow->centreAroundComponent (top, safe->takeWindow->getWidth(), safe->takeWindow->getHeight());
+
+        safe->takeWindow->setVisible (true);
+
+        // 메인 창을 내려 둔 상태(예: 곡이 끝나 녹음이 저절로 멈춤)라면 이 창도 내려 둔다.
+        if (auto* mainWindow = dynamic_cast<juce::DocumentWindow*> (top); mainWindow != nullptr && mainWindow->isMinimised())
+            safe->takeWindow->setMinimised (true);
+        else
+            safe->takeWindow->toFront (true);
+    });
+}
+
+void MainComponent::closeTakeEditor()
+{
+    if (takeEditor != nullptr)
+    {
+        takeEditor->stopPreview();
+        takeEditor->saveEditState();
+    }
+
+    engine.setPreview (nullptr);
+    takeWindow.reset();
+    takeEditor = nullptr;
+}
+
+void MainComponent::setSongStatus (const juce::String& text, bool isError, int secondsToShow)
+{
+    songStatus.setColour (juce::Label::textColourId, isError ? ui::red : ui::textDim);
+    songStatus.setText (text, juce::dontSendNotification);
+    songStatusUntil = secondsToShow > 0 ? juce::Time::getMillisecondCounter() + (juce::uint32) secondsToShow * 1000u : 0;
+}
+
+//==============================================================================
+// ③ 연습 도구
+//   메트로놈: 원곡을 분석해 찾은 박자표대로 클릭한다. 재생을 누르면 박자에 맞춘 4박을 먼저 세고
+//             엔진이 정확한 샘플에서 원곡을 시작하므로 사용자가 맞출 것이 없다.
+//   원곡 드럼 빼기: Demucs로 '드럼을 뺀 원곡'을 만들고, 원곡 − 그것 = 드럼으로 켜고 끈다.
+//   결과는 곡마다 <앱 폴더>\곡 분석\ 아래에 남겨서 같은 곡은 다음부터 바로 쓴다.
+void MainComponent::prepareSongTools()
+{
+    ++songGeneration;   // 이전 곡을 위한 작업의 결과는 이제 버린다
+
+    // 이전 곡 작업은 멈추고 없앤다. 이미 보낸 진행률·결과 메시지도 없앤 작업을 가리키게 되어 무시된다.
+    beatJob.reset();
+    separationJob.reset();
+    copyWaiters.clear();
+    copyingOriginal = false;
+    stemsPendingAfterRecording = false;
+    beatBpm = 0.0;
+    songCache = songcache::folderFor (engine.getSongFile());
+
+    // 이 곡에 맞춰 둔 클릭 빠르기·시점(없으면 그대로)
+    const auto tweak = readMetronomeTweak (songCache);
+    clickSpeed = tweak.speed;
+    engine.metronomeOffsetMs = (float) tweak.offsetMs;
+
+    // 메트로놈: 분석해 둔 곡이면 바로, 아니면 메트로놈이 켜져 있을 때만 분석한다.
+    const bool analysed = songcache::beats (songCache).existsAsFile() && showBeatMap();
+
+    if (! analysed && metronomeButton.getToggleState())
+        startBeatAnalysis();
+    else
+        refreshMetronomeStatus();
+
+    // 원곡 드럼 빼기
+    if (songDrumsButton.getToggleState())
+    {
+        if (songcache::hasStems (songCache))
+            applyStems();
+        else
+            startSeparation();
+    }
+    else
+    {
+        setToolStatus (songDrumsStatus, {}, false);
+    }
+}
+
+juce::File MainComponent::getAnalysisPython()
+{
+    return findAnalysisPython (settings.getValue ("analysisPython"));
+}
+
+void MainComponent::setToolStatus (juce::Label& label, const juce::String& text, bool isError, const juce::String& details)
+{
+    label.setColour (juce::Label::textColourId, isError ? ui::red : ui::textDim);
+    label.setText (text, juce::dontSendNotification);
+    label.setTooltip (details);
+}
+
+void MainComponent::ensureAnalysisCopy (std::function<void (bool, const juce::String&)> then)
+{
+    // 분석·분리는 앱이 직접 해독한 같은 WAV로 해야 시각이 정확히 맞는다(MP3를 따로 읽으면 수십 ms 어긋날 수 있다).
+    const auto destination = songcache::original (songCache);
+
+    if (destination.getSize() > 1000)
+    {
+        then (true, {});
+        return;
+    }
+
+    copyWaiters.push_back (std::move (then));
+
+    if (copyingOriginal)
+        return;
+
+    copyingOriginal = true;
+    const auto song = engine.getSongFile();
+    const int generation = songGeneration;
+    juce::Component::SafePointer<MainComponent> safe (this);
+
+    // 긴 곡은 해독에 몇 초 걸리므로 화면이 멈추지 않게 뒤에서 한다.
+    juce::Thread::launch ([safe, song, destination, generation]
+    {
+        juce::String error;
+        const bool ok = writeAnalysisCopy (song, destination, error);
+
+        juce::MessageManager::callAsync ([safe, generation, ok, error]
+        {
+            if (safe == nullptr || generation != safe->songGeneration)
+                return;
+
+            safe->copyingOriginal = false;
+            auto waiters = std::move (safe->copyWaiters);
+            safe->copyWaiters.clear();
+
+            for (auto& waiter : waiters)
+                if (safe != nullptr)
+                    waiter (ok, error);
+        });
+    });
+}
+
+//------------------------------------------------------------------------------ 메트로놈
+void MainComponent::metronomeClicked()
+{
+    const bool on = metronomeButton.getToggleState();
+
+    if (! engine.hasSong())
+    {
+        metronomeButton.setToggleState (false, juce::dontSendNotification);
+        engine.metronomeOn = false;
+        return;
+    }
+
+    engine.metronomeOn = on;
+
+    if (on && ! engine.hasBeatMap())
+    {
+        if (! (songcache::beats (songCache).existsAsFile() && showBeatMap()))
+            startBeatAnalysis();
+
+        return;
+    }
+
+    refreshMetronomeStatus();
+}
+
+void MainComponent::startBeatAnalysis()
+{
+    if (beatJob != nullptr && beatJob->isRunning())
+        return;
+
+    const auto python = getAnalysisPython();
+    const auto script = toolsFolder().getChildFile ("beats.py");
+
+    if (! python.existsAsFile() || ! script.existsAsFile())
+    {
+        setToolStatus (metronomeStatus, K ("분석 도구를 찾지 못했습니다"), true,
+                       K ("박자 분석에는 파이썬 가상환경(.venv)과 앱 폴더의 tools\\beats.py가 필요합니다."));
+        metronomeButton.setToggleState (false, juce::dontSendNotification);
+        engine.metronomeOn = false;
+        return;
+    }
+
+    setToolStatus (metronomeStatus, K ("박자 찾는 중…"), false, K ("곡마다 처음 한 번만 찾습니다."));
+
+    const int generation = songGeneration;
+    juce::Component::SafePointer<MainComponent> safe (this);
+
+    ensureAnalysisCopy ([safe, generation, python, script] (bool ok, const juce::String& error)
+    {
+        if (safe == nullptr || generation != safe->songGeneration)
+            return;
+
+        if (! ok)
+        {
+            safe->finishBeatAnalysis (false, error);
+            return;
+        }
+
+        auto job = std::make_unique<ProcessJob>();
+
+        job->onProgress = [safe, generation] (float progress)
+        {
+            if (safe != nullptr && generation == safe->songGeneration)
+                safe->setToolStatus (safe->metronomeStatus, K ("박자 찾는 중… ") + juce::String (juce::roundToInt (progress * 100.0f)) + "%", false,
+                                     K ("곡마다 처음 한 번만 찾습니다."));
+        };
+
+        job->onFinished = [safe, generation] (bool done, const juce::String& output)
+        {
+            if (safe != nullptr && generation == safe->songGeneration)
+                safe->finishBeatAnalysis (done, output);
+        };
+
+        const juce::StringArray command { python.getFullPathName(), "-I", "-X", "utf8", "-u", script.getFullPathName(),
+                                          songcache::original (safe->songCache).getFullPathName(),
+                                          songcache::beats (safe->songCache).getFullPathName() };
+
+        const bool started = job->start (command);
+        safe->beatJob = std::move (job);
+
+        if (! started)
+            safe->finishBeatAnalysis (false, K ("파이썬을 실행하지 못했습니다."));
+    });
+}
+
+void MainComponent::finishBeatAnalysis (bool ok, const juce::String& output)
+{
+    if (ok && songcache::beats (songCache).existsAsFile() && showBeatMap())
+        return;
+
+    // 실패한 결과 파일이 남아 있으면 다음에 또 실패하므로 지운다.
+    songcache::beats (songCache).deleteFile();
+
+    setToolStatus (metronomeStatus, explainToolError (output, "박자를 찾지 못했습니다"), true, lastLineOf (output));
+    metronomeButton.setToggleState (false, juce::dontSendNotification);
+    engine.metronomeOn = false;
+}
+
+bool MainComponent::showBeatMap()
+{
+    BeatMap map;
+
+    if (! map.loadJson (songcache::beats (songCache)))
+        return false;
+
+    shiftDownbeats (map, readDownbeatShift (songCache));
+    beatBpm = map.bpm;
+
+    const auto tweak = readMetronomeTweak (songCache);
+    clickSpeed = tweak.speed;
+    engine.metronomeOffsetMs = (float) tweak.offsetMs;
+    engine.setBeatMap (std::move (map), clickSpeed);
+    refreshMetronomeStatus();
+    return true;
+}
+
+void MainComponent::changeMetronomeTweak (std::function<void (MetronomeTweakValues&)> change)
+{
+    auto tweak = readMetronomeTweak (songCache);
+    MetronomeTweakValues values { tweak.speed, tweak.offsetMs };
+    change (values);
+
+    tweak.speed = values.speed >= 1.5 ? 2.0 : (values.speed <= 0.75 ? 0.5 : 1.0);
+    tweak.offsetMs = juce::jlimit (-MetronomeTweak::maxOffsetMs, MetronomeTweak::maxOffsetMs, values.offsetMs);
+    writeMetronomeTweak (songCache, tweak);   // 곡 분석 폴더에 기억해 두므로 다음에 이 곡을 열어도 그대로다
+
+    const bool speedChanged = tweak.speed != clickSpeed;
+    clickSpeed = tweak.speed;
+    engine.metronomeOffsetMs = (float) tweak.offsetMs;
+
+    if (speedChanged)
+        showBeatMap();   // 클릭 시각표를 새 빠르기로 다시 만든다
+    else
+        refreshMetronomeStatus();
+}
+
+void MainComponent::refreshMetronomeStatus()
+{
+    if (beatJob != nullptr && beatJob->isRunning())
+        return;   // 진행률을 보여 주는 중
+
+    if (! engine.hasBeatMap())
+    {
+        setToolStatus (metronomeStatus, {}, false);
+        metronomeStatus.setMouseCursor (juce::MouseCursor::NormalCursor);
+        return;
+    }
+
+    juce::String text = juce::String (juce::roundToInt (beatBpm * clickSpeed)) + " BPM";
+
+    if (clickSpeed == 2.0)
+        text << K (" (2배)");
+    else if (clickSpeed == 0.5)
+        text << K (" (절반)");
+
+    if (const int offset = juce::roundToInt (engine.metronomeOffsetMs.load()); offset != 0)
+        text << K (", 클릭 ") << clickOffsetText (offset, beatBpm > 0.0 ? 60000.0 / (beatBpm * clickSpeed) : 0.0, true);
+
+    if (metronomeButton.getToggleState() && engine.countInEnabled.load())
+        text << K (", 4박 세고 시작");
+
+    setToolStatus (metronomeStatus, text + K ("  ▾"), false,
+                   K ("원곡에서 찾은 박자입니다. 눌러서 클릭 빠르기(2배·절반), 클릭 시점(반 박·1/4박·5ms씩 앞당기기·늦추기), "
+                      "'재생 전에 4박 세기', 높은 클릭(마디 첫 박) 위치를 고칩니다. 곡마다 따로 기억합니다."));
+    metronomeStatus.setMouseCursor (juce::MouseCursor::PointingHandCursor);
+}
+
+void MainComponent::showMetronomeMenu()
+{
+    if (! engine.hasBeatMap())
+        return;
+
+    const int bpm = juce::roundToInt (beatBpm);
+    const int offset = juce::roundToInt (engine.metronomeOffsetMs.load());
+    // 한 박 = 지금 들리는 클릭 사이 간격(화면에 보이는 BPM 기준. 2배로 켰으면 그 절반)
+    const double beatMs = beatBpm > 0.0 ? 60000.0 / (beatBpm * clickSpeed) : 500.0;
+    enum
+    {
+        countInId = 1, shiftId = 2,
+        speedNormalId = 10, speedDoubleId = 11, speedHalfId = 12,
+        earlierHalfId = 20, laterHalfId = 21, earlierQuarterId = 22, laterQuarterId = 23,
+        earlierFineId = 24, laterFineId = 25, offsetResetId = 26
+    };
+
+    juce::PopupMenu menu;
+    menu.addItem (countInId, K ("재생 전에 4박 세기"), true, engine.countInEnabled.load());
+    menu.addItem (shiftId, K ("높은 클릭(마디 첫 박)을 한 박 뒤로 옮기기"));
+
+    menu.addSectionHeader (K ("클릭 빠르기"));
+    menu.addItem (speedNormalId, K ("찾은 박마다 (") + juce::String (bpm) + " BPM)", true, clickSpeed == 1.0);
+    menu.addItem (speedDoubleId, K ("2배 빠르게: 박 사이에도 클릭 (") + juce::String (bpm * 2) + " BPM)", true, clickSpeed == 2.0);
+    menu.addItem (speedHalfId, K ("절반으로: 한 박 걸러 클릭 (") + juce::String (juce::roundToInt (beatBpm * 0.5)) + " BPM)", true, clickSpeed == 0.5);
+
+    // 클릭 시점: 박 단위(반 박·1/4박)로 크게, 5ms로 미세하게 옮긴다.
+    const bool canEarlier = offset > -MetronomeTweak::maxOffsetMs, canLater = offset < MetronomeTweak::maxOffsetMs;
+    const auto stepText = [beatMs] (double fraction) { return " (" + juce::String (juce::roundToInt (beatMs * fraction)) + "ms)"; };
+
+    menu.addSectionHeader (K ("클릭 시점 옮기기 (지금: ") + clickOffsetText (offset, beatMs, false) + ")");
+    menu.addItem (earlierHalfId, K ("◀◀ 반 박 앞당기기") + stepText (0.5), canEarlier);
+    menu.addItem (laterHalfId, K ("▶▶ 반 박 늦추기") + stepText (0.5), canLater);
+    menu.addItem (earlierQuarterId, K ("◀ 1/4박 앞당기기") + stepText (0.25), canEarlier);
+    menu.addItem (laterQuarterId, K ("▶ 1/4박 늦추기") + stepText (0.25), canLater);
+    menu.addItem (earlierFineId, K ("◁ 5ms 앞당기기 (클릭이 조금 늦게 들릴 때)"), canEarlier);
+    menu.addItem (laterFineId, K ("▷ 5ms 늦추기 (클릭이 조금 급하게 들릴 때)"), canLater);
+    menu.addItem (offsetResetId, K ("시점 처음대로 (0ms)"), offset != 0);
+
+    juce::Component::SafePointer<MainComponent> safe (this);
+    const int generation = songGeneration;
+
+    menu.showMenuAsync (juce::PopupMenu::Options().withTargetComponent (metronomeStatus), [safe, generation, beatMs] (int result)
+    {
+        if (safe == nullptr || generation != safe->songGeneration || result == 0)
+            return;
+
+        if (result == countInId)
+        {
+            safe->engine.countInEnabled = ! safe->engine.countInEnabled.load();
+            safe->refreshMetronomeStatus();
+            safe->saveAllNow();
+        }
+        else if (result == shiftId)
+        {
+            // 곡 분석 폴더에 기억해 두므로 다음에 이 곡을 열어도 그대로다.
+            const int shift = (readDownbeatShift (safe->songCache) + 1) % 4;
+            downbeatShiftFile (safe->songCache).replaceWithText (juce::String (shift));
+            safe->showBeatMap();
+        }
+        else if (result >= speedNormalId && result <= speedHalfId)
+        {
+            const double speed = result == speedDoubleId ? 2.0 : (result == speedHalfId ? 0.5 : 1.0);
+            safe->changeMetronomeTweak ([speed] (MetronomeTweakValues& v) { v.speed = speed; });
+        }
+        else if (result >= earlierHalfId && result <= offsetResetId)
+        {
+            const double step = result == earlierHalfId ? -0.5 * beatMs : result == laterHalfId ? 0.5 * beatMs
+                              : result == earlierQuarterId ? -0.25 * beatMs : result == laterQuarterId ? 0.25 * beatMs
+                              : result == earlierFineId ? -5.0 : result == laterFineId ? 5.0 : 0.0;
+
+            // 박 단위로 옮길 때는 지금까지 옮긴 양(ms)에 더한 뒤 반올림한다(반 박 두 번 = 정확히 한 박 근처).
+            safe->changeMetronomeTweak ([result, step] (MetronomeTweakValues& v)
+            {
+                v.offsetMs = result == offsetResetId ? 0 : juce::roundToInt ((double) v.offsetMs + step);
+            });
+
+            // 들으면서 여러 번 밀 수 있게 메뉴를 다시 연다(밖을 누르거나 Esc로 닫는다).
+            if (result != offsetResetId)
+                juce::MessageManager::callAsync ([safe, generation]
+                {
+                    if (safe != nullptr && generation == safe->songGeneration && safe->isShowing())
+                        safe->showMetronomeMenu();
+                });
+        }
+    });
+}
+
+void MainComponent::mouseUp (const juce::MouseEvent& e)
+{
+    if (e.eventComponent == &metronomeStatus && e.mouseWasClicked() && engine.hasBeatMap())
+        showMetronomeMenu();
+}
+
+//------------------------------------------------------------------------------ 원곡 드럼 빼기
+void MainComponent::songDrumsClicked()
+{
+    const bool removeDrums = songDrumsButton.getToggleState();
+
+    if (! engine.hasSong())
+    {
+        songDrumsButton.setToggleState (false, juce::dontSendNotification);
+        return;
+    }
+
+    if (removeDrums)
+    {
+        if (songcache::hasStems (songCache))
+            applyStems();
+        else
+            startSeparation();
+
+        return;
+    }
+
+    // 원곡 드럼을 다시 켠다. 분리하던 중이면 멈춘다(다시 누르면 처음부터 한다).
+    if (separationJob != nullptr && separationJob->isRunning())
+        separationJob->cancel();
+
+    stemsPendingAfterRecording = false;   // 드럼을 켜면 원곡 그대로와 같으니 녹음 뒤에 바꿀 것도 없다
+
+    if (engine.isUsingStems())
+        engine.setSongDrumsOn (true);
+
+    setToolStatus (songDrumsStatus, {}, false);
+}
+
+void MainComponent::startSeparation()
+{
+    if (separationJob != nullptr && separationJob->isRunning())
+        return;
+
+    const auto python = getAnalysisPython();
+    const auto script = toolsFolder().getChildFile ("separate.py");
+
+    if (! python.existsAsFile() || ! script.existsAsFile())
+    {
+        setToolStatus (songDrumsStatus, K ("분리 도구를 찾지 못했습니다"), true,
+                       K ("드럼 분리에는 Demucs가 설치된 파이썬 가상환경(.venv)과 앱 폴더의 tools\\separate.py가 필요합니다."));
+        songDrumsButton.setToggleState (false, juce::dontSendNotification);
+        return;
+    }
+
+    const auto waitHint = K ("곡마다 처음 한 번만 합니다. 2분짜리 곡이면 1분 남짓 걸립니다. 그동안 연주해도 됩니다.");
+    setToolStatus (songDrumsStatus, K ("드럼 분리 준비 중…"), false, waitHint);
+
+    const int generation = songGeneration;
+    juce::Component::SafePointer<MainComponent> safe (this);
+
+    ensureAnalysisCopy ([safe, generation, python, script, waitHint] (bool ok, const juce::String& error)
+    {
+        if (safe == nullptr || generation != safe->songGeneration)
+            return;
+
+        if (! safe->songDrumsButton.getToggleState())   // 그사이 껐다
+        {
+            safe->setToolStatus (safe->songDrumsStatus, {}, false);
+            return;
+        }
+
+        if (! ok)
+        {
+            safe->finishSeparation (false, error);
+            return;
+        }
+
+        const auto work = songcache::work (safe->songCache);
+        work.deleteRecursively();
+        work.createDirectory();
+
+        auto job = std::make_unique<ProcessJob>();
+
+        job->onProgress = [safe, waitHint, generation] (float progress)
+        {
+            if (safe != nullptr && generation == safe->songGeneration && safe->songDrumsButton.getToggleState())
+                safe->setToolStatus (safe->songDrumsStatus, K ("드럼 분리 중… ") + juce::String (juce::roundToInt (progress * 100.0f)) + "%",
+                                     false, waitHint);
+        };
+
+        job->onFinished = [safe, generation] (bool done, const juce::String& output)
+        {
+            if (safe != nullptr && generation == safe->songGeneration)
+                safe->finishSeparation (done, output);
+        };
+
+        const juce::StringArray command { python.getFullPathName(), "-I", "-X", "utf8", "-u", script.getFullPathName(),
+                                          songcache::original (safe->songCache).getFullPathName(),
+                                          work.getFullPathName(), separationModel };
+
+        const bool started = job->start (command);
+        safe->separationJob = std::move (job);
+
+        if (! started)
+            safe->finishSeparation (false, K ("파이썬을 실행하지 못했습니다."));
+    });
+}
+
+void MainComponent::finishSeparation (bool ok, const juce::String& output)
+{
+    const auto work = songcache::work (songCache);
+    const auto separated = work.getChildFile (separationModel).getChildFile ("no_drums.wav");
+
+    if (! ok || separated.getSize() < 1000)
+    {
+        work.deleteRecursively();
+        setToolStatus (songDrumsStatus, explainToolError (output, "드럼을 분리하지 못했습니다"), true, lastLineOf (output));
+        songDrumsButton.setToggleState (false, juce::dontSendNotification);
+        return;
+    }
+
+    if (songDrumsButton.getToggleState())
+        setToolStatus (songDrumsStatus, K ("마무리하는 중…"), false);
+
+    // 드럼 = 원곡 − (드럼을 뺀 원곡). 두 파일을 다시 더하면 원곡과 똑같다. 큰 파일이라 뒤에서 만든다.
+    const int generation = songGeneration;
+    const auto cache = songCache;
+    juce::Component::SafePointer<MainComponent> safe (this);
+
+    juce::Thread::launch ([safe, generation, cache, separated, work]
+    {
+        juce::String error;
+        const auto rest = songcache::rest (cache);
+        bool done = separated.moveFileTo (rest);
+
+        if (! done)
+            error = K ("분리한 파일을 옮기지 못했습니다.");
+        else
+            done = makeExactDrumStem (songcache::original (cache), rest, songcache::drums (cache), error);
+
+        work.deleteRecursively();
+
+        juce::MessageManager::callAsync ([safe, generation, done, error]
+        {
+            if (safe == nullptr || generation != safe->songGeneration)
+                return;
+
+            if (! done)
+            {
+                safe->setToolStatus (safe->songDrumsStatus, K ("드럼을 분리하지 못했습니다"), true, error);
+                safe->songDrumsButton.setToggleState (false, juce::dontSendNotification);
+                return;
+            }
+
+            if (safe->songDrumsButton.getToggleState())
+                safe->applyStems();
+            else
+                safe->setToolStatus (safe->songDrumsStatus, {}, false);   // 다음에 누르면 바로 쓴다
+        });
+    });
+}
+
+void MainComponent::applyStems()
+{
+    if (! engine.isUsingStems())
+    {
+        // 녹음 중에 원곡을 읽는 방식을 바꾸면 녹음에 이음새가 생길 수 있어 녹음이 끝난 뒤에 바꾼다.
+        if (engine.isRecording())
+        {
+            stemsPendingAfterRecording = true;
+            setToolStatus (songDrumsStatus, K ("녹음이 끝나면 적용합니다"), false);
+            return;
+        }
+
+        juce::String error;
+
+        if (! engine.useSongStems (songcache::rest (songCache), songcache::drums (songCache), error))
+        {
+            setToolStatus (songDrumsStatus, K ("분리한 파일을 열지 못했습니다"), true, error);
+            songDrumsButton.setToggleState (false, juce::dontSendNotification);
+            return;
+        }
+    }
+
+    const bool removeDrums = songDrumsButton.getToggleState();
+    engine.setSongDrumsOn (! removeDrums);
+    setToolStatus (songDrumsStatus, removeDrums ? K ("원곡 드럼 꺼짐") : juce::String(), false,
+                   removeDrums ? K ("원곡에서 드럼만 뺀 소리를 들려주고 있습니다. 다시 누르면 원곡 그대로 돌아옵니다.") : juce::String());
+}

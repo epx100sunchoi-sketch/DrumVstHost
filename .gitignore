@@ -1,0 +1,21 @@
+# Built files
+DrumVstHost.exe
+DrumVstHost.pdb
+release/
+
+# User data created next to the exe
+녹음/
+곡 분석/
+Recordings/
+Song analysis/
+MIDI 기록.txt
+MIDI log.txt
+충돌 기록.txt
+Crash log.txt
+
+# Optional analysis environment (tools\setup_analysis.bat)
+.venv/
+__pycache__/
+*.pyc
+
+.claude/
