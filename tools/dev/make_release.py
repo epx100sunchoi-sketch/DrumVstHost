@@ -11,7 +11,7 @@ name = 'DrumVstHost-%s-win64' % version
 path = os.path.join(out_dir, name + '.zip')
 
 files = ['DrumVstHost.exe', 'README.md', 'LICENSE',
-         'tools/beats.py', 'tools/gridfit.py', 'tools/separate.py', 'tools/setup_analysis.bat']
+         'tools/beats.py', 'tools/gridfit.py', 'tools/separate.py']
 files += ['tools/bfd/' + f for f in sorted(os.listdir(os.path.join(ROOT, 'tools', 'bfd')))]
 
 with zipfile.ZipFile(path, 'w', zipfile.ZIP_DEFLATED, compresslevel=9) as z:

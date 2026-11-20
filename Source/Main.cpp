@@ -1,4 +1,5 @@
 #include <JuceHeader.h>
+#include "AnalysisTools.h"
 #include "Engine.h"
 #include "Look.h"
 #include "MainComponent.h"
@@ -1359,6 +1360,166 @@ private:
 };
 
 //==============================================================================
+// 확인용: 분석 도구를 앱 안의 설치 기능으로 받아 설치한 뒤, 그 도구로 박자 찾기(와 드럼 분리)를 실제로 한 번 돌려 본다.
+class InstallTest final
+{
+public:
+    InstallTest (const juce::File& reportFile, bool withSeparation, int cancelAfterSeconds)
+        : report (reportFile), separation (withSeparation)
+    {
+        report.deleteFile();
+        log ("install-analysis: " + juce::String (separation ? "beats + separation" : "beats")
+             + ", folder " + analysis::folderForInstall().getFullPathName()
+             + ", ready before: beats " + juce::String ((int) analysis::isReady (analysis::Kind::beats))
+             + ", separation " + juce::String ((int) analysis::isReady (analysis::Kind::separation)));
+
+        started = juce::Time::getMillisecondCounterHiRes();
+
+        installer.onProgress = [this] (const juce::String& stage, float progress)
+        {
+            const int percent = juce::roundToInt (progress * 100.0f);
+
+            if (stage != lastStage || percent >= lastPercent + 10)
+            {
+                lastStage = stage;
+                lastPercent = percent;
+                log (juce::String (seconds(), 1) + " s  " + stage + " " + juce::String (percent) + "%");
+            }
+        };
+
+        installer.onFinished = [this] (bool ok, const juce::String& error)
+        {
+            log ("install " + juce::String (ok ? "OK" : "FAILED: " + error) + " after " + juce::String (seconds(), 1) + " s");
+            log ("ready after: beats " + juce::String ((int) analysis::isReady (analysis::Kind::beats))
+                 + ", separation " + juce::String ((int) analysis::isReady (analysis::Kind::separation))
+                 + ", python " + analysis::managedPython().getFullPathName()
+                 + ", lookup picks " + findAnalysisPython ({}).getFullPathName());
+
+            if (ok)
+                verify();
+
+            log ("done");
+            juce::JUCEApplication::quit();
+        };
+
+        installer.start (separation);
+
+        // 도중에 그만두기 시험: 정한 시간 뒤 멈추고, 결과를 알리지 않는지·표시 파일이 그대로인지 본다.
+        if (cancelAfterSeconds > 0)
+            callOnceAfterDelay (cancelAfterSeconds * 1000, [this]
+            {
+                const double t0 = seconds();
+                installer.cancel();
+                log ("cancelled at " + juce::String (t0, 1) + " s (stop took " + juce::String (seconds() - t0, 1) + " s), still running "
+                     + juce::String ((int) installer.isRunning()) + ", ready: beats " + juce::String ((int) analysis::isReady (analysis::Kind::beats))
+                     + ", separation " + juce::String ((int) analysis::isReady (analysis::Kind::separation)));
+
+                callOnceAfterDelay (1500, [this]
+                {
+                    log ("done");
+                    juce::JUCEApplication::quit();
+                });
+            });
+    }
+
+private:
+    double seconds() const { return (juce::Time::getMillisecondCounterHiRes() - started) / 1000.0; }
+
+    void log (const juce::String& line)
+    {
+        report.appendText (line + "\r\n");
+    }
+
+    // 120 BPM 클릭(마디 첫 박은 크게)과 낮은 사인파로 된 12초짜리 곡을 만들어 실제 스크립트로 분석한다.
+    void verify()
+    {
+        const auto folder = report.getSiblingFile ("install-test-work");
+        folder.deleteRecursively();
+        folder.createDirectory();
+        const auto song = folder.getChildFile ("song.wav");
+
+        {
+            constexpr double rate = 44100.0;
+            juce::AudioBuffer<float> buffer (2, (int) (rate * 12.0));
+            buffer.clear();
+
+            for (int i = 0; i < buffer.getNumSamples(); ++i)
+            {
+                const double t = i / rate;
+                const double beat = std::fmod (t - 0.25, 0.5);
+                const int index = (int) std::floor ((t - 0.25) / 0.5);
+                float v = 0.1f * (float) std::sin (juce::MathConstants<double>::twoPi * 110.0 * t);
+
+                if (t >= 0.25 && beat < 0.03)
+                    v += (index % 4 == 0 ? 0.8f : 0.5f) * (float) (std::exp (-beat / 0.006) * std::sin (juce::MathConstants<double>::twoPi * 1800.0 * beat));
+
+                buffer.setSample (0, i, v);
+                buffer.setSample (1, i, v);
+            }
+
+            juce::WavAudioFormat wav;
+            std::unique_ptr<juce::OutputStream> stream = song.createOutputStream();
+            auto writer = wav.createWriterFor (stream, juce::AudioFormatWriterOptions().withSampleRate (rate).withNumChannels (2).withBitsPerSample (32)
+                                                           .withSampleFormat (juce::AudioFormatWriterOptions::SampleFormat::floatingPoint));
+            writer->writeFromAudioSampleBuffer (buffer, 0, buffer.getNumSamples());
+        }
+
+        const auto python = findAnalysisPython ({}).getFullPathName();
+        const auto beatsJson = folder.getChildFile ("beats.json");
+
+        if (run ({ python, "-I", "-X", "utf8", "-u", toolsFolder().getChildFile ("beats.py").getFullPathName(),
+                   song.getFullPathName(), beatsJson.getFullPathName() }, "beats.py"))
+        {
+            const auto json = juce::JSON::parse (beatsJson);
+            const auto beats = json.getProperty ("beats", {});
+            log ("beats: bpm " + juce::String ((double) json.getProperty ("bpm", 0.0), 2) + " (expected 120), "
+                 + juce::String (beats.isArray() ? beats.size() : 0) + " beats, first "
+                 + (beats.isArray() && beats.size() > 0 ? juce::String ((double) beats[0], 3) : juce::String ("-")) + " s (expected 0.250)");
+        }
+
+        if (separation)
+        {
+            const auto out = folder.getChildFile ("separated");
+
+            if (run ({ python, "-I", "-X", "utf8", "-u", toolsFolder().getChildFile ("separate.py").getFullPathName(),
+                       song.getFullPathName(), out.getFullPathName(), "htdemucs" }, "separate.py"))
+            {
+                const auto rest = out.getChildFile ("htdemucs").getChildFile ("no_drums.wav");
+                log ("separate: no_drums.wav " + juce::String (rest.getSize()) + " bytes (expected about "
+                     + juce::String (song.getSize()) + ")");
+            }
+        }
+    }
+
+    bool run (const juce::StringArray& command, const juce::String& label)
+    {
+        const double t0 = seconds();
+        juce::ChildProcess process;
+
+        if (! process.start (command, juce::ChildProcess::wantStdOut | juce::ChildProcess::wantStdErr))
+        {
+            log (label + ": could not start");
+            return false;
+        }
+
+        const auto output = process.readAllProcessOutput();
+        const auto code = process.getExitCode();
+        auto lines = juce::StringArray::fromLines (output);
+        lines.removeEmptyStrings();
+        log (label + ": exit " + juce::String ((int) code) + " in " + juce::String (seconds() - t0, 1) + " s, last line: "
+             + (lines.isEmpty() ? juce::String() : lines[lines.size() - 1].substring (0, 200)));
+        return code == 0;
+    }
+
+    juce::File report;
+    bool separation;
+    analysis::Installer installer;
+    double started = 0.0;
+    juce::String lastStage;
+    int lastPercent = -100;
+};
+
+//==============================================================================
 class App final : public juce::JUCEApplication
 {
 public:
@@ -1368,7 +1529,8 @@ public:
     bool moreThanOneInstanceAllowed() override
     {
         const auto commandLine = getCommandLineParameters();
-        return commandLine.contains ("--selftest") || commandLine.contains ("--snapshot") || commandLine.contains ("--probe-latency");
+        return commandLine.contains ("--selftest") || commandLine.contains ("--snapshot") || commandLine.contains ("--probe-latency")
+            || commandLine.contains ("--install-analysis");
     }
 
     void initialise (const juce::String& commandLine) override
@@ -1420,6 +1582,14 @@ public:
 
         look = std::make_unique<Look>();
         juce::LookAndFeel::setDefaultLookAndFeel (look.get());
+
+        //   --install-analysis 결과.txt [--with-separation]   분석 도구를 앱의 설치 기능으로 받아 설치하고 실제로 돌려 본다
+        if (const auto file = argAfter (args, "--install-analysis"); file.isNotEmpty())
+        {
+            installTest = std::make_unique<InstallTest> (juce::File (file), args.contains ("--with-separation"),
+                                                         argAfter (args, "--cancel-after").getIntValue());
+            return;
+        }
 
         //   --selftest 결과.txt [--use-saved-kit]   저장된 킷으로 점검하려면 --use-saved-kit (설정은 바꾸지 않는다)
         if (args.contains ("--selftest"))
@@ -1519,6 +1689,44 @@ public:
         if (const auto seconds = argAfter (args, "--quit-after"); seconds.isNotEmpty())
             callOnceAfterDelay (juce::jmax (1, seconds.getIntValue()) * 1000, [] { juce::JUCEApplication::quit(); });
 
+        //   --snapshot-tool-offer 화면.png [--with-separation]   분석 도구 내려받기 안내 창을 열어 PNG로 저장한 뒤 끝낸다
+        if (const auto png = argAfter (args, "--snapshot-tool-offer"); png.isNotEmpty())
+        {
+            const bool separation = args.contains ("--with-separation");
+
+            callOnceAfterDelay (2000, [this, png, separation]
+            {
+                if (window == nullptr)
+                    return;
+
+                window->getMain().offerToolInstallForTest (separation);
+
+                callOnceAfterDelay (800, [this, png]
+                {
+                    for (int i = juce::Desktop::getInstance().getNumComponents(); --i >= 0;)
+                    {
+                        if (auto* alert = dynamic_cast<juce::AlertWindow*> (juce::Desktop::getInstance().getComponent (i)))
+                        {
+                            const auto image = alert->createComponentSnapshot (alert->getLocalBounds(), true, 2.0f);
+                            const juce::File file (png);
+                            file.deleteFile();
+
+                            if (auto stream = file.createOutputStream())
+                            {
+                                juce::PNGImageFormat format;
+                                format.writeImageToStream (image, *stream);
+                            }
+
+                            alert->exitModalState (0);
+                            break;
+                        }
+                    }
+
+                    quit();
+                });
+            });
+        }
+
         //   --snapshot-pad 화면.png   패드 맞추기 창을 열어 PNG로 저장한 뒤 끝낸다
         if (const auto png = argAfter (args, "--snapshot-pad"); png.isNotEmpty())
             callOnceAfterDelay (2500, [this, png]
@@ -1604,6 +1812,7 @@ public:
         hitter.reset();
         probe.reset();
         selfTest.reset();
+        installTest.reset();
         window.reset();
         engine.reset();
 
@@ -1678,6 +1887,7 @@ private:
     std::unique_ptr<Engine> engine;
     std::unique_ptr<MainWindow> window;
     std::unique_ptr<SelfTest> selfTest;
+    std::unique_ptr<InstallTest> installTest;
     std::unique_ptr<LatencyProbe> probe;
     bool saveOnExit = false;
 };

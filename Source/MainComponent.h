@@ -5,6 +5,7 @@
 #include "Engine.h"
 #include "Look.h"
 #include "PadMap.h"
+#include "AnalysisTools.h"
 
 class WaveformView;
 class ChannelRow;
@@ -35,7 +36,8 @@ public:
     void openTakeEditor (const juce::File& takeFolder);
     TakeEditor* getTakeEditor() const noexcept   { return takeEditor; }
     void setRecordFolder (const juce::File& folder);
-    juce::Component* openPadMapForTest();        // 확인용: 패드 맞추기 창을 열고(예시 값을 넣어) 그 내용을 돌려준다
+    juce::Component* openPadMapForTest();
+    void offerToolInstallForTest (bool separation)  { offerToolInstall (separation); }        // 확인용: 패드 맞추기 창을 열고(예시 값을 넣어) 그 내용을 돌려준다
     void startRecordingForTest();                // 확인용: 녹음 버튼을 누른 것과 같다
     void stopRecordingForTest();
 
@@ -87,9 +89,19 @@ private:
     void prepareSongTools();
     void metronomeClicked();
     void songDrumsClicked();
-    void startBeatAnalysis();
+    void startBeatAnalysis (bool askToInstall = false);   // askToInstall: 도구가 없으면 내려받을지 묻는다(사용자가 누른 경우)
     void finishBeatAnalysis (bool ok, const juce::String& output);
-    void startSeparation();
+    void startSeparation (bool askToInstall = false);
+
+    // 분석 도구(파이썬·박자 찾기·드럼 분리)를 앱 안에서 내려받아 설치한다(AnalysisTools.h).
+    bool analysisToolsReady (bool separation);
+    void offerToolInstall (bool separation);
+    void startToolInstall (bool separation);
+    void showToolInstallProgress (const juce::String& stage, float progress);
+    void finishToolInstall (bool ok, const juce::String& error);
+    void showToolInstallMenu (juce::Component& target);
+    bool isInstallingTools() const;
+    std::unique_ptr<analysis::Installer> toolInstaller;
     void finishSeparation (bool ok, const juce::String& output);
     void applyStems();
     void ensureAnalysisCopy (std::function<void (bool, const juce::String&)> then);

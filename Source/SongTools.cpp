@@ -1,4 +1,5 @@
 #include "SongTools.h"
+#include "AnalysisTools.h"
 
 namespace
 {
@@ -58,6 +59,10 @@ juce::File findAnalysisPython (const juce::String& configuredPath)
 
     if (configuredPath.isNotEmpty())
         candidates.add (juce::File (configuredPath));
+
+    // 앱이 직접 받아 설치한 도구(AnalysisTools.h)를 먼저 쓴다.
+    if (const auto managed = analysis::managedPython(); managed != juce::File())
+        candidates.add (managed);
 
     const auto app = appFolder();
     candidates.add (app.getChildFile (".venv\\Scripts\\python.exe"));

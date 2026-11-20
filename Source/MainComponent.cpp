@@ -1012,7 +1012,8 @@ MainComponent::MainComponent (Engine& engineToUse, juce::PropertiesFile& setting
         addAndMakeVisible (*label);
     }
 
-    metronomeStatus.addMouseListener (this, false);   // 박자를 찾은 뒤에는 눌러서 예비박·강박 위치를 고친다
+    metronomeStatus.addMouseListener (this, false);
+    songDrumsStatus.addMouseListener (this, false);   // 분석 도구를 설치하는 동안 눌러서 그만둘 수 있게   // 박자를 찾은 뒤에는 눌러서 예비박·강박 위치를 고친다
 
     // 지난번 연습 도구 상태(곡을 불러오면 그 곡에 맞춰 다시 적용된다)
     engine.countInEnabled = settings.getBoolValue ("countIn", true);
@@ -2684,7 +2685,7 @@ void MainComponent::metronomeClicked()
     if (on && ! engine.hasBeatMap())
     {
         if (! (songcache::beats (songCache).existsAsFile() && showBeatMap()))
-            startBeatAnalysis();
+            startBeatAnalysis (true);
 
         return;
     }
@@ -2692,22 +2693,43 @@ void MainComponent::metronomeClicked()
     refreshMetronomeStatus();
 }
 
-void MainComponent::startBeatAnalysis()
+void MainComponent::startBeatAnalysis (bool askToInstall)
 {
     if (beatJob != nullptr && beatJob->isRunning())
         return;
 
-    const auto python = getAnalysisPython();
+    if (isInstallingTools())
+        return;   // 설치가 끝나면 finishToolInstall이 이어서 한다
+
     const auto script = toolsFolder().getChildFile ("beats.py");
 
-    if (! python.existsAsFile() || ! script.existsAsFile())
+    if (! script.existsAsFile())
     {
-        setToolStatus (metronomeStatus, K ("분석 도구를 찾지 못했습니다"), true,
-                       K ("박자 분석에는 파이썬 가상환경(.venv)과 앱 폴더의 tools\\beats.py가 필요합니다."));
+        setToolStatus (metronomeStatus, K ("분석 스크립트가 없습니다"), true,
+                       K ("앱 폴더의 tools\\beats.py가 필요합니다. 내려받은 압축 파일을 다시 풀어 주세요."));
         metronomeButton.setToggleState (false, juce::dontSendNotification);
         engine.metronomeOn = false;
         return;
     }
+
+    if (! analysisToolsReady (false))
+    {
+        if (askToInstall)
+        {
+            offerToolInstall (false);
+        }
+        else
+        {
+            setToolStatus (metronomeStatus, K ("박자 찾기 도구가 없습니다"), true,
+                           K ("'메트로놈'을 누르면 박자 찾기 도구를 내려받아 설치할 수 있습니다."));
+            metronomeButton.setToggleState (false, juce::dontSendNotification);
+            engine.metronomeOn = false;
+        }
+
+        return;
+    }
+
+    const auto python = getAnalysisPython();
 
     setToolStatus (metronomeStatus, K ("박자 찾는 중…"), false, K ("곡마다 처음 한 번만 찾습니다."));
 
@@ -2924,8 +2946,197 @@ void MainComponent::showMetronomeMenu()
 
 void MainComponent::mouseUp (const juce::MouseEvent& e)
 {
-    if (e.eventComponent == &metronomeStatus && e.mouseWasClicked() && engine.hasBeatMap())
+    if (! e.mouseWasClicked())
+        return;
+
+    if (isInstallingTools() && (e.eventComponent == &metronomeStatus || e.eventComponent == &songDrumsStatus))
+        showToolInstallMenu (*e.eventComponent);
+    else if (e.eventComponent == &metronomeStatus && engine.hasBeatMap())
         showMetronomeMenu();
+}
+
+//------------------------------------------------------------------------------ 분석 도구 내려받기
+bool MainComponent::analysisToolsReady (bool separation)
+{
+    const auto python = getAnalysisPython();
+
+    if (! python.existsAsFile())
+        return false;
+
+    // 앱이 받아 둔 도구면 그 기능에 쓸 것이 다 설치됐는지 본다. 사용자가 직접 만든 파이썬 환경은 그대로 믿는다
+    // (모자라면 실행할 때 '분석 도구 설치가 덜 됐습니다'로 알려 준다).
+    if (analysis::isManagedPython (python))
+        return analysis::isReady (separation ? analysis::Kind::separation : analysis::Kind::beats);
+
+    return true;
+}
+
+bool MainComponent::isInstallingTools() const
+{
+    return toolInstaller != nullptr && toolInstaller->isRunning();
+}
+
+void MainComponent::offerToolInstall (bool separation)
+{
+    if (isInstallingTools())
+        return;
+
+    auto options = juce::MessageBoxOptions()
+                       .withIconType (juce::MessageBoxIconType::NoIcon)
+                       .withAssociatedComponent (this);
+
+    if (separation)
+    {
+        options = options.withTitle (K ("원곡 드럼 빼기 도구 받기"))
+                         .withMessage (K ("원곡에서 드럼을 빼려면 드럼 분리 도구(PyTorch, Demucs)와 분리 모델이 필요합니다. 지금 내려받아 설치할까요?\n\n"
+                                          "- 크기: 내려받기 약 300MB, 설치 후 약 1GB\n"
+                                          "- 한 번만 받으면 됩니다. 인터넷 속도에 따라 몇 분 걸립니다.\n"
+                                          "- 메트로놈 박자 찾기 도구도 함께 들어갑니다. 파이썬을 따로 설치할 필요가 없습니다."))
+                         .withButton (K ("내려받기"))
+                         .withButton (K ("취소"));
+    }
+    else
+    {
+        options = options.withTitle (K ("메트로놈 박자 찾기 도구 받기"))
+                         .withMessage (K ("곡의 박자를 찾으려면 박자 찾기 도구가 필요합니다. 지금 내려받아 설치할까요?\n\n"
+                                          "- 크기: 내려받기 약 85MB, 설치 후 약 250MB\n"
+                                          "- 한 번만 받으면 됩니다. 보통 1분 안에 끝납니다.\n"
+                                          "- 파이썬을 따로 설치할 필요가 없습니다.\n\n"
+                                          "원곡 드럼 빼기 도구(약 1GB)까지 함께 받을 수도 있습니다."))
+                         .withButton (K ("내려받기"))
+                         .withButton (K ("드럼 빼기 도구까지 함께"))
+                         .withButton (K ("취소"));
+    }
+
+    juce::Component::SafePointer<MainComponent> safe (this);
+
+    // 단추 결과: 첫 단추 1, 둘째 2, 마지막(취소) 0
+    juce::AlertWindow::showAsync (options, [safe, separation] (int result)
+    {
+        if (safe == nullptr)
+            return;
+
+        if (result == 0)
+        {
+            if (separation)
+            {
+                safe->songDrumsButton.setToggleState (false, juce::dontSendNotification);
+                safe->setToolStatus (safe->songDrumsStatus, {}, false);
+            }
+            else
+            {
+                safe->metronomeButton.setToggleState (false, juce::dontSendNotification);
+                safe->engine.metronomeOn = false;
+                safe->setToolStatus (safe->metronomeStatus, {}, false);
+            }
+
+            return;
+        }
+
+        safe->startToolInstall (separation || result == 2);
+    });
+}
+
+void MainComponent::startToolInstall (bool separation)
+{
+    toolInstaller = std::make_unique<analysis::Installer>();
+    juce::Component::SafePointer<MainComponent> safe (this);
+
+    toolInstaller->onProgress = [safe] (const juce::String& stage, float progress)
+    {
+        if (safe != nullptr)
+            safe->showToolInstallProgress (stage, progress);
+    };
+
+    toolInstaller->onFinished = [safe] (bool ok, const juce::String& error)
+    {
+        if (safe != nullptr)
+            safe->finishToolInstall (ok, error);
+    };
+
+    toolInstaller->start (separation);
+    showToolInstallProgress (K ("분석 도구 준비 중…"), 0.0f);
+}
+
+void MainComponent::showToolInstallProgress (const juce::String& stage, float progress)
+{
+    const auto percent = juce::String (juce::roundToInt (progress * 100.0f)) + "%";
+    const auto tooltip = stage + "\n" + K ("분석 도구를 내려받아 설치하고 있습니다. 끝나면 하던 일을 저절로 이어서 합니다. 여기를 누르면 그만둘 수 있습니다.");
+
+    // 메트로놈 쪽은 자리가 넓어 단계까지, 드럼 빼기 쪽은 짧게 보여 준다.
+    if (metronomeButton.getToggleState() || ! songDrumsButton.getToggleState())
+    {
+        setToolStatus (metronomeStatus, stage + " " + percent, false, tooltip);
+        metronomeStatus.setMouseCursor (juce::MouseCursor::PointingHandCursor);
+    }
+
+    if (songDrumsButton.getToggleState())
+    {
+        setToolStatus (songDrumsStatus, K ("도구 설치 중… ") + percent, false, tooltip);
+        songDrumsStatus.setMouseCursor (juce::MouseCursor::PointingHandCursor);
+    }
+}
+
+void MainComponent::finishToolInstall (bool ok, const juce::String& error)
+{
+    toolInstaller.reset();
+    songDrumsStatus.setMouseCursor (juce::MouseCursor::NormalCursor);
+
+    if (! ok)
+    {
+        const auto details = error + "\n" + K ("설치 기록: ") + analysis::folderForInstall().getChildFile ("install-log.txt").getFullPathName();
+
+        if (metronomeButton.getToggleState() || ! songDrumsButton.getToggleState())
+            setToolStatus (metronomeStatus, K ("도구를 설치하지 못했습니다"), true, details);
+
+        if (songDrumsButton.getToggleState())
+            setToolStatus (songDrumsStatus, K ("도구를 설치하지 못했습니다"), true, details);
+
+        metronomeButton.setToggleState (false, juce::dontSendNotification);
+        engine.metronomeOn = false;
+        songDrumsButton.setToggleState (false, juce::dontSendNotification);
+        return;
+    }
+
+    // 하던 일을 이어서 한다(곡이 없으면 다음에 곡을 열 때 한다).
+    if (metronomeButton.getToggleState() && engine.hasSong() && ! engine.hasBeatMap())
+        startBeatAnalysis (false);
+    else
+        refreshMetronomeStatus();
+
+    if (songDrumsButton.getToggleState() && engine.hasSong())
+    {
+        if (songcache::hasStems (songCache))
+            applyStems();
+        else
+            startSeparation (true);   // 박자 도구만 받았으면 드럼 빼기 도구를 받을지 다시 묻는다
+    }
+    else
+    {
+        setToolStatus (songDrumsStatus, {}, false);
+    }
+}
+
+void MainComponent::showToolInstallMenu (juce::Component& target)
+{
+    juce::PopupMenu menu;
+    menu.addItem (1, K ("분석 도구 설치 그만두기"));
+
+    juce::Component::SafePointer<MainComponent> safe (this);
+
+    menu.showMenuAsync (juce::PopupMenu::Options().withTargetComponent (&target), [safe] (int result)
+    {
+        if (safe == nullptr || result != 1 || ! safe->isInstallingTools())
+            return;
+
+        safe->toolInstaller.reset();   // 받던 것을 멈춘다(다음에 다시 받으면 받아 둔 곳부터 이어 간다)
+        safe->metronomeButton.setToggleState (false, juce::dontSendNotification);
+        safe->engine.metronomeOn = false;
+        safe->songDrumsButton.setToggleState (false, juce::dontSendNotification);
+        safe->setToolStatus (safe->metronomeStatus, K ("설치를 그만두었습니다"), false);
+        safe->setToolStatus (safe->songDrumsStatus, {}, false);
+        safe->songDrumsStatus.setMouseCursor (juce::MouseCursor::NormalCursor);
+    });
 }
 
 //------------------------------------------------------------------------------ 원곡 드럼 빼기
@@ -2944,7 +3155,7 @@ void MainComponent::songDrumsClicked()
         if (songcache::hasStems (songCache))
             applyStems();
         else
-            startSeparation();
+            startSeparation (true);
 
         return;
     }
@@ -2961,21 +3172,45 @@ void MainComponent::songDrumsClicked()
     setToolStatus (songDrumsStatus, {}, false);
 }
 
-void MainComponent::startSeparation()
+void MainComponent::startSeparation (bool askToInstall)
 {
     if (separationJob != nullptr && separationJob->isRunning())
         return;
 
-    const auto python = getAnalysisPython();
+    if (isInstallingTools())
+    {
+        // 다른 도구를 설치하는 중이면 끝난 뒤에 이어서 한다(finishToolInstall).
+        setToolStatus (songDrumsStatus, K ("설치가 끝나면 이어서 합니다"), false);
+        return;
+    }
+
     const auto script = toolsFolder().getChildFile ("separate.py");
 
-    if (! python.existsAsFile() || ! script.existsAsFile())
+    if (! script.existsAsFile())
     {
-        setToolStatus (songDrumsStatus, K ("분리 도구를 찾지 못했습니다"), true,
-                       K ("드럼 분리에는 Demucs가 설치된 파이썬 가상환경(.venv)과 앱 폴더의 tools\\separate.py가 필요합니다."));
+        setToolStatus (songDrumsStatus, K ("분석 스크립트가 없습니다"), true,
+                       K ("앱 폴더의 tools\\separate.py가 필요합니다. 내려받은 압축 파일을 다시 풀어 주세요."));
         songDrumsButton.setToggleState (false, juce::dontSendNotification);
         return;
     }
+
+    if (! analysisToolsReady (true))
+    {
+        if (askToInstall)
+        {
+            offerToolInstall (true);
+        }
+        else
+        {
+            setToolStatus (songDrumsStatus, K ("드럼 빼기 도구가 없습니다"), true,
+                           K ("'원곡 드럼 빼기'를 누르면 드럼 분리 도구를 내려받아 설치할 수 있습니다."));
+            songDrumsButton.setToggleState (false, juce::dontSendNotification);
+        }
+
+        return;
+    }
+
+    const auto python = getAnalysisPython();
 
     const auto waitHint = K ("곡마다 처음 한 번만 합니다. 2분짜리 곡이면 1분 남짓 걸립니다. 그동안 연주해도 됩니다.");
     setToolStatus (songDrumsStatus, K ("드럼 분리 준비 중…"), false, waitHint);

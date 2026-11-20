@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.22)
-project(DrumVstHost VERSION 0.1.0 LANGUAGES C CXX)
+project(DrumVstHost VERSION 0.2.0 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -31,7 +31,8 @@ target_sources(DrumVstHost PRIVATE
     Source/DrumPlugins.cpp
     Source/Mp3Writer.cpp
     Source/PadMap.cpp
-    Source/Language.cpp)
+    Source/Language.cpp
+    Source/AnalysisTools.cpp)
 
 target_compile_definitions(DrumVstHost PRIVATE
     JUCE_WEB_BROWSER=0
@@ -60,6 +61,7 @@ option(DVH_ASAN "Diagnostics only: build with AddressSanitizer (no LTO)" OFF)
 target_link_libraries(DrumVstHost
     PRIVATE
         juce::juce_audio_utils
+        juce::juce_cryptography
         juce::juce_audio_formats
         juce::juce_audio_devices
         juce::juce_audio_processors

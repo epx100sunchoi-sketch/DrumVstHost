@@ -52,13 +52,22 @@ and saving an MP3.
 Requirements: Windows 10/11 (64-bit), a VST3 drum instrument, an e-drum module with USB-MIDI.
 An ASIO driver (your module's or your audio interface's) is strongly recommended for low latency.
 
-### Optional: metronome beat detection and drum removal
+### Metronome beat detection and drum removal (one-click download)
 
-These two features run Python tools in the background. Everything else works without them.
+These two features run analysis tools in the background. The first time you press **Metronome** or
+**Remove song drums**, the app offers to download them — no Python install or command line needed:
 
-1. Install [Python 3.10–3.13](https://www.python.org/downloads/) (tick *Add python.exe to PATH*).
-2. Run `tools\setup_analysis.bat` once. It creates `.venv` next to the exe (about 1.5 GB, PyTorch CPU + Demucs)
-   and downloads the separation model. Nothing is installed system-wide.
+| | Download | On disk |
+|---|---|---|
+| Beat detection (metronome) | about 85 MB | about 250 MB |
+| + Drum removal (PyTorch CPU, Demucs, separation model) | about 300 MB | about 1 GB |
+
+Progress is shown next to the button (click it to stop), and the app carries on with what you asked for when
+the download finishes. Everything goes into an `analysis` folder next to the exe (or
+`%LOCALAPPDATA%\DrumVstHost\analysis` if that folder is read-only): a private Python 3.12 installed by
+[uv](https://github.com/astral-sh/uv) (pinned version, SHA-256 checked), the Python packages from PyPI, and the
+Demucs model from Hugging Face. Nothing is installed system-wide; delete the folder to remove it.
+The last install log is `analysis\install-log.txt`.
 
 Each song is analysed once (beats: tens of seconds, drum removal: about as long as half the song on a 6-core CPU)
 and cached in the `Song analysis` folder next to the exe.
@@ -66,7 +75,8 @@ and cached in the `Song analysis` folder next to the exe.
 ### Updating
 
 Extract the new zip over the old folder. Your settings (`%APPDATA%\DrumVstHost`), recordings and analysed
-songs are kept. If a plugin crashes the app while loading, the next start skips auto-loading it and tells you.
+songs and downloaded analysis tools are kept. If a plugin crashes the app while loading, the next start skips
+auto-loading it and tells you.
 
 ## Known limitations
 
@@ -123,5 +133,6 @@ DAW는 드럼 한 번 치려는 데 쓰기엔 너무 무겁고 번거롭습니�
 - 한 번에 녹음하고, 볼륨·타이밍·구간을 다듬어 MP3나 WAV로 저장
 - 한국어·영어 화면
 
-메트로놈 박자 찾기와 원곡 드럼 빼기는 파이썬 도구가 필요합니다. 파이썬 3.10~3.13을 설치한 뒤
-`tools\setup_analysis.bat`을 한 번 실행하세요(약 1.5GB). 나머지 기능은 그대로 쓸 수 있습니다.
+메트로놈 박자 찾기와 원곡 드럼 빼기에 쓰는 분석 도구는 처음 그 버튼을 누를 때 앱이 내려받기를 권합니다.
+'내려받기'만 누르면 되고 파이썬을 따로 설치할 필요가 없습니다(박자 찾기 약 85MB, 드럼 빼기까지 약 300MB 내려받기).
+도구는 앱 폴더의 `analysis` 폴더에 들어가며, 지우면 깨끗이 없어집니다.

@@ -38,6 +38,12 @@ def main(argv):
 
     lower_priority()
 
+    # 앱이 받아 설치한 도구(analysis/venv)면 분리 모델은 그 옆 analysis/hf에 있다. 모델을 불러오기 전에 정한다.
+    models = os.path.join(os.path.dirname(sys.prefix), 'hf')
+
+    if os.path.isdir(models) and 'HF_HOME' not in os.environ:
+        os.environ['HF_HOME'] = models
+
     import numpy as np
     import soundfile as sf
     import torch

@@ -333,3 +333,39 @@ kbps)는 WAV의 약 7분의 1 크기라 올리거나 보내기 좋습니다. 다
 녹음 다듬기	Edit take
 타이밍 맞추기	Timing
 드럼이 원곡보다 늦게(밀려) 들리면 − 쪽으로, 급하게(당겨) 들리면 + 쪽으로 옮기세요.	If the drums sound late (dragging) against the song, move toward −; if they sound early (rushing), move toward +.
+인터넷에 연결할 수 없습니다. 연결을 확인하고 다시 시도해 주세요.	Cannot connect to the internet. Check your connection and try again.
+디스크 공간이 부족합니다. 드럼 빼기 도구까지 받으려면 약 1GB가 필요합니다.	Not enough disk space. The drum removal tools need about 1 GB.
+설치하지 못했습니다:\s	Installation failed:\s
+설치할 폴더를 만들 수 없습니다:\s	Could not create the install folder:\s
+설치 도구 받는 중…	Downloading the installer…
+내려받은 설치 도구가 원래 파일과 다릅니다(손상되었거나 바뀌었습니다). 다시 시도해 주세요.	The downloaded installer does not match the original file (damaged or altered). Please try again.
+설치 도구의 압축을 풀지 못했습니다:\s	Could not extract the installer:\s
+파이썬 받는 중…	Downloading Python…
+박자 분석 도구 받는 중…	Downloading beat detection tools…
+드럼 분리 도구 받는 중… (몇 분 걸릴 수 있습니다)	Downloading drum separation tools… (this can take a few minutes)
+드럼 분리 모델 받는 중…	Downloading the drum separation model…
+설치를 마쳤습니다	Installation finished
+내려받다가 끊겼습니다. 인터넷 연결을 확인하고 다시 시도해 주세요.	The download was interrupted. Check your internet connection and try again.
+프로그램을 실행하지 못했습니다:\s	Could not run:\s
+분석 스크립트가 없습니다	Analysis script missing
+앱 폴더의 tools\\beats.py가 필요합니다. 내려받은 압축 파일을 다시 풀어 주세요.	tools\\beats.py is needed in the app folder. Please extract the downloaded zip again.
+박자 찾기 도구가 없습니다	Beat detection not installed
+'메트로놈'을 누르면 박자 찾기 도구를 내려받아 설치할 수 있습니다.	Press 'Metronome' to download and install the beat detection tools.
+원곡 드럼 빼기 도구 받기	Get the drum removal tools
+원곡에서 드럼을 빼려면 드럼 분리 도구(PyTorch, Demucs)와 분리 모델이 필요합니다. 지금 내려받아 설치할까요?\n\n- 크기: 내려받기 약 300MB, 설치 후 약 1GB\n- 한 번만 받으면 됩니다. 인터넷 속도에 따라 몇 분 걸립니다.\n- 메트로놈 박자 찾기 도구도 함께 들어갑니다. 파이썬을 따로 설치할 필요가 없습니다.	Removing the song's drums needs the drum separation tools (PyTorch, Demucs) and a separation model. Download and install them now?\n\n- Size: about 300 MB to download, about 1 GB installed\n- You only need to do this once. It takes a few minutes depending on your connection.\n- The metronome's beat detection is included. You don't need to install Python yourself.
+내려받기	Download
+취소	Cancel
+메트로놈 박자 찾기 도구 받기	Get the metronome beat detection tools
+곡의 박자를 찾으려면 박자 찾기 도구가 필요합니다. 지금 내려받아 설치할까요?\n\n- 크기: 내려받기 약 85MB, 설치 후 약 250MB\n- 한 번만 받으면 됩니다. 보통 1분 안에 끝납니다.\n- 파이썬을 따로 설치할 필요가 없습니다.\n\n원곡 드럼 빼기 도구(약 1GB)까지 함께 받을 수도 있습니다.	Finding the song's beat needs the beat detection tools. Download and install them now?\n\n- Size: about 85 MB to download, about 250 MB installed\n- You only need to do this once. It usually takes under a minute.\n- You don't need to install Python yourself.\n\nYou can also get the drum removal tools (about 1 GB) at the same time.
+드럼 빼기 도구까지 함께	Also get drum removal
+분석 도구 준비 중…	Preparing the analysis tools…
+분석 도구를 내려받아 설치하고 있습니다. 끝나면 하던 일을 저절로 이어서 합니다. 여기를 누르면 그만둘 수 있습니다.	Downloading and installing the analysis tools. When it finishes, the app carries on automatically. Click here to stop.
+도구 설치 중…\s	Installing tools…\s
+설치 기록:\s	Install log:\s
+도구를 설치하지 못했습니다	Could not install the tools
+분석 도구 설치 그만두기	Stop installing the analysis tools
+설치를 그만두었습니다	Installation stopped
+설치가 끝나면 이어서 합니다	Continues after the install
+앱 폴더의 tools\\separate.py가 필요합니다. 내려받은 압축 파일을 다시 풀어 주세요.	tools\\separate.py is needed in the app folder. Please extract the downloaded zip again.
+드럼 빼기 도구가 없습니다	Drum removal not installed
+'원곡 드럼 빼기'를 누르면 드럼 분리 도구를 내려받아 설치할 수 있습니다.	Press 'Remove song drums' to download and install the drum separation tools.
