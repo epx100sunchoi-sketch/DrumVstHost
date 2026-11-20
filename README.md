@@ -74,7 +74,7 @@ and cached in the `Song analysis` folder next to the exe.
 
 ### Updating
 
-Extract the new zip over the old folder. Your settings (`%APPDATA%\DrumVstHost`), recordings and analysed
+Extract the new zip over the old folder. Your settings (`%APPDATA%\DrumVstHost`), recordings, analysed
 songs and downloaded analysis tools are kept. If a plugin crashes the app while loading, the next start skips
 auto-loading it and tells you.
 
