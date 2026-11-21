@@ -1835,6 +1835,19 @@ juce::String MainComponent::getLatencyHint (juce::Colour& colour) const
         return K ("소리가 끊겼습니다. 버퍼를 한 칸 크게 해 주세요.");
     }
 
+    // Yamaha Steinberg USB 드라이버는 Mode에 따라 버퍼 말고도 여유 버퍼를 더 둔다. 버퍼 크기와 상관없이 일정하다.
+    // 2026-11-22 DTX-PRO 실측(44.1kHz): Low Latency 2.2ms, Standard 6.2ms, Stable 8.2ms.
+    // 버퍼 128에서 Standard 약 10.6ms → Low Latency 약 6.6ms(끊김 없음). Low Latency가 아니면 바꾸는 방법을 알려 준다.
+    if (engine.getAudioDeviceType() == "ASIO" && driverBrand (engine.getAudioDeviceName()) == DrumModule::Brand::yamaha)
+    {
+        if (const float extra = engine.getDriverExtraLatencyMs(); extra > 3.5f)
+        {
+            colour = ui::accent;
+            return K ("'버퍼 바꾸기'에서 Mode를 Low Latency로 바꾸면 약 ") + juce::String (juce::roundToInt (extra - 2.2f))
+                   + K ("ms 빨라집니다");
+        }
+    }
+
     if (latencyMs > 20.0f)
     {
         colour = ui::accent;

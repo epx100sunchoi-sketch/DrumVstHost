@@ -369,3 +369,7 @@ kbps)는 WAV의 약 7분의 1 크기라 올리거나 보내기 좋습니다. 다
 앱 폴더의 tools\\separate.py가 필요합니다. 내려받은 압축 파일을 다시 풀어 주세요.	tools\\separate.py is needed in the app folder. Please extract the downloaded zip again.
 드럼 빼기 도구가 없습니다	Drum removal not installed
 '원곡 드럼 빼기'를 누르면 드럼 분리 도구를 내려받아 설치할 수 있습니다.	Press 'Remove song drums' to download and install the drum separation tools.
+드라이버 창에서 Mode는 Low Latency, Buffer Size는 96~128로	In the driver window: Mode Low Latency, Buffer Size 96-128
+드럼 모듈 드라이버(Yamaha Steinberg USB) 설정 창을 엽니다. ASIO 탭의 Mode를 Low Latency로 두면 지연이 가장 짧습니다(DTX-PRO, 버퍼 128 실측: Standard 약 10.6ms, Low Latency 약 6.6ms). Buffer Size는 96~128이 무난하고, 소리가 끊기면 한 칸 크게 하세요.	Opens the settings window of the drum module driver (Yamaha Steinberg USB). Setting Mode on the ASIO tab to Low Latency gives the shortest latency (measured on a DTX-PRO at a 128-sample buffer: about 10.6 ms in Standard, about 6.6 ms in Low Latency). A Buffer Size of 96-128 works well; if the sound breaks up, go one step larger.
+'버퍼 바꾸기'에서 Mode를 Low Latency로 바꾸면 약\s	Set Mode to Low Latency in 'Change buffer' to save about\s
+ms 빨라집니다	 ms

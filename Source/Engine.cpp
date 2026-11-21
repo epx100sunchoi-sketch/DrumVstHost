@@ -545,6 +545,19 @@ float Engine::getOutputLatencyMs() const
     return -1.0f;
 }
 
+float Engine::getDriverExtraLatencyMs() const
+{
+    if (auto* device = deviceManager.getCurrentAudioDevice())
+    {
+        const double rate = device->getCurrentSampleRate();
+
+        if (rate > 0.0)
+            return (float) (juce::jmax (0, device->getOutputLatencyInSamples() - device->getCurrentBufferSizeSamples()) * 1000.0 / rate);
+    }
+
+    return -1.0f;
+}
+
 float Engine::getEstimatedLatencyMs() const
 {
     if (auto* device = deviceManager.getCurrentAudioDevice())

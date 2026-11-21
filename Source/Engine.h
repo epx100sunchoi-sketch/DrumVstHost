@@ -122,6 +122,7 @@ public:
     void showDriverPanel();
     float getOutputLatencyMs() const;                              // 장치가 알려 주는 출력 지연, 장치가 없으면 -1
     float getEstimatedLatencyMs() const;                           // 패드 신호가 도착한 뒤 소리가 나기까지(모듈·USB 제외)
+    float getDriverExtraLatencyMs() const;                         // 출력 지연 중 버퍼 말고 드라이버가 더 두는 여유분(ms), 장치가 없으면 -1
     int getXRunCount() const                                       { return deviceManager.getXRunCount(); }
     double getCpuUsage() const                                     { return deviceManager.getCpuUsage(); }
     float takeMaxMidiWaitMs() noexcept                             { return maxMidiWaitMs.exchange (0.0f); }

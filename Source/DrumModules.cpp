@@ -184,7 +184,7 @@ juce::String bufferAdviceShort (const juce::String& deviceType, const juce::Stri
 
     switch (driverBrand (deviceName))
     {
-        case DrumModule::Brand::yamaha: return K ("드라이버 창에서 Buffer Size 64~128, Mode는 Low Latency로");
+        case DrumModule::Brand::yamaha: return K ("드라이버 창에서 Mode는 Low Latency, Buffer Size는 96~128로");
         case DrumModule::Brand::roland: return K ("드라이버 창에서 Audio Buffer Size를 작게(64~128)");
         case DrumModule::Brand::alesis:
         case DrumModule::Brand::efnote:
@@ -202,8 +202,9 @@ juce::String bufferAdviceLong (const juce::String& deviceType, const juce::Strin
     switch (driverBrand (deviceName))
     {
         case DrumModule::Brand::yamaha:
-            return K ("드럼 모듈 드라이버(Yamaha Steinberg USB) 설정 창을 엽니다. ASIO 탭에서 Buffer Size를 작게(64~128), "
-                      "Mode를 Low Latency로 바꾸면 지연이 줄어듭니다. 소리가 끊기면 한 칸 크게 하세요.");
+            return K ("드럼 모듈 드라이버(Yamaha Steinberg USB) 설정 창을 엽니다. ASIO 탭의 Mode를 Low Latency로 두면 지연이 가장 짧습니다"
+                      "(DTX-PRO, 버퍼 128 실측: Standard 약 10.6ms, Low Latency 약 6.6ms). Buffer Size는 96~128이 무난하고, "
+                      "소리가 끊기면 한 칸 크게 하세요.");
         case DrumModule::Brand::roland:
             return K ("드럼 모듈 드라이버(Roland) 설정 창을 엽니다. Audio Buffer Size를 작게(보통 64~128) 하면 지연이 줄어듭니다. "
                       "창이 안 열리면 시작 메뉴 > Roland > (모델 이름) Driver Settings에서 바꿉니다. 소리가 끊기면 한 칸 크게 하세요.");
