@@ -150,6 +150,11 @@ private:
     juce::uint32 lastNoteCount = 0, ledUntil = 0, xrunWarningUntil = 0, xrunGraceUntil = 0;
     juce::int64 lastXruns = -1;   // 끊김으로 볼 일의 수(엔진의 getProblemCount)
     juce::uint32 lastStreamStarts = 0;
+
+    // Yamaha 드라이버 창의 Mode·Buffer Size(레지스트리)가 바뀐 것을 보면 장치를 한 번 다시 연다(checkYamahaDriverSettings).
+    juce::String yamahaDriverSettings;
+    juce::uint32 yamahaChangedAt = 0;
+    void checkYamahaDriverSettings();
     juce::int64 ignoredRestarts = 0;   // 설정 창에서 사용자가 일으킨 장치 재시작(끊김으로 보지 않는다)
     bool wasRecording = false;
 

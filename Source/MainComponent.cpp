@@ -1599,6 +1599,7 @@ void MainComponent::timerCallback()
 void MainComponent::slowRefresh()
 {
     engine.refreshMidiInputs();
+    checkYamahaDriverSettings();
 
     // 장치·버퍼가 바뀌었으면 여기서 먼저 알아채고 경고 유예를 건다(바꾸면서 장치가 다시 시작되는 것은 끊김이 아니다).
     refreshBufferControls (false);
@@ -1792,6 +1793,52 @@ void MainComponent::bufferChosen()
     lastXruns = -1;
 
     slowRefresh();
+    refreshBufferControls (true);
+}
+
+void MainComponent::checkYamahaDriverSettings()
+{
+    // Yamaha Steinberg USB 드라이버 창에서 Mode(Low Latency 등)나 Buffer Size를 바꾸면 드라이버는 '지연이 바뀌었다'고만 알리는데,
+    // JUCE는 이 알림(kAsioLatenciesChanged)을 무시해서 장치를 다시 열 때까지 예전 지연을 알려 준다(2026-11-22 확인:
+    // Mode를 바꿔도 화면이 약 11ms 그대로). 그래서 드라이버가 설정을 적어 두는 곳을 보고, 바뀌면 장치를 한 번 다시 연다.
+    // 앱의 '버퍼 바꾸기'로 열었든 시작 메뉴에서 열었든 같다. 녹음 중에는 끝난 뒤에 한다.
+    if (engine.getAudioDeviceType() != "ASIO" || driverBrand (engine.getAudioDeviceName()) != DrumModule::Brand::yamaha)
+    {
+        yamahaDriverSettings.clear();
+        yamahaChangedAt = 0;
+        return;
+    }
+
+    const juce::String key = "HKEY_CURRENT_USER\\Software\\Yamaha\\Yamaha Steinberg USB Driver\\";
+    const auto current = juce::WindowsRegistry::getValue (key + "LatencyMode") + "/" + juce::WindowsRegistry::getValue (key + "PeriodFrames");
+
+    if (yamahaDriverSettings.isEmpty())
+    {
+        yamahaDriverSettings = current;   // 장치를 연 때의 값
+        return;
+    }
+
+    if (current == yamahaDriverSettings)
+    {
+        yamahaChangedAt = 0;
+        return;
+    }
+
+    // 드라이버 창에서 여러 번 바꿀 수 있으므로 1.5초 동안 그대로면 다시 연다.
+    const auto now = juce::Time::getMillisecondCounter();
+
+    if (yamahaChangedAt == 0)
+        yamahaChangedAt = now;
+
+    if (now - yamahaChangedAt < 1500 || engine.isRecording())
+        return;
+
+    yamahaDriverSettings = current;
+    yamahaChangedAt = 0;
+    xrunGraceUntil = now + 5000;
+    xrunWarningUntil = 0;
+    lastXruns = -1;
+    engine.restartAudioDevice();
     refreshBufferControls (true);
 }
 

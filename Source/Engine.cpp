@@ -526,10 +526,17 @@ void Engine::showDriverPanel()
     modalWindow.enterModalState();
 
     if (device->showControlPanel())
-    {
-        deviceManager.closeAudioDevice();
-        deviceManager.restartLastAudioDevice();
-    }
+        restartAudioDevice();
+}
+
+void Engine::restartAudioDevice()
+{
+    if (deviceManager.getCurrentAudioDevice() == nullptr)
+        return;
+
+    setQuietFor (4000);   // 다시 여는 동안 늦은 콜백은 끊김으로 세지 않는다
+    deviceManager.closeAudioDevice();
+    deviceManager.restartLastAudioDevice();
 }
 
 float Engine::getOutputLatencyMs() const
