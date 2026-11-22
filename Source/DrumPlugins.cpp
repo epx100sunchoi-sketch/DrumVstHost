@@ -285,3 +285,26 @@ juce::String drumPadName (DrumModule::Brand brand, int note)
                                          "Tambourine", "Splash", "Cowbell", "Crash 2", "Vibraslap", "Ride 2" };
     return note >= 35 && note <= 59 ? "GM: " + juce::String (names[note - 35]) : juce::String();
 }
+
+juce::Array<int> tomPadNotes (DrumModule::Brand brand)
+{
+    // drumPadName의 탐 헤드·림과 같은 번호
+    if (brand == DrumModule::Brand::yamaha)
+        return { 48, 14, 15, 47, 18, 19, 43, 20, 23, 41, 24, 25 };
+
+    if (brand == DrumModule::Brand::roland)
+        return { 48, 50, 45, 47, 43, 58, 41, 39 };
+
+    return { 41, 43, 45, 47, 48, 50 };   // General MIDI 탐
+}
+
+std::array<juce::uint8, 128> weakTomHitTable (DrumModule::Brand brand, int maxDroppedVelocity)
+{
+    std::array<juce::uint8, 128> table {};
+
+    if (maxDroppedVelocity > 0)
+        for (const int note : tomPadNotes (brand))
+            table[(size_t) note] = (juce::uint8) juce::jlimit (1, 127, maxDroppedVelocity + 1);
+
+    return table;
+}

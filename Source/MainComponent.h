@@ -38,6 +38,7 @@ public:
     bool isTakeSeparationBusy() const noexcept   { return takeSeparationBusy; }
     void setRecordFolder (const juce::File& folder);
     juce::Component* openPadMapForTest();
+    juce::Component* openMidiMonitorForTest();   // 확인용: '신호 보기' 창을 열고 예시 신호(약해서 버린 탐 포함)를 넣는다
     void offerToolInstallForTest (bool separation)  { offerToolInstall (separation); }        // 확인용: 패드 맞추기 창을 열고(예시 값을 넣어) 그 내용을 돌려준다
     void startRecordingForTest();                // 확인용: 녹음 버튼을 누른 것과 같다
     void stopRecordingForTest();
@@ -154,6 +155,25 @@ private:
     void loadPadMapFor (const juce::String& device);
     void applyPadMap (bool save);
     void showPadMap();
+
+    // '더 빠르게(실험)': Yamaha 드라이버의 출력 여유를 1~4ms 줄인다(Engine::writeYamahaFasterStep).
+    // 몇 ms인지는 장치를 열 때 읽은 값으로 본다. 앱이 알아챈 끊김이 생기면 한 단계 낮춘다(녹음 중이면 끝난 뒤).
+    // DTX-PRO에서 4ms는 탐을 칠 때 자글거렸다(앱은 알아채지 못한다: 드라이버→USB 단계의 일이라). 들어 보고 고르게 한다.
+    juce::TextButton fastButton;
+    bool fastRevertPending = false;
+    juce::uint32 fastNoticeUntil = 0;
+    juce::String fastNotice;
+    bool isYamahaAsio() const;
+    int yamahaFasterMs() const;                  // 0 = 드라이버 창의 Mode 그대로
+    void setYamahaFasterMs (int fasterMs, bool becauseOfDropouts);
+    void showFasterMenu();
+    void refreshFastButton();
+
+    // 약한 탐 신호 거르기(크로스토크): 이 세기 이하인 탐 신호는 플러그인에 넘기지 않는다(0 = 끔). '신호 보기' 창에서 바꾼다.
+    static constexpr int defaultWeakTomVelocity = 9;
+    int weakTomVelocity = defaultWeakTomVelocity;
+    void applyWeakTomFilter();
+    void setWeakTomVelocity (int maxDroppedVelocity);
     juce::ComboBox bufferBox;
     juce::Label latencyLabel;
     juce::StringArray midiNames;

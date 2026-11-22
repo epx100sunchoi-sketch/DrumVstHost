@@ -708,6 +708,48 @@ private:
             }
 
             check ("pad map (on, then off)", seen.joinIntoString (" "), "17>57 40>38 36 20x | 17 40 36 20 |");
+            engine->setPadMap (table, false);
+        }
+
+        // 약한 탐 신호 거르기(Yamaha, 세기 9 이하 버림): 탐 헤드(43)·림(20)의 약한 신호만 버리고, 같은 세기라도
+        // 하이햇 페달(44)·스네어(38)는 넘긴다. 버린 신호는 패드 맞추기 창의 '마지막 음'으로 세지 않는다. 끄면 모두 넘긴다.
+        {
+            check ("weak tom table (yamaha 43, 20, 44 / roland 39 / GM 39 at 9)",
+                   juce::String ((int) weakTomHitTable (DrumModule::Brand::yamaha, 9)[43]) + " " + juce::String ((int) weakTomHitTable (DrumModule::Brand::yamaha, 9)[20])
+                       + " " + juce::String ((int) weakTomHitTable (DrumModule::Brand::yamaha, 9)[44]) + " / " + juce::String ((int) weakTomHitTable (DrumModule::Brand::roland, 9)[39])
+                       + " / " + juce::String ((int) weakTomHitTable (DrumModule::Brand::none, 9)[39]),
+                   "10 10 0 / 10 / 0");
+
+            MidiInbox::MonitorEvent events[32];
+            juce::StringArray seen;
+            const std::pair<int, int> hits[] = { { 43, 4 }, { 43, 9 }, { 43, 10 }, { 20, 5 }, { 44, 5 }, { 38, 5 }, { 43, 80 } };
+
+            for (const int level : { 9, 0 })
+            {
+                while (engine->readMidiMonitor (events, 32) > 0) {}
+                engine->setMinVelocity (weakTomHitTable (DrumModule::Brand::yamaha, level));
+
+                for (const auto& [note, velocity] : hits)
+                    engine->injectMidiForTest (juce::MidiMessage::noteOn (10, note, (juce::uint8) velocity));
+
+                const int n = engine->readMidiMonitor (events, 32);
+
+                for (int i = 0; i < n; ++i)
+                    seen.add (juce::String ((int) events[i].data[1]) + "/" + juce::String ((int) events[i].data[2])
+                              + (events[i].weak ? "w" : "") + (events[i].forwarded ? "" : "x"));
+
+                seen.add ("|");
+            }
+
+            check ("weak tom hits dropped (level 9, then off)", seen.joinIntoString (" "),
+                   "43/4wx 43/9wx 43/10 20/5wx 44/5 38/5 43/80 | 43/4 43/9 43/10 20/5 44/5 38/5 43/80 |");
+
+            engine->setMinVelocity (weakTomHitTable (DrumModule::Brand::yamaha, 9));
+            engine->injectMidiForTest (juce::MidiMessage::noteOn (10, 38, (juce::uint8) 90));
+            engine->injectMidiForTest (juce::MidiMessage::noteOn (10, 43, (juce::uint8) 3));
+            check ("weak tom hit not counted as last note", juce::String ((int) (engine->getLastNoteOn() & 0xff)), "38");
+            engine->setMinVelocity (weakTomHitTable (DrumModule::Brand::yamaha, 0));
+            while (engine->readMidiMonitor (events, 32) > 0) {}
         }
     }
 
@@ -1278,6 +1320,52 @@ private:
 };
 
 //==============================================================================
+// 드럼 모듈의 ASIO 드라이버만 열어 드라이버가 알려 주는 지연을 한 줄로 적고 끝낸다(플러그인·저장된 설정 없이).
+// Yamaha 드라이버 설정(레지스트리)을 바꿔 가며 드라이버 여유가 어떻게 달라지는지 빨리 재는 데 쓴다.
+//   DrumVstHost.exe --driver-latency 결과.txt
+class DriverLatencyCheck final : private juce::Timer
+{
+public:
+    explicit DriverLatencyCheck (const juce::File& reportFile) : report (reportFile)
+    {
+        engine = std::make_unique<Engine> (true, nullptr);
+        started = juce::Time::getMillisecondCounter();
+        startTimer (250);
+    }
+
+private:
+    void timerCallback() override
+    {
+        auto* device = engine->deviceManager.getCurrentAudioDevice();
+        const bool open = device != nullptr && device->isOpen() && device->getTypeName() == "ASIO"
+                          && device->getOutputLatencyInSamples() > 0;
+
+        if (! open && juce::Time::getMillisecondCounter() - started < 8000)
+        {
+            engine->refreshMidiInputs();   // 장치 열기를 다시 해 본다(앱의 1초 확인과 같은 일)
+            return;
+        }
+
+        stopTimer();
+        juce::String text;
+
+        if (device != nullptr)
+            text << device->getTypeName() << " / " << device->getName() << " | rate " << juce::String (device->getCurrentSampleRate(), 0)
+                 << " | buffer " << device->getCurrentBufferSizeSamples() << " | out " << device->getOutputLatencyInSamples()
+                 << " | in " << device->getInputLatencyInSamples() << " | registry " << Engine::readYamahaDriverSettings();
+        else
+            text << "no device";
+
+        report.replaceWithText (text + "\r\n");
+        juce::JUCEApplication::quit();
+    }
+
+    juce::File report;
+    std::unique_ptr<Engine> engine;
+    juce::uint32 started = 0;
+};
+
+//==============================================================================
 // 실제 소리 장치와 저장된 드럼 킷으로 버퍼 크기마다 끊김과 처리 부하를 잰다. 출력은 무음이다.
 //   DrumVstHost.exe --probe-latency 결과.txt [--seconds 초] [--soak 초]
 //   --soak을 주면 저장된 원곡을 재생하는 경우와 녹음까지 하는 경우도 그 시간만큼 잰다.
@@ -1706,7 +1794,7 @@ public:
     {
         const auto commandLine = getCommandLineParameters();
         return commandLine.contains ("--selftest") || commandLine.contains ("--snapshot") || commandLine.contains ("--probe-latency")
-            || commandLine.contains ("--install-analysis");
+            || commandLine.contains ("--install-analysis") || commandLine.contains ("--driver-latency");
     }
 
     void initialise (const juce::String& commandLine) override
@@ -1775,6 +1863,12 @@ public:
                                                    argAfter (args, "--plugin"),
                                                    settle.isNotEmpty() ? settle.getIntValue() : 4000,
                                                    args.contains ("--use-saved-kit") ? settings : nullptr);
+            return;
+        }
+
+        if (const auto file = argAfter (args, "--driver-latency"); file.isNotEmpty())
+        {
+            driverCheck = std::make_unique<DriverLatencyCheck> (juce::File (file));
             return;
         }
 
@@ -1926,6 +2020,30 @@ public:
                 quit();
             });
 
+        //   --snapshot-monitor 화면.png   '신호 보기' 창을 열어 예시 신호를 넣고 PNG로 저장한 뒤 끝낸다
+        if (const auto png = argAfter (args, "--snapshot-monitor"); png.isNotEmpty())
+            callOnceAfterDelay (2500, [this, png]
+            {
+                if (window == nullptr)
+                    return;
+
+                if (auto* panel = window->getMain().openMidiMonitorForTest())
+                {
+                    juce::Component::SafePointer<juce::Component> safePanel (panel);
+
+                    callOnceAfterDelay (800, [this, safePanel, png]
+                    {
+                        if (safePanel != nullptr)
+                            saveSnapshot (*safePanel, juce::File (png));
+
+                        quit();
+                    });
+                    return;
+                }
+
+                quit();
+            });
+
         //   --snapshot-take 화면.png   다듬기 창이 열리면 예시 값(지연만큼 당기기, 앞뒤 자르기)을 넣고 PNG로 저장한 뒤 끝낸다
         //     [--separate-song-drums]   원곡 드럼 파일이 없으면 '원곡 드럼 분리'를 누른 화면(…-before.png)을 남기고,
         //                               분리가 끝나기를 기다렸다가 찍는다(진짜 분리 도구를 돌린다)
@@ -2029,6 +2147,7 @@ public:
 
         hitter.reset();
         probe.reset();
+        driverCheck.reset();
         selfTest.reset();
         installTest.reset();
         window.reset();
@@ -2107,6 +2226,7 @@ private:
     std::unique_ptr<SelfTest> selfTest;
     std::unique_ptr<InstallTest> installTest;
     std::unique_ptr<LatencyProbe> probe;
+    std::unique_ptr<DriverLatencyCheck> driverCheck;
     bool saveOnExit = false;
 };
 

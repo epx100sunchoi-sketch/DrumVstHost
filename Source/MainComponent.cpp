@@ -185,6 +185,21 @@ juce::String describeTakeFolder (const juce::File& folder)
          + "   (" + clockText (info.getLengthSeconds()) + ")"
          + (info.songName.isNotEmpty() ? "   " + info.songName : juce::String());
 }
+
+// Yamaha Steinberg USB 드라이버 창의 Mode ↔ 레지스트리 LatencyMode(HKCU\Software\Yamaha\Yamaha Steinberg USB Driver).
+// 2026-11-22 사용자 PC(DTX-PRO, 44.1kHz, 버퍼 96)에서 창으로 바꿔 확인: Low Latency = 1(출력 지연 = 버퍼 + 274샘플),
+// Standard = 2(버퍼 + 318샘플). Stable은 3으로 짐작한다. 창에 없는 0은 버퍼 + 98샘플이다(레지스트리로만 켤 수 있다).
+// 예전(0.2.2까지)에는 0을 Low Latency로 잘못 알아, 이미 Low Latency인 사용자에게 바꾸라고 안내했다.
+juce::String yamahaModeName (const juce::String& latencyMode)
+{
+    if (latencyMode == "1")   return "Low Latency";
+    if (latencyMode == "2")   return "Standard";
+    if (latencyMode == "3")   return "Stable";
+    if (latencyMode == "0")   return K ("더 빠르게(실험) - 드라이버 창에 없는 값 0");
+    return {};
+}
+
+constexpr float yamahaLowLatencyExtraMs = 274.0f * 1000.0f / 44100.0f;   // Low Latency에서 드라이버가 버퍼 말고 더 두는 여유
 } // namespace
 
 //==============================================================================
@@ -685,7 +700,9 @@ private:
 class MidiMonitorPanel final : public juce::Component, private juce::Timer
 {
 public:
-    MidiMonitorPanel (Engine& engineToUse, DrumModule::Brand moduleBrand, const juce::String& moduleName, const juce::String& pluginName)
+    // weakTomVelocity: 지금 쓰는 '약한 탐 신호 거르기' 값(이 세기 이하를 버림, 0 = 끔). 바꾸면 onWeakTomChanged로 알린다.
+    MidiMonitorPanel (Engine& engineToUse, DrumModule::Brand moduleBrand, const juce::String& moduleName, const juce::String& pluginName,
+                      int weakTomVelocity, std::function<void (int)> onWeakTomChanged)
         : engine (engineToUse), brand (moduleBrand)
     {
         hint.setText (K ("드럼을 치면 받은 신호가 아래에 나옵니다. 크래시·라이드처럼 부분(몸통·엣지·벨)이 있는 패드는 부분마다 음 번호가 "
@@ -695,6 +712,31 @@ public:
         hint.setColour (juce::Label::textColourId, ui::textDim);
         hint.setJustificationType (juce::Justification::topLeft);
         addAndMakeVisible (hint);
+
+        // 약한 탐 신호 거르기: 다른 패드를 칠 때 진동이 옮겨 붙어 탐에 들어오는 아주 약한 신호(크로스토크)를 버린다.
+        const auto weakTip = K ("하이햇이나 스네어를 칠 때 진동이 옮겨 붙어 탐에 아주 약한 신호가 들어오면(크로스토크), 드럼 VST에 따라 "
+                                "'둥' 하는 탐 소리가 섞여 들립니다. 고른 세기 이하인 탐 신호(헤드·림)는 드럼 VST에 넘기지 않습니다. "
+                                "버린 신호는 아래 목록에 '약해서 버림'으로 나옵니다. 탐을 아주 여리게 칠 때 소리가 빠지면 값을 낮추세요.");
+        weakLabel.setText (K ("약한 탐 신호 거르기"), juce::dontSendNotification);
+        weakLabel.setFont (ui::font (14.0f));
+        weakLabel.setColour (juce::Label::textColourId, ui::text);
+        weakLabel.setTooltip (weakTip);
+        addAndMakeVisible (weakLabel);
+
+        weakBox.addItem (K ("끄기"), 1);
+        weakBox.addItem (K ("세기 5 이하 버림"), 2);
+        weakBox.addItem (K ("세기 9 이하 버림 (권장)"), 3);
+        weakBox.addItem (K ("세기 15 이하 버림"), 4);
+        weakBox.setSelectedId (weakTomVelocity <= 0 ? 1 : weakTomVelocity <= 5 ? 2 : weakTomVelocity <= 9 ? 3 : 4, juce::dontSendNotification);
+        weakBox.setTooltip (weakTip);
+        weakBox.onChange = [this, onWeakTomChanged]
+        {
+            static constexpr int values[] = { 0, 5, 9, 15 };
+
+            if (const int id = weakBox.getSelectedId(); id >= 1 && id <= 4 && onWeakTomChanged != nullptr)
+                onWeakTomChanged (values[id - 1]);
+        };
+        addAndMakeVisible (weakBox);
 
         view.setMultiLine (true);
         view.setReadOnly (true);
@@ -729,7 +771,7 @@ public:
 
         started = juce::Time::getMillisecondCounterHiRes();
         startTimerHz (20);
-        setSize (680, 520);
+        setSize (680, 560);
     }
 
     void paint (juce::Graphics& g) override { g.fillAll (ui::surface); }
@@ -738,6 +780,10 @@ public:
     {
         auto area = getLocalBounds().reduced (16, 12);
         hint.setBounds (area.removeFromTop (44));
+        auto weakRow = area.removeFromTop (30);
+        weakLabel.setBounds (weakRow.removeFromLeft (170));
+        weakBox.setBounds (weakRow.removeFromLeft (230));
+        area.removeFromTop (8);
         auto buttons = area.removeFromBottom (34);
         fileButton.setBounds (buttons.removeFromRight (130));
         buttons.removeFromRight (8);
@@ -798,7 +844,7 @@ private:
 
         const double seconds = (e.time - started) / 1000.0;
         return juce::String (seconds, 2).paddedLeft (' ', 8) + "s  ch" + juce::String (channel).paddedLeft (' ', 2) + "  " + text
-               + (e.forwarded ? juce::String() : K ("   (걸러짐: 플러그인에 안 넘김)"));
+               + (e.weak ? K ("   (약해서 버림: 크로스토크)") : e.forwarded ? juce::String() : K ("   (걸러짐: 플러그인에 안 넘김)"));
     }
 
     void timerCallback() override
@@ -833,7 +879,8 @@ private:
 
     Engine& engine;
     DrumModule::Brand brand = DrumModule::Brand::none;
-    juce::Label hint, summary;
+    juce::Label hint, summary, weakLabel;
+    juce::ComboBox weakBox;
     juce::TextEditor view;
     juce::TextButton clearButton, fileButton;
     juce::File logFile;
@@ -895,6 +942,16 @@ MainComponent::MainComponent (Engine& engineToUse, juce::PropertiesFile& setting
     styleButton (driverButton, bufferAdviceLong (engine.getAudioDeviceType(), engine.getAudioDeviceName()));   // 장치가 바뀌면 다시 쓴다
     driverButton.onClick = [this] { openDriverPanel(); };
     addChildComponent (driverButton);
+
+    fastButton.setButtonText (K ("더 빠르게"));
+    fastButton.setColour (juce::TextButton::buttonOnColourId, ui::accent);
+    fastButton.setColour (juce::TextButton::textColourOnId, ui::onAccent);
+    styleButton (fastButton, K ("실험 기능: Yamaha 드라이버가 USB로 보내기 전에 버퍼 말고 더 두는 여유(Low Latency에서 약 6ms)를 1ms 단위로 "
+                                "줄입니다(드라이버 창에 없는 숨은 설정). 여유가 모자라면 소리가 자글거리는데, 이것은 드라이버 안에서 생기는 일이라 앱이 "
+                                "알아채지 못합니다. 탐을 쳐 보고 자글거리면 한 단계 낮추세요(DTX-PRO에서는 3ms까지 괜찮았고 4ms는 자글거렸습니다). 드라이버 창에서 Mode를 "
+                                "고르고 OK를 누르면 그 Mode로 바뀝니다. 같은 드라이버를 쓰는 다른 프로그램(DAW 등)에도 적용됩니다."));
+    fastButton.onClick = [this] { showFasterMenu(); };
+    addChildComponent (fastButton);
 
     // ② 드럼 소리
     pluginBox.setTextWhenNothingSelected (K ("드럼 소리 플러그인을 고르세요"));
@@ -1037,6 +1094,10 @@ MainComponent::MainComponent (Engine& engineToUse, juce::PropertiesFile& setting
     const auto defaultFolder = dataChild (juce::File::getSpecialLocation (juce::File::currentExecutableFile).getParentDirectory(),
                                           "녹음", "Recordings");
     recordFolder = juce::File (settings.getValue ("recordFolder", defaultFolder.getFullPathName()));
+
+    // 약한 탐 신호 거르기(모듈을 알아보면 그 회사의 탐 음 번호로 다시 적용된다)
+    weakTomVelocity = juce::jlimit (0, 30, settings.getIntValue ("weakTomVelocity", defaultWeakTomVelocity));
+    applyWeakTomFilter();
 
     xrunGraceUntil = juce::Time::getMillisecondCounter() + 5000;
 
@@ -1336,6 +1397,8 @@ void MainComponent::paint (juce::Graphics& g)
 
         if (bufferBox.isVisible())
             hintX = bufferBox.getRight() + 14;
+        else if (fastButton.isVisible())
+            hintX = fastButton.getRight() + 14;
         else if (driverButton.isVisible())
             hintX = driverButton.getRight() + 14;
 
@@ -1393,6 +1456,7 @@ void MainComponent::resized()
             bufferTextArea = { x, cy, textWidth, 32 };
             x += textWidth + (textWidth > 0 ? 10 : 0);
             driverButton.setBounds (x, cy + 1, 104, 30);
+            fastButton.setBounds (driverButton.getRight() + 8, cy + 1, 92, 30);
         }
     }
     y += section1Height;
@@ -1609,6 +1673,13 @@ void MainComponent::slowRefresh()
     const float newLatency = engine.getEstimatedLatencyMs();
     const auto now = juce::Time::getMillisecondCounter();
 
+    if (fastNoticeUntil != 0 && now >= fastNoticeUntil)   // '더 빠르게' 알림을 다 보여 줬다
+    {
+        fastNoticeUntil = 0;
+        fastNotice.clear();
+        repaint();
+    }
+
     // 10초마다 플러그인 폴더를 훑어 새로 설치된 드럼 VST를 알아챈다.
     if (++pluginScanCounter % 10 == 0)
         checkForNewPlugins();
@@ -1628,8 +1699,12 @@ void MainComponent::slowRefresh()
 
         if (module.displayName() != connectedModule.displayName() || advice != moduleAdvice)
         {
+            const bool brandChanged = module.brand != connectedModule.brand;
             connectedModule = module;
             moduleAdvice = advice;
+
+            if (brandChanged)
+                applyWeakTomFilter();   // 탐 음 번호는 모듈 회사마다 다르다
 
             if (! loadingPlugin && juce::Time::getMillisecondCounter() >= drumStatusHoldUntil)
                 setDrumStatus ({}, false);   // 모듈에 맞는 맵 안내로 바꾼다
@@ -1663,6 +1738,19 @@ void MainComponent::slowRefresh()
     {
         lastXruns = problems;
         xrunWarningUntil = now + 8000;
+
+        if (yamahaFasterMs() > 0)
+            fastRevertPending = true;   // '더 빠르게' 때문일 수 있다: 한 단계 낮춘다
+    }
+
+    // '더 빠르게'를 한 단계 낮춘다(녹음 중이면 녹음이 끝난 뒤). 그새 드라이버 창에서 Mode를 바꿨으면 할 일이 없다.
+    if (fastRevertPending && yamahaFasterMs() == 0)
+        fastRevertPending = false;
+
+    if (fastRevertPending && ! engine.isRecording())
+    {
+        setYamahaFasterMs (yamahaFasterMs() - 1, true);
+        return;   // 장치를 다시 열었으니 나머지는 다음 번에
     }
 
     const bool warning = now < xrunWarningUntil;
@@ -1768,7 +1856,112 @@ void MainComponent::refreshBufferControls (bool force)
         driverButton.setVisible (false);
     }
 
+    refreshFastButton();
     resized();
+    repaint();
+}
+
+//------------------------------------------------------------------------------ 더 빠르게(실험): Yamaha 드라이버 숨은 값 0
+bool MainComponent::isYamahaAsio() const
+{
+    return engine.getAudioDeviceType() == "ASIO" && driverBrand (engine.getAudioDeviceName()) == DrumModule::Brand::yamaha;
+}
+
+int MainComponent::yamahaFasterMs() const
+{
+    if (! isYamahaAsio())
+        return 0;
+
+    // 장치를 열 때 읽은 "LatencyMode/PeriodFrames/OutHubOffset"
+    const auto parts = juce::StringArray::fromTokens (engine.getDriverSettingsAtStart(), "/", {});
+
+    if (parts.size() < 1 || parts[0] != "0")
+        return 0;
+
+    return parts.size() >= 3 && parts[2].isNotEmpty() ? 4 - juce::jlimit (0, 4, parts[2].getIntValue()) : 4;
+}
+
+void MainComponent::refreshFastButton()
+{
+    // 버퍼 크기를 드라이버 창에서만 바꾸는 Yamaha 드라이버이고, 드라이버 설정(LatencyMode)이 있을 때만 보인다.
+    const bool show = isYamahaAsio() && driverButton.isVisible() && ! bufferBox.isVisible()
+                      && Engine::readYamahaDriverSettings().upToFirstOccurrenceOf ("/", false, false).isNotEmpty();
+    const int faster = show ? yamahaFasterMs() : 0;
+    fastButton.setVisible (show);
+    fastButton.setButtonText (faster > 0 ? juce::String (faster) + K ("ms 빠르게") : K ("더 빠르게"));
+    fastButton.setToggleState (faster > 0, juce::dontSendNotification);
+}
+
+void MainComponent::showFasterMenu()
+{
+    const int current = yamahaFasterMs();
+    juce::PopupMenu menu;
+    menu.addSectionHeader (K ("드라이버 여유 줄이기(실험) - 자글거리면 한 단계 낮추세요"));
+    menu.addItem (1, K ("끄기 (드라이버 창의 Mode 그대로)"), true, current == 0);
+    menu.addItem (2, K ("1ms 빠르게"), true, current == 1);
+    menu.addItem (3, K ("2ms 빠르게"), true, current == 2);
+    menu.addItem (4, K ("3ms 빠르게"), true, current == 3);
+    menu.addItem (5, K ("4ms 빠르게 (DTX-PRO에서 자글거림)"), true, current == 4);
+
+    juce::Component::SafePointer<MainComponent> safe (this);
+    menu.showMenuAsync (juce::PopupMenu::Options().withTargetComponent (fastButton), [safe, current] (int result)
+    {
+        if (safe != nullptr && result >= 1 && result <= 5 && result - 1 != current)
+            safe->setYamahaFasterMs (result - 1, false);
+    });
+}
+
+void MainComponent::setYamahaFasterMs (int fasterMs, bool becauseOfDropouts)
+{
+    if (! isYamahaAsio())
+        return;
+
+    const auto now = juce::Time::getMillisecondCounter();
+
+    if (engine.isRecording())
+    {
+        fastNotice = K ("녹음 중에는 바꿀 수 없습니다. 녹음을 마친 뒤 눌러 주세요.");
+        fastNoticeUntil = now + 6000;
+        repaint();
+        return;
+    }
+
+    // 끌 때 되돌릴 Mode(드라이버 창에서 고른 것)를 기억해 둔다. 이미 0이면 전에 기억한 값을 그대로 둔다.
+    const auto current = Engine::readYamahaDriverSettings().upToFirstOccurrenceOf ("/", false, false);
+
+    if (current.isNotEmpty() && current != "0")
+        settings.setValue ("yamahaModeBeforeFast", juce::jlimit (1, 3, current.getIntValue()));
+
+    if (! Engine::writeYamahaFasterStep (juce::jlimit (0, 4, fasterMs), juce::jlimit (1, 3, settings.getIntValue ("yamahaModeBeforeFast", 1))))
+    {
+        fastNotice = K ("드라이버 설정을 바꾸지 못했습니다.");
+        fastNoticeUntil = now + 8000;
+        refreshFastButton();
+        repaint();
+        return;
+    }
+
+    settings.saveIfNeeded();
+
+    // 장치를 다시 열어 드라이버가 새 값을 읽게 한다(드라이버 창에서 바꾼 것처럼). 다시 여는 동안의 끊김은 경고하지 않는다.
+    yamahaReopenedFor = Engine::readYamahaDriverSettings();
+    yamahaPendingSettings.clear();
+    yamahaChangedAt = 0;
+    fastRevertPending = false;
+    xrunGraceUntil = now + 5000;
+    xrunWarningUntil = 0;
+    lastXruns = -1;
+    engine.restartAudioDevice();
+    refreshBufferControls (true);
+
+    if (becauseOfDropouts)
+        fastNotice = K ("소리가 끊겨서 '더 빠르게'를 한 단계 낮췄습니다.");
+    else if (fasterMs > 0)
+        fastNotice = juce::String (fasterMs) + K ("ms 빠르게 했습니다. 탐을 쳐 보고 자글거리면 한 단계 낮추세요.");
+    else
+        fastNotice = K ("'더 빠르게'를 끄고 드라이버 Mode를 원래대로 되돌렸습니다.");
+
+    fastNoticeUntil = now + (becauseOfDropouts ? 20000 : 8000);
     repaint();
 }
 
@@ -1881,28 +2074,30 @@ juce::String MainComponent::getLatencyHint (juce::Colour& colour) const
         return bufferError;
     }
 
+    if (fastNotice.isNotEmpty() && juce::Time::getMillisecondCounter() < fastNoticeUntil)
+    {
+        colour = ui::accent;
+        return fastNotice;
+    }
+
     if (showingXrunWarning)
     {
         colour = ui::red;
         return K ("소리가 끊겼습니다. 버퍼를 한 칸 크게 해 주세요.");
     }
 
-    // Yamaha Steinberg USB 드라이버는 Mode에 따라 버퍼 말고도 여유 버퍼를 더 둔다.
-    // 2026-11-22 DTX-PRO 실측(44.1kHz, 버퍼 32~128): Low Latency 늘 2.2ms, Standard 5.2~6.2ms, Stable 6.2~8.2ms.
-    // 버퍼 128에서 Standard 약 10.6ms → Low Latency 약 6.6ms(끊김 없음). Low Latency가 아니면 바꾸는 방법을 알려 준다.
+    // Yamaha Steinberg USB 드라이버는 Mode에 따라 버퍼 말고도 여유 버퍼를 더 둔다. 드라이버 창이 어떤 Mode였는지는
+    // 장치를 열 때 읽어 둔 레지스트리 값으로 안다(yamahaModeName). Low Latency가 아닐 때만 바꾸는 방법을 알려 준다.
     if (engine.getAudioDeviceType() == "ASIO" && driverBrand (engine.getAudioDeviceName()) == DrumModule::Brand::yamaha)
     {
-        if (const float extra = engine.getDriverExtraLatencyMs(); extra > 3.5f)
+        if (const int faster = yamahaFasterMs(); faster > 0)
+            return juce::String (faster) + K ("ms 빠르게(실험) 쓰는 중: 탐을 칠 때 자글거리면 한 단계 낮추세요");
+
+        if (const auto mode = engine.getDriverSettingsAtStart().upToFirstOccurrenceOf ("/", false, false); mode.getIntValue() >= 2)
         {
             colour = ui::accent;
-
-            // 장치를 열 때 드라이버가 읽은 설정이 이미 Low Latency인데도 여유가 크면, 바꾸라고 하면 헷갈린다
-            // (사용자: "로우 레이턴시 확인했는데"). 적용되지 않았다고 알리고, 방법은 지연 풍선 도움말에 적는다.
-            if (engine.getDriverSettingsAtStart().upToFirstOccurrenceOf ("/", false, false) == "0")
-                return K ("드라이버는 Low Latency인데 아직 적용되지 않았습니다(지연 숫자에 마우스를 올려 보세요)");
-
-            return K ("'버퍼 바꾸기'에서 Mode를 Low Latency로 바꾸면 약 ") + juce::String (juce::roundToInt (extra - 2.2f))
-                   + K ("ms 빨라집니다");
+            const int saving = juce::jmax (1, juce::roundToInt (engine.getDriverExtraLatencyMs() - yamahaLowLatencyExtraMs));
+            return K ("'버퍼 바꾸기'에서 Mode를 Low Latency로 바꾸면 약 ") + juce::String (saving) + K ("ms 빨라집니다");
         }
     }
 
@@ -1935,19 +2130,16 @@ juce::String MainComponent::describeLatency() const
              << "\n" << K ("합계 약 ") << juce::String (b.toMs (b.totalSamples()), 1) << "ms";
     }
 
-    text << "\n" << K ("드럼 모듈과 USB 전송 시간(대략 1~2ms)은 빠져 있습니다. 10ms 아래면 대부분 느끼지 못합니다.");
-
-    // Yamaha 드라이버 설정은 Low Latency인데 드라이버가 알려 주는 여유가 Standard 이상인 경우의 해결 순서
-    if (b.isValid() && b.toMs (b.driverExtra) > 3.5
-        && engine.getAudioDeviceType() == "ASIO" && driverBrand (engine.getAudioDeviceName()) == DrumModule::Brand::yamaha
-        && engine.getDriverSettingsAtStart().upToFirstOccurrenceOf ("/", false, false) == "0")
+    // Yamaha 드라이버 창의 Mode(여유 버퍼가 Mode마다 다르다)
+    if (engine.getAudioDeviceType() == "ASIO" && driverBrand (engine.getAudioDeviceName()) == DrumModule::Brand::yamaha)
     {
-        text << "\n\n" << K ("드라이버 설정은 Low Latency인데 드라이버가 알려 주는 여유는 Standard 이상입니다. 이렇게 해 보세요:")
-             << "\n" << K ("1. 브라우저·유튜브처럼 드럼 모듈로 소리를 내는 다른 프로그램을 모두 끄고 이 앱을 다시 켭니다.")
-             << "\n" << K ("2. 그래도 같으면 이 앱을 끄고 드럼 모듈 전원을 껐다가 6초 뒤에 켠 다음 앱을 켭니다.")
-             << "\n" << K ("앱 폴더의 '지연 진단.txt'에 앱이 읽은 드라이버 설정이 적혀 있습니다.");
+        if (const int faster = yamahaFasterMs(); faster > 0)
+            text << "\n" << K ("· 드라이버 여유: Low Latency보다 ") << faster << K ("ms 짧게(더 빠르게, 실험)");
+        else if (const auto mode = yamahaModeName (engine.getDriverSettingsAtStart().upToFirstOccurrenceOf ("/", false, false)); mode.isNotEmpty())
+            text << "\n" << K ("· 드라이버 Mode: ") << mode;
     }
 
+    text << "\n" << K ("드럼 모듈과 USB 전송 시간(대략 1~2ms)은 빠져 있습니다. 10ms 아래면 대부분 느끼지 못합니다.");
     return text;
 }
 
@@ -2014,7 +2206,8 @@ void MainComponent::writeLatencyReport()
             if (line.startsWith ("LatencyMode = "))
             {
                 const auto mode = line.fromFirstOccurrenceOf ("= ", false, false).trim();
-                line << "  (" << (mode == "0" ? "Low Latency" : mode == "1" ? "Standard" : mode == "2" ? "Stable" : "?") << ")";
+                line << "  (" << (mode == "0" ? juce::String ("0: the app's 'Faster' (experimental), not offered in the driver window")
+                                              : mode == "1" || mode == "2" || mode == "3" ? yamahaModeName (mode) : juce::String ("?")) << ")";
             }
 
             lines.add ("  " + line);
@@ -2033,12 +2226,19 @@ void MainComponent::showMidiMonitor()
 {
     if (monitorWindow == nullptr)
     {
+        juce::Component::SafePointer<MainComponent> safe (this);
         monitorWindow = std::make_unique<ToolWindow> (K ("신호 보기"),
-                                                      new MidiMonitorPanel (engine, connectedModule.brand, connectedModule.displayName(), engine.getPluginName()), true);
+                                                      new MidiMonitorPanel (engine, connectedModule.brand, connectedModule.displayName(), engine.getPluginName(),
+                                                                            weakTomVelocity,
+                                                                            [safe] (int velocity)
+                                                                            {
+                                                                                if (safe != nullptr)
+                                                                                    safe->setWeakTomVelocity (velocity);
+                                                                            }),
+                                                      true);
         monitorWindow->centreAroundComponent (this, monitorWindow->getWidth(), monitorWindow->getHeight());
 
         // 닫으면 없앤다(받은 신호 쌓기를 멈추고, 다음에 열 때 기록을 새로 시작한다).
-        juce::Component::SafePointer<MainComponent> safe (this);
         monitorWindow->onClose = [safe]
         {
             juce::MessageManager::callAsync ([safe]
@@ -2320,6 +2520,24 @@ void MainComponent::applyPadMap (bool save)
     }
 }
 
+//------------------------------------------------------------------------------ 약한 탐 신호 거르기
+void MainComponent::applyWeakTomFilter()
+{
+    engine.setMinVelocity (weakTomHitTable (connectedModule.brand, weakTomVelocity));
+}
+
+void MainComponent::setWeakTomVelocity (int maxDroppedVelocity)
+{
+    weakTomVelocity = juce::jlimit (0, 30, maxDroppedVelocity);
+    applyWeakTomFilter();
+
+    if (autosave)
+    {
+        settings.setValue ("weakTomVelocity", weakTomVelocity);
+        settings.saveIfNeeded();
+    }
+}
+
 void MainComponent::showPadMap()
 {
     if (padWindow == nullptr)
@@ -2348,6 +2566,25 @@ juce::Component* MainComponent::openPadMapForTest()
     padWindow.reset();
     showPadMap();
     return padWindow != nullptr ? padWindow->getContentComponent() : nullptr;
+}
+
+juce::Component* MainComponent::openMidiMonitorForTest()
+{
+    monitorWindow.reset();
+    showMidiMonitor();
+
+    // 하이햇을 칠 때 탐 3(43)에 약한 신호가 같이 들어오는 모습(2026-11-22 DTX-PRO 기록과 같은 세기)
+    engine.injectMidiForTest (juce::MidiMessage::controllerEvent (10, 4, 0));
+    engine.injectMidiForTest (juce::MidiMessage::noteOn (10, 46, (juce::uint8) 70));
+    engine.injectMidiForTest (juce::MidiMessage::noteOn (10, 43, (juce::uint8) 4));
+    engine.injectMidiForTest (juce::MidiMessage::noteOn (10, 44, (juce::uint8) 76));
+    engine.injectMidiForTest (juce::MidiMessage::controllerEvent (10, 4, 126));
+    engine.injectMidiForTest (juce::MidiMessage::noteOn (10, 43, (juce::uint8) 8));
+    engine.injectMidiForTest (juce::MidiMessage::noteOn (10, 42, (juce::uint8) 65));
+    engine.injectMidiForTest (juce::MidiMessage::noteOn (10, 43, (juce::uint8) 82));
+    engine.injectMidiForTest (juce::MidiMessage::noteOn (10, 20, (juce::uint8) 64));
+
+    return monitorWindow != nullptr ? monitorWindow->getContentComponent() : nullptr;
 }
 
 void MainComponent::startLoadingPlugin (const juce::String& path, bool openWindowAfter)

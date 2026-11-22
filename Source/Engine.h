@@ -52,7 +52,11 @@ public:
     static constexpr juce::uint8 keepNote = 255, dropNote = 254;
     void setNoteMap (const std::array<juce::uint8, 128>& map, bool enabled) noexcept;
 
-    // 마지막으로 받은 '음 켬': (지금까지 받은 횟수 << 8) | 받은 음 번호(바꾸기 전). 패드 맞추기 창이 읽는다.
+    // 약한 신호 거르기: minVelocity[받은 음]보다 약한 '음 켬'은 넘기지 않는다(0 = 거르지 않음). 패드 배치보다 먼저,
+    // 모듈이 보낸 음 번호로 본다. 크로스토크로 탐에 들어오는 아주 약한 신호를 버리는 데 쓴다(weakTomHitTable).
+    void setMinVelocity (const std::array<juce::uint8, 128>& minVelocity) noexcept;
+
+    // 마지막으로 받은 '음 켬': (지금까지 받은 횟수 << 8) | 받은 음 번호(바꾸기 전). 패드 맞추기 창이 읽는다. 약해서 버린 신호는 빼고 센다.
     juce::uint32 getLastNoteOn() const noexcept   { return lastNoteOn.load (std::memory_order_relaxed); }
 
     // 드럼 플러그인에 넘길 신호인지. 음·하이햇 페달(CC4)·위치 CC·초크(폴리 애프터터치)는 받은 순서 그대로 넘기고,
@@ -67,6 +71,7 @@ public:
         juce::uint8 data[3] {};
         juce::uint8 size = 0;
         bool forwarded = false;     // 플러그인에 넘겼는지
+        bool weak = false;          // 약해서 버렸는지(setMinVelocity)
         juce::uint8 mappedNote = 255;   // 패드 배치로 바꿔 넘긴 음 번호(255 = 바꾸지 않음)
     };
 
@@ -90,6 +95,7 @@ private:
 
     std::array<std::atomic<juce::uint8>, 128> noteMap;
     std::atomic<bool> noteMapOn { false };
+    std::array<std::atomic<juce::uint8>, 128> minVelocity;
     std::atomic<juce::uint32> lastNoteOn { 0 };
 
     static constexpr int monitorCapacity = 1024;   // 넘치면 새 신호는 버린다(창이 닫혀 있을 때)
@@ -153,10 +159,17 @@ public:
     };
     LatencyBreakdown getLatencyBreakdown() const;
 
-    // Yamaha Steinberg USB 드라이버 설정(레지스트리 LatencyMode/PeriodFrames, 예: "0/128"). 키가 없으면 "/".
-    // 드라이버는 장치를 열 때 이 값을 읽으므로, 장치가 시작될 때 읽어 둔 값과 지금 값이 다르면 다시 열어야 적용된다.
+    // Yamaha Steinberg USB 드라이버 설정(레지스트리 LatencyMode/PeriodFrames/OutHubOffset, 예: "1/96/", "0/96/2").
+    // 키가 없으면 "//". 드라이버는 장치를 열 때 이 값을 읽으므로, 장치가 시작될 때 읽어 둔 값과 지금 값이 다르면 다시 열어야 적용된다.
     static juce::String readYamahaDriverSettings();
     juce::String getDriverSettingsAtStart() const;
+
+    // '더 빠르게'(실험): Yamaha 드라이버가 버퍼 말고 더 두는 출력 여유를 1ms 단위로 줄인다.
+    // 드라이버 창 Mode는 LatencyMode 1 = Low Latency(여유 274샘플), 2 = Standard, 3 = Stable이고, 창에 없는 0은 여유가
+    // 98샘플이다. 0일 때만 OutHubOffset 1당 출력 여유가 44샘플(1ms)씩 늘어 4면 Low Latency와 같다(2026-11-22, DTX-PRO 44.1kHz,
+    // 버퍼 64·96·128 모두 같음). 그래서 fasterMs(1~4)는 LatencyMode 0 + OutHubOffset (4 - fasterMs)이고,
+    // 0이면 modeWhenOff(드라이버 창에서 고른 Mode)로 되돌리고 OutHubOffset을 지운다. 장치를 다시 열어야 적용된다.
+    static bool writeYamahaFasterStep (int fasterMs, int modeWhenOff);
     int getXRunCount() const                                       { return deviceManager.getXRunCount(); }
     double getCpuUsage() const                                     { return deviceManager.getCpuUsage(); }
     float takeMaxMidiWaitMs() noexcept                             { return maxMidiWaitMs.exchange (0.0f); }
@@ -211,6 +224,7 @@ public:
 
     // 패드 배치(모듈 음 번호 → 플러그인 음 번호)와 패드 맞추기용 마지막 음
     void setPadMap (const std::array<juce::uint8, 128>& map, bool enabled) noexcept   { midiInbox.setNoteMap (map, enabled); }
+    void setMinVelocity (const std::array<juce::uint8, 128>& table) noexcept          { midiInbox.setMinVelocity (table); }
     juce::uint32 getLastNoteOn() const noexcept                      { return midiInbox.getLastNoteOn(); }
     void addExtraPluginPath (const juce::String& path);
 

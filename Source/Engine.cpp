@@ -176,6 +176,9 @@ MidiInbox::MidiInbox()
 {
     for (auto& note : noteMap)
         note.store (keepNote);
+
+    for (auto& velocity : minVelocity)
+        velocity.store (0);
 }
 
 void MidiInbox::setNoteMap (const std::array<juce::uint8, 128>& map, bool enabled) noexcept
@@ -184,6 +187,12 @@ void MidiInbox::setNoteMap (const std::array<juce::uint8, 128>& map, bool enable
         noteMap[i].store (map[i], std::memory_order_relaxed);
 
     noteMapOn.store (enabled, std::memory_order_relaxed);
+}
+
+void MidiInbox::setMinVelocity (const std::array<juce::uint8, 128>& table) noexcept
+{
+    for (size_t i = 0; i < table.size(); ++i)
+        minVelocity[i].store (table[i], std::memory_order_relaxed);
 }
 
 void MidiInbox::handleIncomingMidiMessage (juce::MidiInput*, const juce::MidiMessage& message)
@@ -195,18 +204,26 @@ void MidiInbox::receive (const juce::MidiMessage& message, double time)
 {
     const int size = message.getRawDataSize();
     bool forward = shouldForward (message.getRawData(), size);
+    bool weak = false;
     juce::uint8 mapped = keepNote;
 
-    // 음 켬·끔·초크(폴리 애프터터치): 패드 맞추기 창에 알리고, 패드 배치가 켜져 있으면 음 번호를 바꾼다.
+    // 음 켬·끔·초크(폴리 애프터터치): 약한 신호는 버리고, 패드 맞추기 창에 알리고, 패드 배치가 켜져 있으면 음 번호를 바꾼다.
+    // 버린 음의 '음 끔'은 그대로 넘긴다(드럼 플러그인에는 해가 없다).
     if (size == 3)
     {
         const auto* raw = message.getRawData();
         const int status = raw[0] & 0xf0;
 
-        if (status == 0x90 && raw[2] > 0)
+        if (status == 0x90 && raw[2] > 0 && raw[1] < 128 && raw[2] < minVelocity[raw[1]].load (std::memory_order_relaxed))
+        {
+            weak = true;
+            forward = false;
+        }
+
+        if (status == 0x90 && raw[2] > 0 && ! weak)
             lastNoteOn.store ((((lastNoteOn.load (std::memory_order_relaxed) >> 8) + 1) << 8) | raw[1], std::memory_order_relaxed);
 
-        if ((status == 0x90 || status == 0x80 || status == 0xa0) && raw[1] < 128 && noteMapOn.load (std::memory_order_relaxed))
+        if (! weak && (status == 0x90 || status == 0x80 || status == 0xa0) && raw[1] < 128 && noteMapOn.load (std::memory_order_relaxed))
         {
             const auto to = noteMap[raw[1]].load (std::memory_order_relaxed);
 
@@ -230,6 +247,7 @@ void MidiInbox::receive (const juce::MidiMessage& message, double time)
             copy.size = (juce::uint8) size;
             std::memcpy (copy.data, message.getRawData(), (size_t) size);
             copy.forwarded = forward;
+            copy.weak = weak;
             copy.mappedNote = mapped;
             monitorFifo.finishedWrite (1);
         }
@@ -1748,7 +1766,29 @@ void Engine::audioDeviceAboutToStart (juce::AudioIODevice* device)
 juce::String Engine::readYamahaDriverSettings()
 {
     const juce::String key ("HKEY_CURRENT_USER\\Software\\Yamaha\\Yamaha Steinberg USB Driver\\");
-    return juce::WindowsRegistry::getValue (key + "LatencyMode") + "/" + juce::WindowsRegistry::getValue (key + "PeriodFrames");
+    return juce::WindowsRegistry::getValue (key + "LatencyMode") + "/" + juce::WindowsRegistry::getValue (key + "PeriodFrames")
+         + "/" + juce::WindowsRegistry::getValue (key + "OutHubOffset");
+}
+
+bool Engine::writeYamahaFasterStep (int fasterMs, int modeWhenOff)
+{
+    const juce::String key ("HKEY_CURRENT_USER\\Software\\Yamaha\\Yamaha Steinberg USB Driver\\");
+
+    if (fasterMs < 0 || fasterMs > 4 || modeWhenOff < 1 || modeWhenOff > 3 || ! juce::WindowsRegistry::valueExists (key + "LatencyMode"))
+        return false;
+
+    if (fasterMs == 0)
+    {
+        // 드라이버 창의 Mode로 되돌리고, 앱이 넣은 값은 지운다(0이 아닐 때는 효과가 없지만 남겨 두지 않는다).
+        juce::WindowsRegistry::setValue (key + "LatencyMode", (juce::uint32) modeWhenOff);
+        juce::WindowsRegistry::deleteValue (key + "OutHubOffset");
+        return juce::WindowsRegistry::getValue (key + "LatencyMode") == juce::String (modeWhenOff);
+    }
+
+    juce::WindowsRegistry::setValue (key + "OutHubOffset", (juce::uint32) (4 - fasterMs));
+    juce::WindowsRegistry::setValue (key + "LatencyMode", (juce::uint32) 0);
+    return juce::WindowsRegistry::getValue (key + "LatencyMode") == "0"
+        && juce::WindowsRegistry::getValue (key + "OutHubOffset") == juce::String (4 - fasterMs);
 }
 
 juce::String Engine::getDriverSettingsAtStart() const

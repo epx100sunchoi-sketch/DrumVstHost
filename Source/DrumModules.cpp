@@ -203,7 +203,7 @@ juce::String bufferAdviceLong (const juce::String& deviceType, const juce::Strin
     {
         case DrumModule::Brand::yamaha:
             return K ("드럼 모듈 드라이버(Yamaha Steinberg USB) 설정 창을 엽니다. ASIO 탭의 Mode를 Low Latency로 두면 지연이 가장 짧습니다"
-                      "(DTX-PRO, 버퍼 128 실측: Standard 약 10.6ms, Low Latency 약 6.6ms). Buffer Size는 96~128이 무난하고, "
+                      "(DTX-PRO, 버퍼 96 실측: Standard보다 약 1ms 짧음). Buffer Size는 96~128이 무난하고, "
                       "소리가 끊기면 한 칸 크게 하세요.");
         case DrumModule::Brand::roland:
             return K ("드럼 모듈 드라이버(Roland) 설정 창을 엽니다. Audio Buffer Size를 작게(보통 64~128) 하면 지연이 줄어듭니다. "

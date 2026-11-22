@@ -37,3 +37,11 @@ bool isBundledBfdKeymapInstalled();
 
 // '신호 보기'에 보일 패드 이름: 모듈 회사의 기본 음 배치 기준(Yamaha DTX·Roland V-Drums), 모르면 General MIDI 이름.
 juce::String drumPadName (DrumModule::Brand, int note);
+
+// 탐 패드(헤드·림)가 보내는 음 번호: 모듈 회사의 기본 배치 기준, 모르면 General MIDI 탐 번호.
+juce::Array<int> tomPadNotes (DrumModule::Brand);
+
+// 약한 탐 신호 거르기(크로스토크): 다른 패드를 칠 때 진동이 옮겨 붙어 탐에 아주 약한 신호(DTX-PRO에서 세기 3~8)가 들어온다.
+// 드럼 VST는 이런 신호도 꽤 크게 낸다(Addictive Drums 2: 세기 4짜리 탐이 세기 65짜리 하이햇만큼 크다).
+// 받은 음 번호마다 '이 세기보다 약하면 버림' 값을 돌려준다(탐 음만 maxDroppedVelocity + 1, 나머지 0 = 거르지 않음).
+std::array<juce::uint8, 128> weakTomHitTable (DrumModule::Brand, int maxDroppedVelocity);
