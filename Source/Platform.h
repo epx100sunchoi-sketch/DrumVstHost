@@ -13,6 +13,10 @@ void setProcessEnvironmentVariable (const juce::String& name, const juce::String
 // 확인용: milliseconds 동안 Windows 메시지를 직접 돌린다(불러오는 중에 메시지를 처리하는 플러그인 흉내).
 void pumpMessagesFor (int milliseconds);
 
+// 레지스트리 키 아래 값을 "이름 = 값" 줄로 돌려준다(하위 키는 depth 단계까지, "하위키\이름 = 값"). 키가 없으면 빈 배열.
+// localMachine이 false면 HKEY_CURRENT_USER, true면 HKEY_LOCAL_MACHINE(64비트 보기). 지연 진단 파일용.
+juce::StringArray describeRegistryKey (bool localMachine, const juce::String& subKey, int depth);
+
 // 앱이 비정상 종료되면 그 순간의 호출 경로를 logFile에 남긴다(같은 폴더의 .pdb가 있으면 함수 이름·줄 번호까지).
 // 이 앱 코드 안의 메모리 접근 오류와 힙 손상만 기록한다(플러그인이 스스로 처리하는 예외는 건드리지 않는다).
 void installCrashReporter (const juce::File& logFile);

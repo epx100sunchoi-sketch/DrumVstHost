@@ -12,11 +12,14 @@ juce::int64 readInt64 (const juce::XmlElement& xml, const char* name, juce::int6
 }
 
 // source의 [sourceStart, sourceStart + numSamples) 구간을 배율을 곱해 더한다. 범위 밖은 무음.
-// startGain과 endGain이 다르면 블록 안에서 고르게 바꾼다.
+// startGain과 endGain이 다르면 블록 안에서 고르게 바꾼다. 배율이 음수면 그만큼 뺀다(원곡 드럼 빼기).
 void addSource (const juce::AudioBuffer<float>& source, juce::int64 sourceStart, int numSamples,
                 float* left, float* right, float startGain, float endGain) noexcept
 {
-    if (startGain <= 0.0f && endGain <= 0.0f)
+    if (startGain == 0.0f && endGain == 0.0f)
+        return;
+
+    if (source.getNumSamples() <= 0)
         return;
 
     const juce::int64 sourceLength = source.getNumSamples();
@@ -106,6 +109,7 @@ bool TakeInfo::load (const juce::File& folder)
         edited    = true;
         editDrum  = (float) edit->getDoubleAttribute ("drum", drumVolume);
         editSong  = (float) edit->getDoubleAttribute ("song", songVolume);
+        editSongDrums = (float) juce::jlimit (0.0, 1.0, edit->getDoubleAttribute ("songDrums", 1.0));
         offsetMs  = edit->getIntAttribute ("offsetMs", 0);
         trimStart = readInt64 (*edit, "trimStart", 0);
         trimEnd   = readInt64 (*edit, "trimEnd", 0);
@@ -130,6 +134,7 @@ bool TakeInfo::save (const juce::File& folder) const
         auto* edit = xml.createNewChildElement ("EDIT");
         edit->setAttribute ("drum", (double) editDrum);
         edit->setAttribute ("song", (double) editSong);
+        edit->setAttribute ("songDrums", (double) editSongDrums);
         edit->setAttribute ("offsetMs", offsetMs);
         edit->setAttribute ("trimStart", juce::String (trimStart));
         edit->setAttribute ("trimEnd", juce::String (trimEnd));
@@ -168,39 +173,41 @@ juce::Array<juce::File> findRecentTakes (const juce::File& recordFolder, int max
 }
 
 //==============================================================================
+bool TakePlayer::readStereo (const juce::File& file, juce::AudioBuffer<float>& buffer, double& sampleRate)
+{
+    juce::AudioFormatManager formats;
+    formats.registerBasicFormats();
+    std::unique_ptr<juce::AudioFormatReader> reader (formats.createReaderFor (file));
+
+    if (reader == nullptr || reader->lengthInSamples > (juce::int64) std::numeric_limits<int>::max() / 2)
+        return false;
+
+    buffer.setSize (2, (int) reader->lengthInSamples);
+    buffer.clear();
+
+    if (reader->lengthInSamples > 0)
+        reader->read (&buffer, 0, (int) reader->lengthInSamples, 0, true, true);
+
+    sampleRate = reader->sampleRate > 0.0 ? reader->sampleRate : 44100.0;
+    return true;
+}
+
 std::shared_ptr<TakePlayer> TakePlayer::load (const juce::File& folder, juce::String& error)
 {
     std::shared_ptr<TakePlayer> take (new TakePlayer());
     take->folder = folder;
     take->info.load (folder);   // 없어도 소리 파일만 있으면 된다
 
-    juce::AudioFormatManager formats;
-    formats.registerBasicFormats();
+    double drumRate = 0.0, songRate = 0.0;
 
-    const auto read = [&] (const juce::File& file, juce::AudioBuffer<float>& buffer) -> bool
-    {
-        std::unique_ptr<juce::AudioFormatReader> reader (formats.createReaderFor (file));
-
-        if (reader == nullptr || reader->lengthInSamples > (juce::int64) std::numeric_limits<int>::max() / 2)
-            return false;
-
-        buffer.setSize (2, (int) reader->lengthInSamples);
-        buffer.clear();
-
-        if (reader->lengthInSamples > 0)
-            reader->read (&buffer, 0, (int) reader->lengthInSamples, 0, true, true);
-
-        take->rate = reader->sampleRate > 0.0 ? reader->sampleRate : 44100.0;
-        return true;
-    };
-
-    if (! read (TakeFiles::drumIn (folder), take->drum)
-        || ! read (TakeFiles::songIn (folder), take->song))
+    if (! readStereo (TakeFiles::drumIn (folder), take->drum, drumRate)
+        || ! readStereo (TakeFiles::songIn (folder), take->song, songRate))
     {
         error = K ("녹음 파일(드럼.wav, 원곡.wav)을 읽을 수 없습니다.");
         return {};
     }
 
+    take->rate = songRate;
     take->length = juce::jmax (take->drum.getNumSamples(), take->song.getNumSamples());
 
     if (take->length <= 0)
@@ -209,11 +216,52 @@ std::shared_ptr<TakePlayer> TakePlayer::load (const juce::File& folder, juce::St
         return {};
     }
 
+    // 원곡 드럼이 있으면 같이 올린다(없거나 맞지 않으면 그냥 없는 것으로 친다).
+    if (const auto file = TakeFiles::songDrumsIn (folder); file.existsAsFile())
+    {
+        double songDrumsRate = 0.0;
+
+        if (readStereo (file, take->songDrums, songDrumsRate) && std::abs (songDrumsRate - take->rate) < 0.5)
+            take->songDrumsReady.store (true, std::memory_order_release);
+        else
+            take->songDrums.setSize (2, 0);
+    }
+
     take->drumPeaks = computePeaks (take->drum, take->length);
     take->songPeaks = computePeaks (take->song, take->length);
     take->trimStart = 0;
     take->trimEnd = take->length;
     return take;
+}
+
+bool TakePlayer::attachSongDrums (const juce::File& file, juce::String& error)
+{
+    if (hasSongDrums())
+        return true;
+
+    juce::AudioBuffer<float> buffer;
+    double fileRate = 0.0;
+
+    if (! readStereo (file, buffer, fileRate) || std::abs (fileRate - rate) >= 0.5)
+    {
+        error = K ("분리한 원곡 드럼 파일을 읽을 수 없습니다.");
+        return false;
+    }
+
+    // 오디오 스레드는 songDrumsReady가 true가 된 뒤에만 songDrums를 읽는다.
+    songDrums = std::move (buffer);
+    songDrumsReady.store (true, std::memory_order_release);
+    return true;
+}
+
+float TakePlayer::songDrumGainFor (float songGainValue) const noexcept
+{
+    if (! hasSongDrums())
+        return 0.0f;
+
+    // 원곡.wav에는 원곡 드럼이 이미 다 들어 있다. 남길 만큼(amount)만 남기도록 나머지를 뺀다.
+    const float amount = juce::jlimit (0.0f, 1.0f, songDrumAmount.load (std::memory_order_relaxed));
+    return songGainValue * (amount - 1.0f);
 }
 
 void TakePlayer::seek (juce::int64 samplePosition) noexcept
@@ -227,11 +275,13 @@ void TakePlayer::renderAdding (float* left, float* right, int numSamples, double
 {
     const float targetDrum = drumGain.load (std::memory_order_relaxed);
     const float targetSong = songGain.load (std::memory_order_relaxed);
+    const float targetSongDrum = songDrumGainFor (targetSong);
 
     if (currentDrumGain < 0.0f)
     {
         currentDrumGain = targetDrum;
         currentSongGain = targetSong;
+        currentSongDrumGain = targetSongDrum;
     }
 
     auto pos = position.load();
@@ -246,8 +296,12 @@ void TakePlayer::renderAdding (float* left, float* right, int numSamples, double
     {
         currentDrumGain = targetDrum;
         currentSongGain = targetSong;
+        currentSongDrumGain = targetSongDrum;
         return;
     }
+
+    // songDrumsReady는 한 번 true가 되면 바뀌지 않고, 그 뒤로 songDrums도 바뀌지 않는다.
+    const bool withSongDrums = hasSongDrums();
 
     const auto end = juce::jmin (length, trimEnd.load());
 
@@ -264,6 +318,11 @@ void TakePlayer::renderAdding (float* left, float* right, int numSamples, double
         const juce::int64 songLength = song.getNumSamples(), drumLength = drum.getNumSamples();
         const float songStep = (targetSong - currentSongGain) / (float) juce::jmax (1, numSamples);
         const float drumStep = (targetDrum - currentDrumGain) / (float) juce::jmax (1, numSamples);
+        const float songDrumStep = (targetSongDrum - currentSongDrumGain) / (float) juce::jmax (1, numSamples);
+        const bool subtract = withSongDrums && (currentSongDrumGain != 0.0f || targetSongDrum != 0.0f);
+        const float* songDrumL = subtract ? songDrums.getReadPointer (0) : nullptr;
+        const float* songDrumR = subtract ? songDrums.getReadPointer (songDrums.getNumChannels() > 1 ? 1 : 0) : nullptr;
+        const juce::int64 songDrumLength = subtract ? songDrums.getNumSamples() : 0;
 
         double source = (double) pos + readFraction;
 
@@ -275,10 +334,18 @@ void TakePlayer::renderAdding (float* left, float* right, int numSamples, double
 
             left[i]  += readAt (songL, songLength, source) * gs + readAt (drumL, drumLength, d) * gd;
             right[i] += readAt (songR, songLength, source) * gs + readAt (drumR, drumLength, d) * gd;
+
+            if (subtract)
+            {
+                const float gsd = currentSongDrumGain + songDrumStep * (float) i;
+                left[i]  += readAt (songDrumL, songDrumLength, source) * gsd;
+                right[i] += readAt (songDrumR, songDrumLength, source) * gsd;
+            }
         }
 
         currentDrumGain = targetDrum;
         currentSongGain = targetSong;
+        currentSongDrumGain = targetSongDrum;
 
         if (source >= (double) end)
         {
@@ -304,10 +371,14 @@ void TakePlayer::renderAdding (float* left, float* right, int numSamples, double
         const int offset = offsetSamples.load (std::memory_order_relaxed);
         addSource (song, pos, count, left, right, currentSongGain, targetSong);
         addSource (drum, pos - offset, count, left, right, currentDrumGain, targetDrum);
+
+        if (withSongDrums)
+            addSource (songDrums, pos, count, left, right, currentSongDrumGain, targetSongDrum);
     }
 
     currentDrumGain = targetDrum;
     currentSongGain = targetSong;
+    currentSongDrumGain = targetSongDrum;
     pos += count;
 
     if (pos >= end)
@@ -366,6 +437,7 @@ bool TakePlayer::exportMix (const juce::File& destination, ExportFormat format, 
     }
 
     const float drumG = drumGain.load(), songG = songGain.load();
+    const float songDrumG = songDrumGainFor (songG);
     const int offset = offsetSamples.load();
     const int fade = juce::jmax (1, juce::roundToInt (rate * 0.01));   // 앞뒤 10ms
 
@@ -384,6 +456,9 @@ bool TakePlayer::exportMix (const juce::File& destination, ExportFormat format, 
 
         addSource (song, start + done, n, left, right, songG, songG);
         addSource (drum, start + done - offset, n, left, right, drumG, drumG);
+
+        if (hasSongDrums())
+            addSource (songDrums, start + done, n, left, right, songDrumG, songDrumG);
 
         if (done < fade || total - done - n < fade)
         {

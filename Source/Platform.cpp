@@ -237,7 +237,90 @@ void setProcessEnvironmentVariable (const juce::String& name, const juce::String
     SetEnvironmentVariableW (name.toWideCharPointer(), value.toWideCharPointer());
 }
 
+namespace
+{
+void describeKeyInto (HKEY parent, const wchar_t* path, REGSAM view, const juce::String& prefix, int depth, juce::StringArray& out)
+{
+    HKEY key = nullptr;
+
+    if (RegOpenKeyExW (parent, path, 0, KEY_READ | view, &key) != ERROR_SUCCESS)
+        return;
+
+    for (DWORD i = 0; i < 512; ++i)
+    {
+        wchar_t name[256] {};
+        DWORD nameLength = 256, type = 0;
+        BYTE data[2048] {};
+        DWORD dataSize = sizeof (data) - 2;   // 문자열 끝 0을 붙일 자리
+        const auto result = RegEnumValueW (key, i, name, &nameLength, nullptr, &type, data, &dataSize);
+
+        if (result == ERROR_NO_MORE_ITEMS)
+            break;
+
+        if (result != ERROR_SUCCESS)
+        {
+            out.add (prefix + "(value " + juce::String ((int) i) + " not readable)");
+            continue;
+        }
+
+        juce::String value;
+
+        if (type == REG_DWORD && dataSize >= sizeof (DWORD))
+        {
+            DWORD number = 0;
+            std::memcpy (&number, data, sizeof (number));
+            value = juce::String ((juce::uint32) number);
+        }
+        else if (type == REG_QWORD && dataSize >= sizeof (juce::uint64))
+        {
+            juce::uint64 number = 0;
+            std::memcpy (&number, data, sizeof (number));
+            value = juce::String (number);
+        }
+        else if (type == REG_SZ || type == REG_EXPAND_SZ)
+        {
+            value = juce::String (juce::CharPointer_UTF16 (reinterpret_cast<const juce::CharPointer_UTF16::CharType*> (data)));
+        }
+        else
+        {
+            value = "(" + juce::String ((int) dataSize) + " bytes, type " + juce::String ((int) type) + ")";
+        }
+
+        out.add (prefix + juce::String (juce::CharPointer_UTF16 (reinterpret_cast<const juce::CharPointer_UTF16::CharType*> (name)))
+                 + " = " + value);
+    }
+
+    if (depth > 0)
+    {
+        for (DWORD i = 0; i < 64; ++i)
+        {
+            wchar_t name[256] {};
+            DWORD nameLength = 256;
+
+            if (RegEnumKeyExW (key, i, name, &nameLength, nullptr, nullptr, nullptr, nullptr) != ERROR_SUCCESS)
+                break;
+
+            describeKeyInto (key, name, view,
+                             prefix + juce::String (juce::CharPointer_UTF16 (reinterpret_cast<const juce::CharPointer_UTF16::CharType*> (name))) + "\\",
+                             depth - 1, out);
+        }
+    }
+
+    RegCloseKey (key);
+}
+}
+
+juce::StringArray describeRegistryKey (bool localMachine, const juce::String& subKey, int depth)
+{
+    juce::StringArray out;
+    describeKeyInto (localMachine ? HKEY_LOCAL_MACHINE : HKEY_CURRENT_USER, subKey.toWideCharPointer(),
+                     localMachine ? KEY_WOW64_64KEY : 0, {}, depth, out);
+    return out;
+}
+
 #else
+
+juce::StringArray describeRegistryKey (bool, const juce::String&, int) { return {}; }
 
 void setDarkTitleBar (void*) {}
 void setProcessEnvironmentVariable (const juce::String&, const juce::String&) {}

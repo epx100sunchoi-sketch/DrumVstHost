@@ -325,7 +325,7 @@ private:
     }
 
     // 실제 패드와 같은 경로(MidiInbox)로 스네어를 넣어 드럼 소리가 나는지 본다.
-    // 큰 버퍼(512, 한 블록 지연으로 고르게)와 작은 버퍼(64, 블록 맨 앞에 바로) 두 방식을 모두 확인한다.
+    // 큰 버퍼(512, 일정 시간 늦춰 놓기)와 작은 버퍼(64, 블록 맨 앞에 바로) 두 방식을 모두 확인한다.
     void testMidiInput()
     {
         const auto hitThroughInbox = [this] (const juce::String& label)
@@ -339,10 +339,54 @@ private:
             log ("midi-input " + label + ": drum " + dbText (d) + ", max wait " + juce::String (engine->takeMaxMidiWaitMs(), 1) + " ms");
         };
 
-        hitThroughInbox ("buffer 512 (steady)");
+        hitThroughInbox ("buffer 512 (delay " + juce::String (Engine::midiDelayMs (blockSize, sampleRate), 2) + " ms)");
 
         engine->prepareOffline (44100.0, 64);
-        hitThroughInbox ("buffer 64 (immediate)");
+        hitThroughInbox ("buffer 64 (delay " + juce::String (Engine::midiDelayMs (64, 44100.0), 2) + " ms)");
+
+        testMidiPlacement();
+    }
+
+    // 패드 신호를 블록 어디에 놓는지(MidiInbox): 받은 시각과 콜백 시각을 정해 두고 놓인 자리를 본다.
+    // 늦추는 시간은 '버퍼 - 3ms'(3ms 이하 버퍼는 0). 그보다 오래 기다린 신호는 맨 앞, 같은 블록 안의 간격은 그대로.
+    void testMidiPlacement()
+    {
+        const auto place = [] (int block, double rate, std::initializer_list<double> waitedMs) -> juce::String
+        {
+            auto inbox = std::make_unique<MidiInbox>();
+            const double now = 1000000.0;
+            int note = 38;
+
+            for (auto waited : waitedMs)
+                inbox->receive (juce::MidiMessage::noteOn (10, note++, (juce::uint8) 100), now - waited);
+
+            juce::MidiBuffer buffer;
+            inbox->drainInto (buffer, block, rate, Engine::midiDelayMs (block, rate), now);
+
+            juce::StringArray positions;
+
+            for (const auto meta : buffer)
+                positions.add (juce::String (meta.samplePosition));
+
+            return positions.joinIntoString (",");
+        };
+
+        const auto check = [this, &place] (const juce::String& label, int block, double rate, std::initializer_list<double> waitedMs,
+                                           const juce::String& expected)
+        {
+            const auto got = place (block, rate, waitedMs);
+            log ("midi-place " + label + ": " + got + (got == expected ? " ok" : " MISMATCH, expected " + expected));
+        };
+
+        check ("buffer 64 @44.1k, waited 1.0 ms", 64, 44100.0, { 1.0 }, "0");
+        check ("buffer 128 @44.1k, waited 0.2 ms", 128, 44100.0, { 0.2 }, "0");
+        check ("buffer 192 @44.1k, waited 0.5 ms", 192, 44100.0, { 0.5 }, "38");
+        check ("buffer 192 @44.1k, waited 2.0 ms", 192, 44100.0, { 2.0 }, "0");
+        check ("buffer 192 @44.1k, flam waited 3.0/2.0 ms", 192, 44100.0, { 3.0, 2.0 }, "0,44");
+        check ("buffer 192 @44.1k, flam waited 1.0/0.5 ms", 192, 44100.0, { 1.0, 0.5 }, "16,38");
+        check ("buffer 512 @48k, waited 2.0 ms", 512, 48000.0, { 2.0 }, "272");
+        check ("buffer 512 @48k, waited 9.0 ms", 512, 48000.0, { 9.0 }, "0");
+        check ("buffer 512 @48k, stale 60 ms", 512, 48000.0, { 60.0 }, "");
     }
 
     // 녹음(믹스·드럼·원곡) → 테이크 불러오기 → 볼륨·타이밍·구간을 바꿔 저장 → 다시 읽어 확인
@@ -368,7 +412,8 @@ private:
 
         log ("record: " + juce::String (engine->getRecordedSeconds(), 2) + " s in '" + take.getFileName() + "': mix "
              + size (TakeFiles::mix()) + ", drum " + size (TakeFiles::drum()) + ", song " + size (TakeFiles::song())
-             + ", info " + size (TakeFiles::info()) + " bytes");
+             + ", info " + size (TakeFiles::info()) + " bytes, song drums file "
+             + (TakeFiles::songDrumsIn (take).existsAsFile() ? "yes" : "no (expected: song not separated)"));
 
         juce::String takeError;
         auto player = TakePlayer::load (take, takeError);
@@ -1085,6 +1130,137 @@ private:
             engine->pause();
         }
 
+        // 분리한 원곡으로 녹음하면 원곡 드럼.wav도 남는다. 다듬기 창에서 원곡 드럼을 0으로 하면
+        // 펄스(드럼)가 빠지고 사인만 남아야 한다.
+        {
+            juce::String e;
+            const auto folder = report.getSiblingFile ("selftest-stem-recording");
+            folder.deleteRecursively();
+            engine->prepareOffline (rate, 512);
+            engine->loadSong (original, e);
+            engine->useSongStems (rest, drums, e);
+            engine->setSongDrumsOn (true);
+            engine->setPosition (1.0);
+            capture (0.3, 512);
+            engine->play();
+            const bool recording = engine->startRecording (folder, e);
+            capture (2.0, 512);
+            engine->stopRecording();
+            engine->pause();
+
+            const auto take = engine->getLastTakeFolder();
+            auto player = recording ? TakePlayer::load (take, e) : nullptr;
+
+            if (player == nullptr)
+            {
+                log ("stem recording: FAILED " + e);
+            }
+            else
+            {
+                const auto exportPeak = [&] (float amount)
+                {
+                    player->drumGain = 0.0f;
+                    player->songGain = 1.0f;
+                    player->songDrumAmount = amount;
+                    const auto out = take.getChildFile ("song drums " + juce::String (amount, 2) + ".wav");
+                    juce::String exportError;
+
+                    if (! player->exportMix (out, TakePlayer::ExportFormat::wav24, exportError))
+                        return 0.0f;
+
+                    juce::AudioFormatManager formats;
+                    formats.registerBasicFormats();
+                    std::unique_ptr<juce::AudioFormatReader> reader (formats.createReaderFor (out));
+
+                    if (reader == nullptr)
+                        return 0.0f;
+
+                    juce::Range<float> range[2];
+                    reader->readMaxLevels (0, reader->lengthInSamples, range, 2);
+                    return juce::jmax (std::abs (range[0].getStart()), std::abs (range[0].getEnd()));
+                };
+
+                log ("stem recording: song drums file " + juce::String (player->hasSongDrums() ? "loaded" : "MISSING")
+                     + ", export peak with song drums 100 " + dbText (exportPeak (1.0f)) + ", 50 " + dbText (exportPeak (0.25f))
+                     + ", 0 " + dbText (exportPeak (0.0f)) + " (pulse about " + dbText (0.6f) + ", sine only about " + dbText (0.2f) + ")");
+            }
+
+            folder.deleteRecursively();
+        }
+
+        // 48kHz 녹음을 '원곡 드럼 분리'할 때는 44.1kHz로 바꿔 나눈 뒤 되돌린다. 주파수마다 크기·시각이 얼마나 바뀌는지 잰다.
+        {
+            const auto source = report.getSiblingFile ("selftest-48k.wav");
+            const auto down = report.getSiblingFile ("selftest-48k-down.wav");
+            const auto back = report.getSiblingFile ("selftest-48k-back.wav");
+            juce::StringArray parts;
+            juce::String failure;
+
+            for (double hz : { 100.0, 1000.0, 5000.0, 10000.0, 15000.0, 19000.0 })
+            {
+                const double w = 2.0 * juce::MathConstants<double>::pi * hz / 48000.0;
+                juce::AudioBuffer<float> tone (2, 48000 * 2);
+
+                for (int i = 0; i < tone.getNumSamples(); ++i)
+                {
+                    const float v = 0.5f * (float) std::sin (w * i);
+                    tone.setSample (0, i, v);
+                    tone.setSample (1, i, v);
+                }
+
+                source.deleteFile();
+
+                if (std::unique_ptr<juce::OutputStream> stream = source.createOutputStream())
+                {
+                    juce::WavAudioFormat wav;
+
+                    if (auto writer = wav.createWriterFor (stream, juce::AudioFormatWriterOptions()
+                                                                       .withSampleRate (48000.0)
+                                                                       .withNumChannels (2)
+                                                                       .withBitsPerSample (32)
+                                                                       .withSampleFormat (juce::AudioFormatWriterOptions::SampleFormat::floatingPoint)))
+                        writer->writeFromAudioSampleBuffer (tone, 0, tone.getNumSamples());
+                }
+
+                down.deleteFile();
+                back.deleteFile();
+                juce::String e;
+                const bool ok = writeResampledCopy (source, down, 44100.0, e) && writeResampledCopy (down, back, 48000.0, e);
+                juce::AudioFormatManager formats;
+                formats.registerBasicFormats();
+                std::unique_ptr<juce::AudioFormatReader> reader (ok ? formats.createReaderFor (back) : nullptr);
+
+                if (reader == nullptr)
+                {
+                    failure = e;
+                    break;
+                }
+
+                // 가운데 1초를 sin·cos에 투영해 크기와 위상(= 몇 샘플 늦은지)을 구한다.
+                juce::AudioBuffer<float> result (2, (int) reader->lengthInSamples);
+                reader->read (&result, 0, result.getNumSamples(), 0, true, true);
+                double a = 0.0, b = 0.0;
+                int n = 0;
+
+                for (int i = 24000; i < juce::jmin (72000, result.getNumSamples()); ++i, ++n)
+                {
+                    a += result.getSample (0, i) * std::sin (w * i);
+                    b += result.getSample (0, i) * std::cos (w * i);
+                }
+
+                const double amplitude = 2.0 * std::sqrt (a * a + b * b) / juce::jmax (1, n);
+                const double late = -std::atan2 (b, a) / w;   // y = A sin (w (i - late))
+                parts.add (juce::String (hz / 1000.0, hz < 1000.0 ? 1 : 0) + "k " + juce::String (juce::Decibels::gainToDecibels (amplitude / 0.5), 2)
+                           + " dB " + juce::String (late, 2) + " smp");
+            }
+
+            log ("resample 48k -> 44.1k -> 48k (level, samples late): "
+                 + (failure.isNotEmpty() ? "FAILED " + failure : parts.joinIntoString (", ")));
+
+            for (const auto& f : { source, down, back })
+                f.deleteFile();
+        }
+
         engine->drum.mute = false;
         engine->setSongDrumsOn (true);
         juce::String e;
@@ -1751,13 +1927,27 @@ public:
             });
 
         //   --snapshot-take 화면.png   다듬기 창이 열리면 예시 값(지연만큼 당기기, 앞뒤 자르기)을 넣고 PNG로 저장한 뒤 끝낸다
+        //     [--separate-song-drums]   원곡 드럼 파일이 없으면 '원곡 드럼 분리'를 누른 화면(…-before.png)을 남기고,
+        //                               분리가 끝나기를 기다렸다가 찍는다(진짜 분리 도구를 돌린다)
         if (const auto png = argAfter (args, "--snapshot-take"); png.isNotEmpty())
-            waitForTakeEditor (juce::File (png), 120);
+            waitForTakeEditor (juce::File (png), 120, args.contains ("--separate-song-drums"));
     }
 
-    void waitForTakeEditor (const juce::File& png, int triesLeft)
+    static void saveSnapshot (juce::Component& component, const juce::File& png)
     {
-        callOnceAfterDelay (500, [this, png, triesLeft]
+        const auto image = component.createComponentSnapshot (component.getLocalBounds(), true, 2.0f);
+        png.deleteFile();
+
+        if (auto stream = png.createOutputStream())
+        {
+            juce::PNGImageFormat format;
+            format.writeImageToStream (image, *stream);
+        }
+    }
+
+    void waitForTakeEditor (const juce::File& png, int triesLeft, bool separate)
+    {
+        callOnceAfterDelay (500, [this, png, triesLeft, separate]
         {
             if (window == nullptr)
                 return;
@@ -1767,34 +1957,62 @@ public:
             if (editor == nullptr)
             {
                 if (triesLeft > 0)
-                    waitForTakeEditor (png, triesLeft - 1);
+                    waitForTakeEditor (png, triesLeft - 1, separate);
                 else
                     quit();
 
                 return;
             }
 
+            if (separate && ! editor->hasSongDrums() && editor->onSeparateSongDrums != nullptr)
+            {
+                editor->onSeparateSongDrums();
+                callOnceAfterDelay (3000, [this, png]
+                {
+                    if (window != nullptr)
+                        if (auto* ed = window->getMain().getTakeEditor())
+                            saveSnapshot (*ed, png.getSiblingFile (png.getFileNameWithoutExtension() + "-before.png"));
+
+                    waitForTakeSeparation (png, 900);
+                });
+                return;
+            }
+
+            snapshotTakeEditor (png);
+        });
+    }
+
+    void waitForTakeSeparation (const juce::File& png, int secondsLeft)
+    {
+        callOnceAfterDelay (1000, [this, png, secondsLeft]
+        {
+            if (window == nullptr)
+                return;
+
+            if (window->getMain().isTakeSeparationBusy() && secondsLeft > 0)
+                waitForTakeSeparation (png, secondsLeft - 1);
+            else
+                snapshotTakeEditor (png);
+        });
+    }
+
+    void snapshotTakeEditor (const juce::File& png)
+    {
+        if (window == nullptr)
+            return;
+
+        if (auto* editor = window->getMain().getTakeEditor())
             editor->runSnapshotDemo();
 
-            callOnceAfterDelay (600, [this, png]
-            {
-                if (window == nullptr)
-                    return;
+        callOnceAfterDelay (600, [this, png]
+        {
+            if (window == nullptr)
+                return;
 
-                if (auto* ed = window->getMain().getTakeEditor())
-                {
-                    const auto image = ed->createComponentSnapshot (ed->getLocalBounds(), true, 2.0f);
-                    png.deleteFile();
+            if (auto* ed = window->getMain().getTakeEditor())
+                saveSnapshot (*ed, png);
 
-                    if (auto stream = png.createOutputStream())
-                    {
-                        juce::PNGImageFormat format;
-                        format.writeImageToStream (image, *stream);
-                    }
-                }
-
-                quit();
-            });
+            quit();
         });
     }
 

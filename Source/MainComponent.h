@@ -35,6 +35,7 @@ public:
     void openSong (const juce::File& file)       { loadSong (file); }
     void openTakeEditor (const juce::File& takeFolder);
     TakeEditor* getTakeEditor() const noexcept   { return takeEditor; }
+    bool isTakeSeparationBusy() const noexcept   { return takeSeparationBusy; }
     void setRecordFolder (const juce::File& folder);
     juce::Component* openPadMapForTest();
     void offerToolInstallForTest (bool separation)  { offerToolInstall (separation); }        // 확인용: 패드 맞추기 창을 열고(예시 값을 넣어) 그 내용을 돌려준다
@@ -60,6 +61,9 @@ private:
     void bufferChosen();
     void openDriverPanel();
     juce::String getLatencyHint (juce::Colour& colour) const;
+    juce::String describeLatency() const;        // 지연 풍선 도움말: 버퍼·드라이버 여유·패드 신호 대기·플러그인 지연
+    void writeLatencyReport();                   // 앱 폴더의 '지연 진단.txt'를 새로 쓴다(내용이 바뀐 경우만)
+    juce::String latencyReportSignature;
     void showSettings();
 
     // ② 드럼 소리
@@ -83,6 +87,17 @@ private:
     void showRecordingsMenu();
     void browseForTake();
     void closeTakeEditor();
+
+    // 다듬기 창의 '원곡 드럼 분리': 녹음 폴더의 원곡.wav를 Demucs로 나눠 원곡 드럼.wav를 만든다(한 번에 한 녹음).
+    void startTakeSeparation();
+    void runTakeSeparation (const juce::File& folder, const juce::File& input, double takeRate);
+    void finishTakeSeparation (const juce::File& folder, bool ok, const juce::String& message, const juce::String& details);
+    void showTakeSeparationState (const juce::File& folder, const juce::String& text, bool isError, bool busy);
+    std::unique_ptr<ProcessJob> takeSeparationJob;
+    juce::File takeSeparationFolder;
+    juce::String takeSeparationText;   // 다듬기 창을 다시 열었을 때 보여 줄 진행 상황
+    bool takeSeparationBusy = false;
+
     void setSongStatus (const juce::String& text, bool isError, int secondsToShow = 0);
 
     // ③ 연습 도구: 메트로놈(원곡 박자 분석), 원곡 드럼 빼기(분리)
@@ -152,7 +167,7 @@ private:
     juce::uint32 lastStreamStarts = 0;
 
     // Yamaha 드라이버 창의 Mode·Buffer Size(레지스트리)가 바뀐 것을 보면 장치를 한 번 다시 연다(checkYamahaDriverSettings).
-    juce::String yamahaDriverSettings;
+    juce::String yamahaPendingSettings, yamahaReopenedFor;
     juce::uint32 yamahaChangedAt = 0;
     void checkYamahaDriverSettings();
     juce::int64 ignoredRestarts = 0;   // 설정 창에서 사용자가 일으킨 장치 재시작(끊김으로 보지 않는다)

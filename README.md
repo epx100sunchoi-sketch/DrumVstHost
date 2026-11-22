@@ -36,7 +36,7 @@ and saving an MP3.
 | **Metronome that follows the song** | Finds the beats of the song and clicks on them, with a 4-beat count-in before playback. Double / half speed, and shift the click by half a beat, a quarter beat or 5 ms. Clicks are not recorded. *(optional tools, see below)* |
 | **Remove the song's drums** | Separates the original drums (Demucs) so you play over the rest of the band. One button to switch them back. *(optional tools, see below)* |
 | **Record** | One button. Saves the mix plus separate drum and song stems. |
-| **Edit the take** | Re-balance drums and song, shift the drums ±150 ms (one click to compensate the measured latency), trim the start and end, then save the final mix as **MP3** or WAV. |
+| **Edit the take** | Re-balance drums and song, turn the song's own drums down or off (**Song drums**), shift the drums ±150 ms (one click to compensate the measured latency), trim the start and end, then save the final mix as **MP3** or WAV. Takes recorded over a separated song can do this right away; for older takes, press **Separate song drums** once. |
 | **English / 한국어** | Follows the Windows language; switch with the button at the top right. |
 
 ## Getting started
@@ -130,7 +130,7 @@ DAW는 드럼 한 번 치려는 데 쓰기엔 너무 무겁고 번거롭습니�
 - 지연 시간 표시와 드라이버 설정 안내(DTX-PRO, 버퍼 128: 드라이버 Mode가 Low Latency면 약 6.6ms, 기본값 Standard면 약 10.6ms)
 - 어떤 전자드럼이든 패드를 쳐서 맞추는 '패드 맞추기', 받은 신호를 보여 주는 '신호 보기'
 - 원곡(MP3·WAV·FLAC)에 맞춰 연주, 원곡 박자를 따라가는 메트로놈(2배·절반, 반 박·1/4박·5ms 조정), 원곡 드럼 빼기
-- 한 번에 녹음하고, 볼륨·타이밍·구간을 다듬어 MP3나 WAV로 저장
+- 한 번에 녹음하고, 볼륨·타이밍·구간을 다듬어 MP3나 WAV로 저장(다듬을 때 원곡 속 드럼만 줄이거나 뺄 수 있음)
 - 한국어·영어 화면
 
 메트로놈 박자 찾기와 원곡 드럼 빼기에 쓰는 분석 도구는 처음 그 버튼을 누를 때 앱이 내려받기를 권합니다.

@@ -34,13 +34,18 @@ struct PluginEntry
 
 //==============================================================================
 // 드럼에서 온 MIDI를 받아 두었다가 다음 오디오 블록에 놓는다.
-//  - 버퍼가 작을 때(3ms 이하): 블록 맨 앞에 바로 놓는다. 평균 반 블록 빨라지고, 흔들림은 3ms 이하라 들리지 않는다.
-//  - 버퍼가 클 때: 직전 블록 시점 기준 간격을 그대로 살린다(JUCE 기본 방식). 한 블록 늦지만 박자가 흔들리지 않는다.
+// 패드 신호는 블록 사이 아무 때나 오므로, 받은 시각 그대로 놓으려면 일정한 시간(delay)만큼 늦춰야 한다.
+//  - delay = 0: 블록 맨 앞에 바로 놓는다(가장 빠르다). 기다리는 시간이 0~한 블록으로 흔들린다.
+//  - delay = 한 블록: 받은 간격을 그대로 살린다(JUCE 기본 방식). 흔들림은 없지만 늘 한 블록 늦다.
+//  - 그 사이: delay보다 짧게 기다린 신호는 정확히 delay 뒤에, 더 오래 기다린 신호는 블록 맨 앞에 놓는다.
+//    흔들림은 '한 블록 - delay'를 넘지 않는다. 엔진은 흔들림이 3ms를 넘지 않는 가장 짧은 delay를 쓴다(Engine::midiDelayMs).
+// 같은 블록에 든 신호끼리의 간격(플램 등)은 늘 그대로 둔다.
 class MidiInbox final : public juce::MidiInputCallback
 {
 public:
     MidiInbox();
     void handleIncomingMidiMessage (juce::MidiInput*, const juce::MidiMessage&) override;
+    void receive (const juce::MidiMessage&, double time);   // time: 받은 시각(Time::getMillisecondCounterHiRes), 확인용으로도 쓴다
 
     // 패드 배치: 모듈이 보낸 음 번호를 플러그인이 아는 번호로 바꿔 넘긴다(음 켬·끔·초크에 적용).
     // map[받은 음] = 보낼 음(0~127), keepNote = 그대로, dropNote = 넘기지 않음. MIDI 스레드가 읽으므로 값 하나씩 원자적으로 바꾼다.
@@ -67,13 +72,11 @@ public:
 
     int readMonitor (MonitorEvent* destination, int maxEvents) noexcept;
 
-    // 오디오 스레드. 쌓인 신호를 블록에 놓고, 가장 오래 기다린 시간(ms)을 돌려준다(없으면 -1).
+    // 오디오 스레드. 쌓인 신호를 delayMs만큼 늦춰 블록에 놓고, 가장 오래 기다린 시간(ms)을 돌려준다(없으면 -1).
     // now는 이 콜백이 시작된 시각(Time::getMillisecondCounterHiRes)이다.
-    double drainInto (juce::MidiBuffer& destination, int numSamples, double sampleRate, bool immediate, double now) noexcept;
+    double drainInto (juce::MidiBuffer& destination, int numSamples, double sampleRate, double delayMs, double now) noexcept;
 
 private:
-    double lastDrainTime = 0.0;   // 오디오 스레드 전용
-
     struct Event
     {
         double time = 0.0;
@@ -103,8 +106,14 @@ public:
     Engine (bool openAudioDevice, juce::PropertiesFile* settings);
     ~Engine() override;
 
-    // 버퍼가 3ms 이하면 MIDI를 블록 맨 앞에 바로 놓는다(MidiInbox 설명 참고).
-    static bool usesImmediateMidi (int bufferSize, double rate) noexcept   { return rate > 0.0 && bufferSize <= rate * 0.003; }
+    // 패드 신호를 일부러 늦추는 시간(ms): 버퍼가 3ms 이하면 0(블록 맨 앞에 바로), 크면 '버퍼 - 3ms'.
+    // 신호 대기의 흔들림이 어떤 버퍼에서도 3ms를 넘지 않게 하면서 평균 대기를 가장 짧게 한다(MidiInbox 설명 참고).
+    // 예전에는 3ms가 넘는 버퍼에서 한 블록을 통째로 늦췄다(44.1kHz 버퍼 192: 평균 4.4ms → 지금 2.4ms).
+    static constexpr double maxMidiJitterMs = 3.0;
+    static double midiDelayMs (int bufferSize, double rate) noexcept
+    {
+        return rate > 0.0 && bufferSize > 0 ? juce::jmax (0.0, bufferSize * 1000.0 / rate - maxMidiJitterMs) : 0.0;
+    }
 
     juce::AudioDeviceManager deviceManager;
     ChannelSettings drum, song, master;
@@ -124,6 +133,30 @@ public:
     float getOutputLatencyMs() const;                              // 장치가 알려 주는 출력 지연, 장치가 없으면 -1
     float getEstimatedLatencyMs() const;                           // 패드 신호가 도착한 뒤 소리가 나기까지(모듈·USB 제외)
     float getDriverExtraLatencyMs() const;                         // 출력 지연 중 버퍼 말고 드라이버가 더 두는 여유분(ms), 장치가 없으면 -1
+
+    // 지연 내역(샘플 단위). getEstimatedLatencyMs는 이 합이다. 화면의 풍선 도움말과 '지연 진단' 파일이 쓴다.
+    struct LatencyBreakdown
+    {
+        double rate = 0.0;
+        int buffer = 0;              // 버퍼 크기
+        int reportedOutput = 0;      // 드라이버가 알려 준 출력 지연(지금 채우는 블록 포함, ASIO 규약)
+        int reportedInput = 0;       // 드라이버가 알려 준 입력 지연(이 앱은 쓰지 않는다, 참고용)
+        int driverExtra = 0;         // 출력 지연 중 버퍼 말고 드라이버가 더 두는 여유
+        double midiDelay = 0.0;      // 패드 신호를 일부러 늦추는 고정 시간(박자 흔들림을 막는 몫, 작은 버퍼는 0)
+        double midiWait = 0.0;       // 패드 신호를 블록에 놓기까지의 평균 대기(고정 시간 포함)
+        int plugin = 0;              // 플러그인이 스스로 늦추는 만큼
+        juce::String pluginName;
+
+        bool isValid() const noexcept                  { return rate > 0.0 && buffer > 0; }
+        double toMs (double samples) const noexcept    { return rate > 0.0 ? samples * 1000.0 / rate : 0.0; }
+        double totalSamples() const noexcept           { return buffer + driverExtra + midiWait + plugin; }
+    };
+    LatencyBreakdown getLatencyBreakdown() const;
+
+    // Yamaha Steinberg USB 드라이버 설정(레지스트리 LatencyMode/PeriodFrames, 예: "0/128"). 키가 없으면 "/".
+    // 드라이버는 장치를 열 때 이 값을 읽으므로, 장치가 시작될 때 읽어 둔 값과 지금 값이 다르면 다시 열어야 적용된다.
+    static juce::String readYamahaDriverSettings();
+    juce::String getDriverSettingsAtStart() const;
     int getXRunCount() const                                       { return deviceManager.getXRunCount(); }
     double getCpuUsage() const                                     { return deviceManager.getCpuUsage(); }
     float takeMaxMidiWaitMs() noexcept                             { return maxMidiWaitMs.exchange (0.0f); }
@@ -347,6 +380,9 @@ private:
     std::atomic<bool> monResetMax { false };
     std::atomic<double> quietUntilMs { 0.0 };
 
+    juce::CriticalSection driverSettingsLock;
+    juce::String driverSettingsAtStart;   // 장치가 시작될 때 읽은 Yamaha 드라이버 설정(readYamahaDriverSettings)
+
     // 카운트인: 메시지 스레드가 박 시각을 채운 뒤 남은 샘플 수를 넣고, 오디오 스레드가 세다가 0이 되면 원곡을 시작한다.
     // 남은 샘플 수를 바꾸는 쪽은 모두 countInLock 안에서 바꾼다(오디오 스레드는 try-lock).
     juce::SpinLock countInLock;
@@ -414,10 +450,13 @@ private:
     // 녹음
     juce::TimeSliceThread recordThread { "recorder" };
     juce::SpinLock recordLock;
-    std::unique_ptr<ThreadedWriter> mixWriter, drumWriter, songWriter;
+    std::unique_ptr<ThreadedWriter> mixWriter, drumWriter, songWriter, songDrumWriter;
     ThreadedWriter* activeMixWriter = nullptr;
     ThreadedWriter* activeDrumWriter = nullptr;
     ThreadedWriter* activeSongWriter = nullptr;
+    ThreadedWriter* activeSongDrumWriter = nullptr;   // 드럼을 분리한 곡을 녹음할 때만(원곡 드럼.wav)
+    std::atomic<bool> recordingSongDrums { false };
+    mixdsp::ToneEq songDrumEq;                        // 원곡 드럼에도 원곡과 같은 EQ를 건다(오디오 스레드 전용)
     std::atomic<bool> recording { false };
     std::atomic<juce::int64> recordedSamples { 0 };
     double recordSampleRate = 0.0;

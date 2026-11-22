@@ -48,6 +48,8 @@ juce::String describeTake (const TakePlayer& take)
 class StepSlider final : public juce::Component
 {
 public:
+    static constexpr int nameWidth = 84;   // '원곡 드럼'까지 들어가는 이름 칸
+
     StepSlider (const juce::String& nameToUse, double minimum, double maximum, double buttonStep, double defaultValue,
                 bool bipolar, std::function<juce::String (double)> formatter)
         : name (nameToUse), step (buttonStep), format (std::move (formatter))
@@ -101,7 +103,7 @@ public:
     void resized() override
     {
         auto area = getLocalBounds();
-        nameArea = area.removeFromLeft (64);
+        nameArea = area.removeFromLeft (nameWidth);
         valueArea = area.removeFromRight (70);
         area.removeFromRight (10);
         minus.setBounds (area.removeFromLeft (36).withSizeKeepingCentre (36, 32));
@@ -429,6 +431,29 @@ TakeEditor::TakeEditor (Engine& engineToUse, std::shared_ptr<TakePlayer> takeToU
     songVolume->onChange = [this] (double) { applyVolumes(); };
     addAndMakeVisible (*songVolume);
 
+    // 원곡 드럼: 원곡 드럼 파일이 있으면 조절 막대, 없으면 '원곡 드럼 분리' 단추를 보여 준다.
+    const float songDrumsStart = info.edited ? info.editSongDrums : 1.0f;
+    songDrumsVolume = std::make_unique<StepSlider> (K ("원곡 드럼"), 0.0, 100.0, 1.0, 100.0, false, volumeText);
+    songDrumsVolume->setValue (std::round (songDrumsStart * 100.0f), juce::dontSendNotification);
+    songDrumsVolume->setTooltips (K ("원곡에 들어 있는 드럼 소리의 크기입니다. 100이면 녹음 그대로, 0이면 원곡 드럼을 뺍니다. 더블클릭하면 100으로 돌아갑니다."),
+                                  K ("원곡 드럼을 조금 작게"), K ("원곡 드럼을 조금 크게"));
+    songDrumsVolume->onChange = [this] (double) { applyVolumes(); };
+    addChildComponent (*songDrumsVolume);
+
+    separateButton.setButtonText (K ("원곡 드럼 분리"));
+    styleButton (separateButton, K ("이 녹음의 원곡에서 드럼만 따로 떼어 냅니다. 한 번만 하면 되고, 3분짜리 녹음이면 2분쯤 걸립니다. 끝나면 원곡 드럼을 줄이거나 뺄 수 있습니다."));
+    separateButton.onClick = [this]
+    {
+        if (onSeparateSongDrums != nullptr)
+            onSeparateSongDrums();
+    };
+    addChildComponent (separateButton);
+
+    styleLabel (songDrumsNote, 14.0f, ui::textDim);
+    songDrumsNote.setText (K ("원곡에 든 드럼을 떼어 내면 원곡 드럼만 줄이거나 뺄 수 있습니다."), juce::dontSendNotification);
+    addChildComponent (songDrumsNote);
+    updateSongDrumsRow();
+
     // 타이밍
     timing = std::make_unique<StepSlider> (K ("드럼"), -150.0, 150.0, 1.0, 0.0, true, signedMs);
     timing->setValue (info.edited ? (double) info.offsetMs : 0.0, juce::dontSendNotification);
@@ -490,9 +515,9 @@ TakeEditor::TakeEditor (Engine& engineToUse, std::shared_ptr<TakePlayer> takeToU
 
     take->seek (take->trimStart.load());
     rangeChanged();
-    setStatus (K ("볼륨과 타이밍을 맞춘 뒤 '완성본 저장'을 누르세요."), false);
+    setStatus (K ("볼륨과 타이밍을 맞춘 뒤 '완성본 저장'을 누르세요. 저장하지 않고 닫으면 바꾼 값은 남지 않습니다."), false);
 
-    setSize (editorWidth, 612);
+    setSize (editorWidth, 656);
     startTimerHz (30);
 }
 
@@ -507,12 +532,45 @@ void TakeEditor::stopPreview()
     take->playing = false;
 }
 
+void TakeEditor::updateSongDrumsRow()
+{
+    const bool ready = take->hasSongDrums();
+    songDrumsVolume->setVisible (ready);
+    separateButton.setVisible (! ready);
+    songDrumsNote.setVisible (! ready);
+    repaint (songDrumsNameArea);
+}
+
+void TakeEditor::showSeparationState (const juce::String& text, bool isError, bool busy, const juce::String& details)
+{
+    separateButton.setEnabled (! busy);
+    songDrumsNote.setColour (juce::Label::textColourId, isError ? ui::red : ui::textDim);
+    songDrumsNote.setText (text, juce::dontSendNotification);
+    songDrumsNote.setTooltip (details.isNotEmpty() ? text + "\n" + details : (isError ? text : juce::String()));
+}
+
+void TakeEditor::attachSeparatedSongDrums (const juce::File& songDrumsFile)
+{
+    juce::String error;
+
+    if (! take->attachSongDrums (songDrumsFile, error))
+    {
+        showSeparationState (error, true, false);
+        return;
+    }
+
+    updateSongDrumsRow();
+    applyVolumes();
+    setStatus (K ("원곡 드럼을 분리했습니다. '원곡 드럼'을 줄이면 원곡의 드럼 소리가 작아지고, 0이면 빠집니다."), false);
+}
+
 void TakeEditor::saveEditState()
 {
     auto& info = take->info;
     info.edited = true;
     info.editDrum = (float) (drumVolume->getValue() / 100.0);
     info.editSong = (float) (songVolume->getValue() / 100.0);
+    info.editSongDrums = (float) (songDrumsVolume->getValue() / 100.0);
     info.offsetMs = juce::roundToInt (timing->getValue());
     info.trimStart = take->trimStart.load();
     info.trimEnd = take->trimEnd.load();
@@ -535,6 +593,10 @@ void TakeEditor::runSnapshotDemo()
     take->trimEnd = take->getLength() * 92 / 100;
     take->seek (take->getLength() * 35 / 100);
     drumVolume->setValue (90.0, juce::sendNotificationSync);
+
+    if (take->hasSongDrums())
+        songDrumsVolume->setValue (40.0, juce::sendNotificationSync);
+
     rangeChanged();
     waveform->repaint();
 }
@@ -545,6 +607,7 @@ void TakeEditor::applyVolumes()
     const auto toGain = [] (double v) { const float x = (float) juce::jlimit (0.0, 1.0, v / 100.0); return x * x; };
     take->drumGain = toGain (drumVolume->getValue());
     take->songGain = toGain (songVolume->getValue());
+    take->songDrumAmount = toGain (songDrumsVolume->getValue());   // 원곡 드럼 파일이 없으면 쓰지 않는다
     waveform->repaint();
 }
 
@@ -698,6 +761,12 @@ void TakeEditor::paint (juce::Graphics& g)
     g.drawText (K ("볼륨 맞추기"), volumeTitleArea, juce::Justification::centredLeft);
     g.drawText (K ("타이밍 맞추기"), timingTitleArea, juce::Justification::centredLeft);
 
+    if (! songDrumsVolume->isVisible())   // 조절 막대 대신 '원곡 드럼 분리' 단추가 있을 때의 이름
+    {
+        g.setFont (ui::font (16.0f));
+        g.drawText (K ("원곡 드럼"), songDrumsNameArea, juce::Justification::centredLeft);
+    }
+
     g.setColour (ui::textDim);
     g.setFont (ui::font (14.0f));
     g.drawText (K ("드럼이 원곡보다 늦게(밀려) 들리면 − 쪽으로, 급하게(당겨) 들리면 + 쪽으로 옮기세요."),
@@ -736,6 +805,17 @@ void TakeEditor::resized()
     drumVolume->setBounds (pad, y, width, 40);
     y += 44;
     songVolume->setBounds (pad, y, width, 40);
+    y += 44;
+
+    {
+        auto row = juce::Rectangle<int> (pad, y, width, 40);
+        songDrumsVolume->setBounds (row);
+        songDrumsNameArea = row.removeFromLeft (StepSlider::nameWidth);
+        separateButton.setBounds (row.removeFromLeft (150).withSizeKeepingCentre (150, 34));
+        row.removeFromLeft (14);
+        songDrumsNote.setBounds (row);
+    }
+
     y += 40 + 12;
 
     dividers[1] = y;

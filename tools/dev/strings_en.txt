@@ -322,7 +322,7 @@ WAV (원본 음질)	WAV (full quality)
 kbps)는 WAV의 약 7분의 1 크기라 올리거나 보내기 좋습니다. 다시 편집하거나 원본 음질 그대로 남기려면 WAV를 고르세요.	 kbps) is about one seventh the size of WAV, good for uploading or sending. Choose WAV to edit it again or to keep full quality.
 완성본 저장	Save final mix
 지금 값으로 섞어서 남길 구간만 저장합니다. 파일 형식(MP3·WAV)은 왼쪽 상자에서 고릅니다.	Mixes with the current values and saves only the kept range. Choose the file format (MP3 or WAV) in the box on the left.
-볼륨과 타이밍을 맞춘 뒤 '완성본 저장'을 누르세요.	Set the volume and timing, then press 'Save final mix'.
+볼륨과 타이밍을 맞춘 뒤 '완성본 저장'을 누르세요. 저장하지 않고 닫으면 바꾼 값은 남지 않습니다.	Set the volume and timing, then press 'Save final mix'. If you close without saving, your changes are not kept.
 파형 양 끝의 손잡이를 끌면 앞뒤를 자를 수 있습니다	Drag the handles at both ends of the waveform to trim the start and end
 남길 구간\s	Kept range\s
 녹음하는 동안에는 들어볼 수 없습니다.	You cannot listen while recording.
@@ -373,3 +373,30 @@ kbps)는 WAV의 약 7분의 1 크기라 올리거나 보내기 좋습니다. 다
 드럼 모듈 드라이버(Yamaha Steinberg USB) 설정 창을 엽니다. ASIO 탭의 Mode를 Low Latency로 두면 지연이 가장 짧습니다(DTX-PRO, 버퍼 128 실측: Standard 약 10.6ms, Low Latency 약 6.6ms). Buffer Size는 96~128이 무난하고, 소리가 끊기면 한 칸 크게 하세요.	Opens the settings window of the drum module driver (Yamaha Steinberg USB). Setting Mode on the ASIO tab to Low Latency gives the shortest latency (measured on a DTX-PRO at a 128-sample buffer: about 10.6 ms in Standard, about 6.6 ms in Low Latency). A Buffer Size of 96-128 works well; if the sound breaks up, go one step larger.
 '버퍼 바꾸기'에서 Mode를 Low Latency로 바꾸면 약\s	Set Mode to Low Latency in 'Change buffer' to save about\s
 ms 빨라집니다	 ms
+패드 신호가 PC에 도착한 뒤 헤드폰에서 소리가 나기까지 걸리는 시간입니다.	Time from the pad signal reaching the PC to the sound in your headphones.
+· 버퍼\s	- Buffer\s
+ 샘플:\s	 samples:\s
+· 드라이버가 더 두는 여유:\s	- Extra buffer the driver keeps:\s
+· 패드 신호 대기(평균):\s	- Waiting for the next audio block (average):\s
+· 드럼 VST 자체 지연:\s	- Drum VST's own latency:\s
+합계 약\s	Total about\s
+드럼 모듈과 USB 전송 시간(대략 1~2ms)은 빠져 있습니다. 10ms 아래면 대부분 느끼지 못합니다.	The drum module and USB transfer (roughly 1-2 ms) are not included. Below 10 ms most people do not notice it.
+드라이버는 Low Latency인데 아직 적용되지 않았습니다(지연 숫자에 마우스를 올려 보세요)	The driver is set to Low Latency but it has not taken effect yet (hover over the latency number)
+드라이버 설정은 Low Latency인데 드라이버가 알려 주는 여유는 Standard 이상입니다. 이렇게 해 보세요:	The driver setting is Low Latency, but the extra buffer the driver reports is Standard or more. Try this:
+1. 브라우저·유튜브처럼 드럼 모듈로 소리를 내는 다른 프로그램을 모두 끄고 이 앱을 다시 켭니다.	1. Close every other program that plays sound through the drum module (browser, YouTube, ...) and restart this app.
+2. 그래도 같으면 이 앱을 끄고 드럼 모듈 전원을 껐다가 6초 뒤에 켠 다음 앱을 켭니다.	2. If nothing changes, close this app, switch the drum module off, wait 6 seconds, switch it on, then start the app.
+앱 폴더의 '지연 진단.txt'에 앱이 읽은 드라이버 설정이 적혀 있습니다.	'Latency report.txt' in the app folder shows the driver settings the app read.
+다른 녹음의 원곡 드럼을 분리하는 중입니다. 끝난 뒤에 다시 눌러 주세요.	Separating the song drums of another recording. Press again when it is done.
+드럼 분리 도구가 없습니다. 메인 창의 '원곡 드럼 빼기'를 눌러 먼저 설치해 주세요.	The drum separation tool is not installed. Press 'Remove song drums' in the main window to install it first.
+분리 준비 중…	Preparing to separate…
+녹음의 원곡 파일을 읽을 수 없습니다.	Cannot read the song file of this recording.
+작업 폴더를 만들 수 없습니다:\s	Cannot create the work folder:\s
+분리한 원곡 드럼 파일을 읽을 수 없습니다.	Cannot read the separated song drums file.
+원곡 드럼	Song drums
+원곡에 들어 있는 드럼 소리의 크기입니다. 100이면 녹음 그대로, 0이면 원곡 드럼을 뺍니다. 더블클릭하면 100으로 돌아갑니다.	Volume of the drums inside the song. 100 keeps them as recorded, 0 removes them. Double-click to return to 100.
+원곡 드럼을 조금 작게	Song drums a little quieter
+원곡 드럼을 조금 크게	Song drums a little louder
+원곡 드럼 분리	Separate song drums
+이 녹음의 원곡에서 드럼만 따로 떼어 냅니다. 한 번만 하면 되고, 3분짜리 녹음이면 2분쯤 걸립니다. 끝나면 원곡 드럼을 줄이거나 뺄 수 있습니다.	Separates the drums from the song in this recording. You only do this once; a 3-minute recording takes about 2 minutes. Then you can lower or remove the song drums.
+원곡에 든 드럼을 떼어 내면 원곡 드럼만 줄이거나 뺄 수 있습니다.	Separate the drums in the song to lower or remove only the song drums.
+원곡 드럼을 분리했습니다. '원곡 드럼'을 줄이면 원곡의 드럼 소리가 작아지고, 0이면 빠집니다.	Song drums separated. Lower 'Song drums' to make the song's drums quieter; at 0 they are gone.

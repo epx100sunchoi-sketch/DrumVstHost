@@ -188,6 +188,11 @@ void MidiInbox::setNoteMap (const std::array<juce::uint8, 128>& map, bool enable
 
 void MidiInbox::handleIncomingMidiMessage (juce::MidiInput*, const juce::MidiMessage& message)
 {
+    receive (message, juce::Time::getMillisecondCounterHiRes());
+}
+
+void MidiInbox::receive (const juce::MidiMessage& message, double time)
+{
     const int size = message.getRawDataSize();
     bool forward = shouldForward (message.getRawData(), size);
     juce::uint8 mapped = keepNote;
@@ -221,7 +226,7 @@ void MidiInbox::handleIncomingMidiMessage (juce::MidiInput*, const juce::MidiMes
         if (n1 + n2 > 0)
         {
             auto& copy = monitorEvents[(size_t) (n1 > 0 ? s1 : s2)];
-            copy.time = juce::Time::getMillisecondCounterHiRes();
+            copy.time = time;
             copy.size = (juce::uint8) size;
             std::memcpy (copy.data, message.getRawData(), (size_t) size);
             copy.forwarded = forward;
@@ -240,7 +245,7 @@ void MidiInbox::handleIncomingMidiMessage (juce::MidiInput*, const juce::MidiMes
         return;   // 넘치면 버린다(정상적으로는 일어나지 않는다)
 
     auto& event = events[(size_t) (size1 > 0 ? start1 : start2)];
-    event.time = juce::Time::getMillisecondCounterHiRes();
+    event.time = time;
     event.size = (juce::uint8) size;
     std::memcpy (event.data, message.getRawData(), (size_t) size);
 
@@ -250,11 +255,8 @@ void MidiInbox::handleIncomingMidiMessage (juce::MidiInput*, const juce::MidiMes
     fifo.finishedWrite (1);
 }
 
-double MidiInbox::drainInto (juce::MidiBuffer& destination, int numSamples, double sampleRate, bool immediate, double now) noexcept
+double MidiInbox::drainInto (juce::MidiBuffer& destination, int numSamples, double sampleRate, double delayMs, double now) noexcept
 {
-    const double previous = lastDrainTime;
-    lastDrainTime = now;
-
     const int ready = fifo.getNumReady();
 
     if (ready <= 0)
@@ -262,13 +264,6 @@ double MidiInbox::drainInto (juce::MidiBuffer& destination, int numSamples, doub
 
     const double blockMs = numSamples * 1000.0 / sampleRate;
     const double staleMs = juce::jmax (40.0, 3.0 * blockMs);   // 장치를 다시 여는 동안 쌓인 신호는 한꺼번에 울리지 않게 버린다
-    const double interval = now - previous;
-
-    // 큰 버퍼: 직전 콜백 시각을 기준으로 간격을 그대로 살린다(정확히 한 블록 늦게 → 박자가 흔들리지 않는다).
-    // 콜백이 늦게 와서 간격이 한 블록보다 길면, 끝에 몰리지 않게 블록 안으로 줄여 넣는다.
-    // 콜백이 한동안 멈췄다가 온 경우처럼 기준이 이상하면 작은 버퍼 방식으로 놓는다.
-    const bool steady = ! immediate && previous > 0.0 && interval < blockMs * 3.0;
-    const double scale = (steady && interval > blockMs) ? blockMs / interval : 1.0;
 
     int start1, size1, start2, size2;
     fifo.prepareToRead (ready, start1, size1, start2, size2);
@@ -279,11 +274,12 @@ double MidiInbox::drainInto (juce::MidiBuffer& destination, int numSamples, doub
         return events[(size_t) (i < size1 ? start1 + i : start2 + (i - size1))];
     };
 
-    // 작은 버퍼: 이번에 들어온 첫 음(note-on)을 블록 맨 앞에 놓는다. 하이햇 페달(CC) 같은 신호가 먼저 왔다고
-    // 음이 그만큼 밀리지 않게, 기준은 첫 음이다(음이 없으면 첫 신호).
-    double reference = previous;
+    // 블록 맨 앞(0번 샘플)에 해당하는 받은 시각. 이 시각보다 늦게 받은 신호는 받은 뒤 정확히 delay 만에 울린다.
+    double reference = now - juce::jlimit (0.0, blockMs, delayMs);
 
-    if (! steady)
+    // 이 시각보다 먼저 받은 신호(delay보다 오래 기다린 신호)가 있으면 이번에 들어온 첫 음(note-on)을 블록 맨 앞에 놓고,
+    // 나머지는 그 음과의 간격을 살려 뒤에 놓는다. 하이햇 페달(CC) 같은 신호가 먼저 왔다고 음이 밀리지 않게
+    // 기준은 첫 음이다(음이 없으면 첫 신호). delay가 0이면 늘 이 경우다.
     {
         double firstAny = -1.0, firstNote = -1.0;
 
@@ -301,7 +297,10 @@ double MidiInbox::drainInto (juce::MidiBuffer& destination, int numSamples, doub
                 firstNote = event.time;
         }
 
-        reference = firstNote >= 0.0 ? firstNote : firstAny;
+        const double first = firstNote >= 0.0 ? firstNote : firstAny;
+
+        if (first >= 0.0 && first < reference)
+            reference = first;
     }
 
     const int lastIndex = juce::jmax (0, numSamples - 1);
@@ -316,7 +315,7 @@ double MidiInbox::drainInto (juce::MidiBuffer& destination, int numSamples, doub
             continue;
 
         waited = juce::jmax (waited, now - event.time);
-        const int pos = juce::jlimit (lastPos, lastIndex, juce::roundToInt ((event.time - reference) * scale * 0.001 * sampleRate));
+        const int pos = juce::jlimit (lastPos, lastIndex, juce::roundToInt ((event.time - reference) * 0.001 * sampleRate));
         lastPos = pos;
         destination.addEvent (event.data, (int) event.size, pos);
     }
@@ -552,43 +551,47 @@ float Engine::getOutputLatencyMs() const
     return -1.0f;
 }
 
-float Engine::getDriverExtraLatencyMs() const
+Engine::LatencyBreakdown Engine::getLatencyBreakdown() const
 {
+    LatencyBreakdown b;
+
     if (auto* device = deviceManager.getCurrentAudioDevice())
     {
-        const double rate = device->getCurrentSampleRate();
+        b.rate = device->getCurrentSampleRate();
+        b.buffer = device->getCurrentBufferSizeSamples();
 
-        if (rate > 0.0)
-            return (float) (juce::jmax (0, device->getOutputLatencyInSamples() - device->getCurrentBufferSizeSamples()) * 1000.0 / rate);
+        if (! b.isValid())
+            return {};
+
+        // 장치가 알려 주는 출력 지연은 지금 채우는 블록까지 포함한다(ASIO 규약). 그보다 작게 알려 주면 버퍼만 센다.
+        b.reportedOutput = device->getOutputLatencyInSamples();
+        b.reportedInput = device->getInputLatencyInSamples();
+        b.driverExtra = juce::jmax (0, b.reportedOutput - b.buffer);
+
+        // 패드 신호는 블록 사이 아무 때나 온다. 고정 시간 D만큼 늦춰 놓되, 이미 D보다 오래 기다린 신호는 블록 맨 앞에 놓는다.
+        // 기다린 시간이 0~버퍼(B) 사이에 고르게 퍼져 있으면 평균 대기는 (B² + D²) / 2B 이다(D = 0이면 B/2, D = B면 B).
+        const double block = b.buffer;
+        b.midiDelay = juce::jmin (block, midiDelayMs (b.buffer, b.rate) * b.rate * 0.001);
+        b.midiWait = (block * block + b.midiDelay * b.midiDelay) / (2.0 * block);
+
+        // 플러그인이 스스로 늦추는 만큼(SSD 5.5는 0)
+        b.plugin = plugin != nullptr ? juce::jmax (0, plugin->getLatencySamples()) : 0;
+        b.pluginName = pluginName;
     }
 
-    return -1.0f;
+    return b;
+}
+
+float Engine::getDriverExtraLatencyMs() const
+{
+    const auto b = getLatencyBreakdown();
+    return b.isValid() ? (float) b.toMs (b.driverExtra) : -1.0f;
 }
 
 float Engine::getEstimatedLatencyMs() const
 {
-    if (auto* device = deviceManager.getCurrentAudioDevice())
-    {
-        const double rate = device->getCurrentSampleRate();
-
-        if (rate > 0.0)
-        {
-            const int buffer = device->getCurrentBufferSizeSamples();
-
-            // 장치가 알려 주는 출력 지연은 지금 채우는 블록까지 포함한다(ASIO 규약).
-            const int output = juce::jmax (buffer, device->getOutputLatencyInSamples());
-
-            // 패드 신호를 블록에 놓기까지 기다리는 시간: 작은 버퍼는 평균 반 블록, 큰 버퍼는 한 블록.
-            const double wait = usesImmediateMidi (buffer, rate) ? buffer * 0.5 : (double) buffer;
-
-            // 플러그인이 스스로 늦추는 만큼(SSD 5.5는 0)
-            const int pluginLatency = plugin != nullptr ? juce::jmax (0, plugin->getLatencySamples()) : 0;
-
-            return (float) ((output + wait + pluginLatency) * 1000.0 / rate);
-        }
-    }
-
-    return -1.0f;
+    const auto b = getLatencyBreakdown();
+    return b.isValid() ? (float) b.toMs (b.totalSamples()) : -1.0f;
 }
 
 Engine::MonitorSnapshot Engine::getMonitor() const noexcept
@@ -1493,6 +1496,10 @@ bool Engine::startRecording (const juce::File& parentFolder, juce::String& error
     auto newDrum = makeWriter (folder.getChildFile (TakeFiles::drum()), true);
     auto newSong = makeWriter (folder.getChildFile (TakeFiles::song()), true);
 
+    // 드럼을 분리한 곡이면 원곡에 들어간 원곡 드럼도 따로 남긴다(다듬기 창의 '원곡 드럼' 조절). 못 만들어도 녹음은 한다.
+    auto newSongDrums = isUsingStems() ? makeWriter (folder.getChildFile (TakeFiles::songDrums()), true)
+                                       : std::unique_ptr<ThreadedWriter>();
+
     if (newMix == nullptr || newDrum == nullptr || newSong == nullptr)
     {
         newMix.reset();
@@ -1515,6 +1522,7 @@ bool Engine::startRecording (const juce::File& parentFolder, juce::String& error
     mixWriter  = std::move (newMix);
     drumWriter = std::move (newDrum);
     songWriter = std::move (newSong);
+    songDrumWriter = std::move (newSongDrums);
     recordFolder = folder;
     recordSampleRate = rate;
     recordedSamples = 0;
@@ -1524,8 +1532,10 @@ bool Engine::startRecording (const juce::File& parentFolder, juce::String& error
         activeMixWriter  = mixWriter.get();
         activeDrumWriter = drumWriter.get();
         activeSongWriter = songWriter.get();
+        activeSongDrumWriter = songDrumWriter.get();
     }
 
+    recordingSongDrums = songDrumWriter != nullptr;
     recording = true;
     return true;
 }
@@ -1537,13 +1547,16 @@ void Engine::stopRecording()
         activeMixWriter  = nullptr;
         activeDrumWriter = nullptr;
         activeSongWriter = nullptr;
+        activeSongDrumWriter = nullptr;
     }
 
     const bool wasRecording = recording.exchange (false);
+    recordingSongDrums = false;
 
     mixWriter.reset();     // 남은 데이터를 다 쓰고 파일을 닫는다
     drumWriter.reset();
     songWriter.reset();
+    songDrumWriter.reset();
 
     if (wasRecording && recordFolder != juce::File())
     {
@@ -1682,12 +1695,13 @@ void Engine::prepare (double newSampleRate, int newBlockSize)
     drumBuffer.setSize (2, maxBlock, false, true, false);
     songBuffer.setSize (4, maxBlock, false, true, false);   // 0·1 원곡(또는 드럼을 뺀 원곡), 2·3 원곡 드럼(분리했을 때만)
     mixBuffer.setSize (2, maxBlock, false, true, false);
-    stemBuffer.setSize (4, maxBlock, false, true, false);
+    stemBuffer.setSize (6, maxBlock, false, true, false);   // 0·1 드럼, 2·3 원곡, 4·5 원곡에 들어간 원곡 드럼(녹음용)
     clickBuffer.setSize (1, maxBlock, false, true, false);
     makeClickSounds();
 
     drumStrip.prepare (sampleRate);
     songStrip.prepare (sampleRate);
+    songDrumEq.prepare (sampleRate);
     masterGain.reset (sampleRate, 0.03);
     songDrumGain.reset (sampleRate, 0.03);
     songDrumGain.setCurrentAndTargetValue (songDrumsOn.load() ? 1.0f : 0.0f);
@@ -1720,7 +1734,27 @@ void Engine::audioDeviceAboutToStart (juce::AudioIODevice* device)
     monitor.headroomMs = rate > 0.0 ? juce::jmax (0.0, (device->getOutputLatencyInSamples() - buffer) * 1000.0 / rate - 1.0) : 0.0;
     monHeadroomMs = (float) monitor.headroomMs;
     monBlockMs = rate > 0.0 ? (float) (buffer * 1000.0 / rate) : 0.0f;
+
+    // 드라이버가 방금 장치를 열면서 읽은 설정과 같은 값이다(화면이 나중에 읽으면 그 사이 바뀐 것을 놓친다).
+    {
+        const auto settings = readYamahaDriverSettings();
+        const juce::ScopedLock lock (driverSettingsLock);
+        driverSettingsAtStart = settings;
+    }
+
     monStreamStarts.fetch_add (1);
+}
+
+juce::String Engine::readYamahaDriverSettings()
+{
+    const juce::String key ("HKEY_CURRENT_USER\\Software\\Yamaha\\Yamaha Steinberg USB Driver\\");
+    return juce::WindowsRegistry::getValue (key + "LatencyMode") + "/" + juce::WindowsRegistry::getValue (key + "PeriodFrames");
+}
+
+juce::String Engine::getDriverSettingsAtStart() const
+{
+    const juce::ScopedLock lock (driverSettingsLock);
+    return driverSettingsAtStart;
 }
 
 void Engine::audioDeviceStopped()
@@ -1873,7 +1907,7 @@ void Engine::audioDeviceIOCallbackWithContext (const float* const*, int,
 
     incomingMidi.clear();
 
-    const double waited = midiInbox.drainInto (incomingMidi, numSamples, sampleRate, usesImmediateMidi (maxBlock, sampleRate), callbackStart);
+    const double waited = midiInbox.drainInto (incomingMidi, numSamples, sampleRate, midiDelayMs (maxBlock, sampleRate), callbackStart);
 
     // 최댓값 갱신(읽는 쪽이 0으로 비우는 것과 겹쳐도 값이 사라지지 않게 비교-교환)
     for (auto current = maxMidiWaitMs.load (std::memory_order_relaxed); waited > (double) current;)
@@ -1999,6 +2033,12 @@ void Engine::processChunk (int offset, int numSamples, float* const* out, int nu
     float* songR = songBuffer.getWritePointer (1);
 
     // 원곡 드럼 켜고 끄기: 30ms에 걸쳐 바꾼다. 켜 두면 원곡과 똑같다(드럼 = 원곡 − 나머지).
+    // 녹음 중이면 원곡에 실제로 들어간 원곡 드럼(배율을 곱한 것)을 4·5번에 따로 남긴다. 다듬기 창이 이만큼을 빼서
+    // 원곡 드럼만 줄이거나 없앤다(원곡.wav − 이것 = 드럼을 뺀 원곡).
+    const bool keepSongDrums = recordingSongDrums.load (std::memory_order_relaxed);
+    float* appliedL = stemBuffer.getWritePointer (4);
+    float* appliedR = stemBuffer.getWritePointer (5);
+
     {
         songDrumGain.setTargetValue (songDrumsOn.load (std::memory_order_relaxed) ? 1.0f : 0.0f);
         const float* songDrumsL = songBuffer.getReadPointer (2);
@@ -2011,17 +2051,42 @@ void Engine::processChunk (int offset, int numSamples, float* const* out, int nu
                 const float g = songDrumGain.getNextValue();
                 songL[i] += g * songDrumsL[i];
                 songR[i] += g * songDrumsR[i];
+
+                if (keepSongDrums)
+                {
+                    appliedL[i] = g * songDrumsL[i];
+                    appliedR[i] = g * songDrumsR[i];
+                }
             }
         }
         else if (const float g = songDrumGain.getCurrentValue(); g > 0.0f)
         {
             juce::FloatVectorOperations::addWithMultiply (songL, songDrumsL, g, numSamples);
             juce::FloatVectorOperations::addWithMultiply (songR, songDrumsR, g, numSamples);
+
+            if (keepSongDrums)
+            {
+                juce::FloatVectorOperations::copyWithMultiply (appliedL, songDrumsL, g, numSamples);
+                juce::FloatVectorOperations::copyWithMultiply (appliedR, songDrumsR, g, numSamples);
+            }
+        }
+        else if (keepSongDrums)
+        {
+            juce::FloatVectorOperations::clear (appliedL, numSamples);
+            juce::FloatVectorOperations::clear (appliedR, numSamples);
         }
     }
 
     drumStrip.processTone (drumL, drumR, numSamples, drum);
     songStrip.processTone (songL, songR, numSamples, song);
+
+    // 원곡 EQ는 선형이라 원곡 드럼에도 똑같이 걸면 빼기가 정확하다(원곡 컴프레서를 쓴 경우만 조금 어긋난다).
+    // 값은 늘 따라가게 해서 녹음을 시작한 첫 블록부터 원곡과 같은 EQ가 걸리게 한다.
+    songDrumEq.setGains (song.low.load (std::memory_order_relaxed), song.mid.load (std::memory_order_relaxed),
+                         song.high.load (std::memory_order_relaxed));
+
+    if (keepSongDrums)
+        songDrumEq.process (appliedL, appliedR, numSamples);
 
     // 녹음 중이면 볼륨을 적용하기 전의 드럼·원곡을 따로 남긴다(다듬기 창에서 다시 섞는다).
     const bool rec = recording.load (std::memory_order_relaxed);
@@ -2092,6 +2157,12 @@ void Engine::processChunk (int offset, int numSamples, float* const* out, int nu
             {
                 const float* songs[] = { stemBuffer.getReadPointer (2), stemBuffer.getReadPointer (3) };
                 activeSongWriter->write (songs, numSamples);
+            }
+
+            if (activeSongDrumWriter != nullptr)
+            {
+                const float* songDrums[] = { stemBuffer.getReadPointer (4), stemBuffer.getReadPointer (5) };
+                activeSongDrumWriter->write (songDrums, numSamples);
             }
 
             recordedSamples.fetch_add (numSamples, std::memory_order_relaxed);

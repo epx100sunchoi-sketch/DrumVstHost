@@ -87,6 +87,11 @@ bool writeAnalysisCopy (const juce::File& song, const juce::File& destination, j
     if (destination.getSize() > 1000)
         return true;
 
+    return writeResampledCopy (song, destination, 44100.0, error);
+}
+
+bool writeResampledCopy (const juce::File& song, const juce::File& destination, double targetRate, juce::String& error)
+{
     juce::AudioFormatManager formats;
     formats.registerBasicFormats();
     std::unique_ptr<juce::AudioFormatReader> reader (formats.createReaderFor (song));
@@ -97,7 +102,6 @@ bool writeAnalysisCopy (const juce::File& song, const juce::File& destination, j
         return false;
     }
 
-    constexpr double targetRate = 44100.0;
     const double ratio = reader->sampleRate / targetRate;   // 출력 한 샘플마다 쓰는 입력 샘플 수
 
     destination.getParentDirectory().createDirectory();

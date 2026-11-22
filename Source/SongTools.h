@@ -29,6 +29,9 @@ juce::File toolsFolder();
 // 원곡을 해독해 44.1kHz 32비트 WAV로 쓴다(이미 있으면 그대로 둔다).
 bool writeAnalysisCopy (const juce::File& song, const juce::File& destination, juce::String& error);
 
+// 소리 파일을 targetRate로 바꿔 32비트 실수 WAV로 쓴다(시각은 그대로). 같은 속도면 그대로 옮겨 쓴다.
+bool writeResampledCopy (const juce::File& source, const juce::File& destination, double targetRate, juce::String& error);
+
 // destination = original − rest. 드럼을 켰을 때 rest + destination이 원곡과 정확히 같다.
 bool makeExactDrumStem (const juce::File& original, const juce::File& rest, const juce::File& destination, juce::String& error);
 

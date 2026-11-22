@@ -882,8 +882,7 @@ MainComponent::MainComponent (Engine& engineToUse, juce::PropertiesFile& setting
 
     styleLabel (latencyLabel, 16.0f, ui::text);
     latencyLabel.setInterceptsMouseClicks (true, false);
-    latencyLabel.setTooltip (K ("패드 신호가 PC에 도착한 뒤 헤드폰에서 소리가 나기까지 걸리는 시간입니다(버퍼 + 장치 출력 + 신호 대기). "
-                                "드럼 모듈과 USB 전송 시간(대략 1~2ms)은 빠져 있습니다. 10ms 아래면 대부분 느끼지 못합니다."));
+    latencyLabel.setTooltip (describeLatency());   // 장치가 열리면 내역으로 바뀐다(slowRefresh)
     addAndMakeVisible (latencyLabel);
 
     bufferBox.setMouseClickGrabsKeyboardFocus (false);
@@ -1688,8 +1687,11 @@ void MainComponent::slowRefresh()
             latencyLabel.setColour (juce::Label::textColourId, ui::textDim);
         }
 
+        latencyLabel.setTooltip (describeLatency());
         repaint();
     }
+
+    writeLatencyReport();
 }
 
 //==============================================================================
@@ -1802,38 +1804,41 @@ void MainComponent::checkYamahaDriverSettings()
     // JUCE는 이 알림(kAsioLatenciesChanged)을 무시해서 장치를 다시 열 때까지 예전 지연을 알려 준다(2026-11-22 확인:
     // Mode를 바꿔도 화면이 약 11ms 그대로). 그래서 드라이버가 설정을 적어 두는 곳을 보고, 바뀌면 장치를 한 번 다시 연다.
     // 앱의 '버퍼 바꾸기'로 열었든 시작 메뉴에서 열었든 같다. 녹음 중에는 끝난 뒤에 한다.
+    // 기준은 장치가 시작될 때 엔진이 읽어 둔 값이다(드라이버가 그때 읽은 값과 같다). 화면이 나중에 기준을 잡으면
+    // 장치를 연 직후 바뀐 설정을 놓친다(0.2.1).
     if (engine.getAudioDeviceType() != "ASIO" || driverBrand (engine.getAudioDeviceName()) != DrumModule::Brand::yamaha)
     {
-        yamahaDriverSettings.clear();
+        yamahaPendingSettings.clear();
         yamahaChangedAt = 0;
         return;
     }
 
-    const juce::String key = "HKEY_CURRENT_USER\\Software\\Yamaha\\Yamaha Steinberg USB Driver\\";
-    const auto current = juce::WindowsRegistry::getValue (key + "LatencyMode") + "/" + juce::WindowsRegistry::getValue (key + "PeriodFrames");
+    const auto atStart = engine.getDriverSettingsAtStart();
+    const auto current = Engine::readYamahaDriverSettings();
 
-    if (yamahaDriverSettings.isEmpty())
+    // 같은 값으로 이미 한 번 다시 열었는데도 다르면(장치를 못 열었거나 드라이버가 다른 값을 쓴 경우) 되풀이하지 않는다.
+    if (atStart.isEmpty() || current == atStart || current == yamahaReopenedFor)
     {
-        yamahaDriverSettings = current;   // 장치를 연 때의 값
-        return;
-    }
-
-    if (current == yamahaDriverSettings)
-    {
+        yamahaPendingSettings.clear();
         yamahaChangedAt = 0;
         return;
     }
 
-    // 드라이버 창에서 여러 번 바꿀 수 있으므로 1.5초 동안 그대로면 다시 연다.
+    // 드라이버 창에서 여러 번 바꿀 수 있으므로 같은 값이 1.5초 동안 그대로면 다시 연다.
     const auto now = juce::Time::getMillisecondCounter();
 
-    if (yamahaChangedAt == 0)
+    if (current != yamahaPendingSettings)
+    {
+        yamahaPendingSettings = current;
         yamahaChangedAt = now;
+        return;
+    }
 
     if (now - yamahaChangedAt < 1500 || engine.isRecording())
         return;
 
-    yamahaDriverSettings = current;
+    yamahaReopenedFor = current;
+    yamahaPendingSettings.clear();
     yamahaChangedAt = 0;
     xrunGraceUntil = now + 5000;
     xrunWarningUntil = 0;
@@ -1882,14 +1887,20 @@ juce::String MainComponent::getLatencyHint (juce::Colour& colour) const
         return K ("소리가 끊겼습니다. 버퍼를 한 칸 크게 해 주세요.");
     }
 
-    // Yamaha Steinberg USB 드라이버는 Mode에 따라 버퍼 말고도 여유 버퍼를 더 둔다. 버퍼 크기와 상관없이 일정하다.
-    // 2026-11-22 DTX-PRO 실측(44.1kHz): Low Latency 2.2ms, Standard 6.2ms, Stable 8.2ms.
+    // Yamaha Steinberg USB 드라이버는 Mode에 따라 버퍼 말고도 여유 버퍼를 더 둔다.
+    // 2026-11-22 DTX-PRO 실측(44.1kHz, 버퍼 32~128): Low Latency 늘 2.2ms, Standard 5.2~6.2ms, Stable 6.2~8.2ms.
     // 버퍼 128에서 Standard 약 10.6ms → Low Latency 약 6.6ms(끊김 없음). Low Latency가 아니면 바꾸는 방법을 알려 준다.
     if (engine.getAudioDeviceType() == "ASIO" && driverBrand (engine.getAudioDeviceName()) == DrumModule::Brand::yamaha)
     {
         if (const float extra = engine.getDriverExtraLatencyMs(); extra > 3.5f)
         {
             colour = ui::accent;
+
+            // 장치를 열 때 드라이버가 읽은 설정이 이미 Low Latency인데도 여유가 크면, 바꾸라고 하면 헷갈린다
+            // (사용자: "로우 레이턴시 확인했는데"). 적용되지 않았다고 알리고, 방법은 지연 풍선 도움말에 적는다.
+            if (engine.getDriverSettingsAtStart().upToFirstOccurrenceOf ("/", false, false) == "0")
+                return K ("드라이버는 Low Latency인데 아직 적용되지 않았습니다(지연 숫자에 마우스를 올려 보세요)");
+
             return K ("'버퍼 바꾸기'에서 Mode를 Low Latency로 바꾸면 약 ") + juce::String (juce::roundToInt (extra - 2.2f))
                    + K ("ms 빨라집니다");
         }
@@ -1906,6 +1917,116 @@ juce::String MainComponent::getLatencyHint (juce::Colour& colour) const
     }
 
     return K ("버퍼가 작을수록 빠르고, 너무 작으면 소리가 끊깁니다.");
+}
+
+juce::String MainComponent::describeLatency() const
+{
+    juce::String text = K ("패드 신호가 PC에 도착한 뒤 헤드폰에서 소리가 나기까지 걸리는 시간입니다.");
+    const auto b = engine.getLatencyBreakdown();
+
+    if (b.isValid())
+    {
+        const auto ms = [&b] (double samples) { return juce::String (b.toMs (samples), 1) + "ms"; };
+
+        text << "\n" << K ("· 버퍼 ") << b.buffer << K (" 샘플: ") << ms (b.buffer)
+             << "\n" << K ("· 드라이버가 더 두는 여유: ") << ms (b.driverExtra)
+             << "\n" << K ("· 패드 신호 대기(평균): ") << ms (b.midiWait)
+             << "\n" << K ("· 드럼 VST 자체 지연: ") << ms (b.plugin)
+             << "\n" << K ("합계 약 ") << juce::String (b.toMs (b.totalSamples()), 1) << "ms";
+    }
+
+    text << "\n" << K ("드럼 모듈과 USB 전송 시간(대략 1~2ms)은 빠져 있습니다. 10ms 아래면 대부분 느끼지 못합니다.");
+
+    // Yamaha 드라이버 설정은 Low Latency인데 드라이버가 알려 주는 여유가 Standard 이상인 경우의 해결 순서
+    if (b.isValid() && b.toMs (b.driverExtra) > 3.5
+        && engine.getAudioDeviceType() == "ASIO" && driverBrand (engine.getAudioDeviceName()) == DrumModule::Brand::yamaha
+        && engine.getDriverSettingsAtStart().upToFirstOccurrenceOf ("/", false, false) == "0")
+    {
+        text << "\n\n" << K ("드라이버 설정은 Low Latency인데 드라이버가 알려 주는 여유는 Standard 이상입니다. 이렇게 해 보세요:")
+             << "\n" << K ("1. 브라우저·유튜브처럼 드럼 모듈로 소리를 내는 다른 프로그램을 모두 끄고 이 앱을 다시 켭니다.")
+             << "\n" << K ("2. 그래도 같으면 이 앱을 끄고 드럼 모듈 전원을 껐다가 6초 뒤에 켠 다음 앱을 켭니다.")
+             << "\n" << K ("앱 폴더의 '지연 진단.txt'에 앱이 읽은 드라이버 설정이 적혀 있습니다.");
+    }
+
+    return text;
+}
+
+void MainComponent::writeLatencyReport()
+{
+    // 확인용 실행(--no-save, 스냅숏 등)은 사용자가 만든 진단 파일을 덮어쓰지 않는다.
+    if (! autosave)
+        return;
+
+    const auto b = engine.getLatencyBreakdown();
+    const juce::String yamahaKey ("Software\\Yamaha\\Yamaha Steinberg USB Driver");
+    const auto yamaha = describeRegistryKey (false, yamahaKey, 1);
+
+    juce::String signature;
+    signature << engine.getAudioDeviceType() << '|' << engine.getAudioDeviceName() << '|' << b.rate << '|' << b.buffer << '|'
+              << b.reportedOutput << '|' << b.reportedInput << '|' << b.plugin << '|' << b.pluginName << '|'
+              << midiNames.joinIntoString (",") << '|' << yamaha.joinIntoString (",");
+
+    if (signature == latencyReportSignature)
+        return;
+
+    latencyReportSignature = signature;
+
+    const auto ms = [&b] (double samples) { return juce::String (b.toMs (samples), 2) + " ms"; };
+    const auto row = [&] (const char* name, double samples, const juce::String& note)
+    {
+        return "  " + juce::String (name).paddedRight (' ', 20) + juce::String (samples, 1).paddedLeft (' ', 7) + " samples  "
+               + ms (samples).paddedLeft (' ', 9) + (note.isNotEmpty() ? "  " + note : juce::String());
+    };
+
+    juce::StringArray sizes;
+
+    for (auto s : engine.getAvailableBufferSizes())
+        sizes.add (juce::String (s));
+
+    juce::StringArray lines;
+    lines.add (juce::String ("DrumVstHost ") + JUCE_APPLICATION_VERSION_STRING + " latency report, "
+               + juce::Time::getCurrentTime().formatted ("%Y-%m-%d %H:%M:%S"));
+    lines.add ("Audio device: " + engine.getAudioDeviceType() + " / " + engine.getAudioDeviceName()
+               + (b.isValid() ? ", " + juce::String (b.rate, 0) + " Hz, buffer " + juce::String (b.buffer) + " samples" : juce::String (" (not open)")));
+    lines.add ("  buffer sizes the driver offers here: " + (sizes.isEmpty() ? juce::String ("-") : sizes.joinIntoString (" ")));
+
+    if (b.isValid())
+    {
+        lines.add ("  latency reported by the driver: output " + juce::String (b.reportedOutput) + " samples (" + ms (b.reportedOutput)
+                   + "), input " + juce::String (b.reportedInput) + " samples (" + ms (b.reportedInput) + ")");
+        lines.add ("Estimated pad-to-ear latency: " + ms (b.totalSamples()) + " (the window shows " + latencyLabel.getText() + ")");
+        lines.add (row ("buffer", b.buffer, {}));
+        lines.add (row ("driver extra", b.driverExtra, "output latency beyond the buffer"));
+        lines.add (row ("MIDI wait (average)", b.midiWait, "fixed delay " + ms (b.midiDelay) + ", the rest depends on when the hit arrives"));
+        lines.add (row ("plugin", b.plugin, b.pluginName.isNotEmpty() ? b.pluginName : juce::String ("no plugin")));
+        lines.add ("  not included: drum module processing and USB transfer (about 1-2 ms)");
+    }
+
+    lines.add ("MIDI inputs: " + (midiNames.isEmpty() ? juce::String ("-") : midiNames.joinIntoString (", ")));
+    lines.add ("Drum module: " + (connectedModule.isKnown() ? connectedModule.displayName() : juce::String ("not recognised")));
+
+    if (! yamaha.isEmpty())
+    {
+        lines.add ("Yamaha Steinberg USB Driver settings this app reads (HKCU\\" + yamahaKey + "):");
+
+        for (auto line : yamaha)
+        {
+            if (line.startsWith ("LatencyMode = "))
+            {
+                const auto mode = line.fromFirstOccurrenceOf ("= ", false, false).trim();
+                line << "  (" << (mode == "0" ? "Low Latency" : mode == "1" ? "Standard" : mode == "2" ? "Stable" : "?") << ")";
+            }
+
+            lines.add ("  " + line);
+        }
+
+        for (const auto& line : describeRegistryKey (true, yamahaKey, 1))
+            lines.add ("  HKLM: " + line);
+    }
+
+    const auto file = juce::File::getSpecialLocation (juce::File::currentExecutableFile).getParentDirectory()
+                          .getChildFile (lang::pick ("지연 진단.txt", "Latency report.txt"));
+    file.replaceWithText (lines.joinIntoString ("\r\n") + "\r\n");   // 폴더에 쓸 수 없으면 그냥 넘어간다
 }
 
 void MainComponent::showMidiMonitor()
@@ -2582,6 +2703,15 @@ void MainComponent::openTakeEditor (const juce::File& takeFolder)
 
         auto* editor = new TakeEditor (safe->engine, take);
         safe->takeEditor = editor;
+        editor->onSeparateSongDrums = [safe]
+        {
+            if (safe != nullptr)
+                safe->startTakeSeparation();
+        };
+
+        if (safe->takeSeparationBusy && safe->takeSeparationFolder == takeFolder)   // 창을 닫았다 다시 열었다
+            editor->showSeparationState (safe->takeSeparationText, false, true);
+
         safe->takeWindow = std::make_unique<ToolWindow> (K ("녹음 다듬기 · ") + takeFolder.getFileName(), editor, false);
         safe->takeWindow->onClose = [safe]
         {
@@ -2609,15 +2739,196 @@ void MainComponent::openTakeEditor (const juce::File& takeFolder)
 
 void MainComponent::closeTakeEditor()
 {
+    // 닫을 때는 저장하지 않는다. 다듬은 값(볼륨·타이밍·구간)은 '완성본 저장'을 눌렀을 때만 정보.xml에 남는다.
     if (takeEditor != nullptr)
-    {
         takeEditor->stopPreview();
-        takeEditor->saveEditState();
-    }
 
     engine.setPreview (nullptr);
     takeWindow.reset();
     takeEditor = nullptr;
+}
+
+//==============================================================================
+// 다듬기 창의 '원곡 드럼 분리'. 메인 창의 '원곡 드럼 빼기'와 같은 도구(separate.py)를 녹음의 원곡.wav에 쓴다.
+//   원곡 드럼.wav = 원곡.wav − (드럼을 뺀 원곡). 다듬기 창은 원곡 드럼을 남길 만큼만 남기고 나머지를 뺀다.
+//   separate.py는 44.1kHz만 받는다. 녹음이 48kHz 등이면 44.1kHz로 바꿔 나누고, 결과를 녹음 속도로 되돌려 뺀다
+//   (뺄셈으로 만들므로 '원곡 드럼을 0으로' 하면 되돌린 결과와 정확히 같아진다).
+//   작업 파일은 임시 폴더에 두고 끝나면 지운다. 다듬기 창을 닫아도 계속하며, 결과는 녹음 폴더에 남는다.
+namespace
+{
+juce::File takeSeparationWork()
+{
+    return juce::File::getSpecialLocation (juce::File::tempDirectory).getChildFile ("DrumVstHost take separation");
+}
+
+juce::File songDrumsDestination (const juce::File& takeFolder)
+{
+    return TakeFiles::songDrumsIn (takeFolder);   // 녹음할 때 만드는 이름과 같다(화면 언어)
+}
+} // namespace
+
+void MainComponent::showTakeSeparationState (const juce::File& folder, const juce::String& text, bool isError, bool busy)
+{
+    takeSeparationText = busy ? text : juce::String();
+
+    if (takeEditor != nullptr && takeEditor->getTakeFolder() == folder)
+        takeEditor->showSeparationState (text, isError, busy);
+}
+
+void MainComponent::startTakeSeparation()
+{
+    if (takeEditor == nullptr)
+        return;
+
+    const auto folder = takeEditor->getTakeFolder();
+
+    if (takeSeparationBusy)
+    {
+        if (folder != takeSeparationFolder)
+            takeEditor->showSeparationState (K ("다른 녹음의 원곡 드럼을 분리하는 중입니다. 끝난 뒤에 다시 눌러 주세요."), true, false,
+                                             takeSeparationFolder.getFileName());
+
+        return;
+    }
+
+    if (! toolsFolder().getChildFile ("separate.py").existsAsFile())
+    {
+        takeEditor->showSeparationState (K ("분석 스크립트가 없습니다"), true, false,
+                                         K ("앱 폴더의 tools\\separate.py가 필요합니다. 내려받은 압축 파일을 다시 풀어 주세요."));
+        return;
+    }
+
+    if (isInstallingTools() || ! analysisToolsReady (true))
+    {
+        takeEditor->showSeparationState (K ("드럼 분리 도구가 없습니다. 메인 창의 '원곡 드럼 빼기'를 눌러 먼저 설치해 주세요."), true, false);
+        return;
+    }
+
+    const auto song = TakeFiles::songIn (folder);
+    takeSeparationBusy = true;
+    takeSeparationFolder = folder;
+    showTakeSeparationState (folder, K ("분리 준비 중…"), false, true);
+
+    // 원곡 파일을 읽고(필요하면 44.1kHz로 바꾸고) 나서 분리 도구를 돌린다. 큰 파일이라 뒤에서 한다.
+    juce::Component::SafePointer<MainComponent> safe (this);
+
+    juce::Thread::launch ([safe, folder, song]
+    {
+        juce::String error;
+        double rate = 0.0;
+
+        {
+            juce::AudioFormatManager formats;
+            formats.registerBasicFormats();
+            std::unique_ptr<juce::AudioFormatReader> reader (formats.createReaderFor (song));
+
+            if (reader != nullptr && reader->lengthInSamples > 0)
+                rate = reader->sampleRate;
+        }
+
+        const auto work = takeSeparationWork();
+        work.deleteRecursively();
+        auto input = song;
+        bool ok = false;
+
+        if (rate <= 0.0)
+            error = K ("녹음의 원곡 파일을 읽을 수 없습니다.");
+        else if (! work.createDirectory())
+            error = K ("작업 폴더를 만들 수 없습니다: ") + work.getFullPathName();
+        else if (std::abs (rate - 44100.0) > 0.5)
+            ok = writeResampledCopy (song, input = work.getChildFile ("input.wav"), 44100.0, error);
+        else
+            ok = true;
+
+        juce::MessageManager::callAsync ([safe, folder, input, rate, ok, error]
+        {
+            if (safe == nullptr)
+                return;
+
+            if (ok)
+                safe->runTakeSeparation (folder, input, rate);
+            else
+                safe->finishTakeSeparation (folder, false, K ("드럼을 분리하지 못했습니다"), error);
+        });
+    });
+}
+
+void MainComponent::runTakeSeparation (const juce::File& folder, const juce::File& input, double takeRate)
+{
+    const auto work = takeSeparationWork();
+    auto job = std::make_unique<ProcessJob>();
+    juce::Component::SafePointer<MainComponent> safe (this);
+
+    job->onProgress = [safe, folder] (float progress)
+    {
+        if (safe != nullptr && safe->takeSeparationBusy)
+            safe->showTakeSeparationState (folder, K ("드럼 분리 중… ") + juce::String (juce::roundToInt (progress * 100.0f)) + "%", false, true);
+    };
+
+    job->onFinished = [safe, folder, work, takeRate] (bool done, const juce::String& output)
+    {
+        if (safe == nullptr)
+            return;
+
+        const auto separated = work.getChildFile (separationModel).getChildFile ("no_drums.wav");
+
+        if (! done || separated.getSize() < 1000)
+        {
+            safe->finishTakeSeparation (folder, false, explainToolError (output, "드럼을 분리하지 못했습니다"), lastLineOf (output));
+            return;
+        }
+
+        safe->showTakeSeparationState (folder, K ("마무리하는 중…"), false, true);
+
+        // 원곡 드럼 = 원곡 − (드럼을 뺀 원곡). 큰 파일이라 뒤에서 만든다.
+        juce::Thread::launch ([safe, folder, work, separated, takeRate]
+        {
+            juce::String error;
+            auto rest = separated;
+            bool ok = true;
+
+            if (std::abs (takeRate - 44100.0) > 0.5)
+                ok = writeResampledCopy (separated, rest = work.getChildFile ("no_drums_take.wav"), takeRate, error);
+
+            if (ok)
+                ok = makeExactDrumStem (TakeFiles::songIn (folder), rest, songDrumsDestination (folder), error);
+
+            work.deleteRecursively();
+
+            juce::MessageManager::callAsync ([safe, folder, ok, error]
+            {
+                if (safe != nullptr)
+                    safe->finishTakeSeparation (folder, ok, ok ? juce::String() : K ("드럼을 분리하지 못했습니다"), error);
+            });
+        });
+    };
+
+    const juce::StringArray command { getAnalysisPython().getFullPathName(), "-I", "-X", "utf8", "-u",
+                                      toolsFolder().getChildFile ("separate.py").getFullPathName(),
+                                      input.getFullPathName(), work.getFullPathName(), separationModel };
+
+    const bool started = job->start (command);
+    takeSeparationJob = std::move (job);   // 끝난 작업은 다음 분리 때 바뀐다(끝났다는 알림 안에서 없애지 않는다)
+
+    if (! started)
+        finishTakeSeparation (folder, false, K ("드럼을 분리하지 못했습니다"), K ("파이썬을 실행하지 못했습니다."));
+}
+
+void MainComponent::finishTakeSeparation (const juce::File& folder, bool ok, const juce::String& message, const juce::String& details)
+{
+    takeSeparationBusy = false;
+    takeSeparationText = {};
+
+    if (! ok)
+        takeSeparationWork().deleteRecursively();
+
+    if (takeEditor == nullptr || takeEditor->getTakeFolder() != folder)
+        return;   // 창을 닫았으면 다음에 열 때 원곡 드럼 파일을 같이 읽는다
+
+    if (ok)
+        takeEditor->attachSeparatedSongDrums (songDrumsDestination (folder));
+    else
+        takeEditor->showSeparationState (message, true, false, details);
 }
 
 void MainComponent::setSongStatus (const juce::String& text, bool isError, int secondsToShow)
