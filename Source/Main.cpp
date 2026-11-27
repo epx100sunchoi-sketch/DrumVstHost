@@ -930,6 +930,37 @@ private:
             log ("midi re-render: " + juce::String (ok ? "ok" : "FAILED " + e) + ", onsets recorded " + juce::String (a.size())
                  + " rendered " + juce::String (b.size()) + ", worst difference " + juce::String (worst, 2) + " ms" + onsetDebug
                  + (ok && a.size() == b.size() && worst < 1.0 ? " ok" : " MISMATCH"));
+
+            // 박자 맞추기 → '연주 (고친 뒤).mid' 저장 → 킷 재렌더: 맞춘 박이 실제 소리에서도 유지되는지.
+            // (여기 녹음의 박은 멋대로라 120BPM 격자로 옮겨지므로, 맞춘 소리는 원래 녹음과 자리가 달라야 한다)
+            {
+                takemidi::Rebuilt quantized, kit;
+                const auto current = take.getChildFile (TakeFiles::currentMidi());
+                const auto renderedQuantized = take.getChildFile ("rendered quantized.wav");
+                const auto renderedKit = take.getChildFile ("rendered kit.wav");
+                juce::String e2;
+                const bool ok2 = takemidi::quantizeRaw (TakeFiles::rawMidiIn (take), info, 0.5, 1.0, quantized, e2)
+                              && engine->renderDrumsFromMidi (quantized.events, info.lengthSamples, info.sampleRate, renderedQuantized, nullptr, e2)
+                              && takemidi::writeRawFormat (quantized.events, info, TakeFiles::rawMidiIn (take), current, e2)
+                              && takemidi::quantizeRaw (current, info, 0.5, 0.0, kit, e2)
+                              && engine->renderDrumsFromMidi (kit.events, info.lengthSamples, info.sampleRate, renderedKit, nullptr, e2);
+
+                const auto afterQuantize = onsets (renderedQuantized);
+                const auto afterKit = onsets (renderedKit);
+                double kitDifference = 0.0, movedByQuantize = 0.0;
+
+                for (int i = 0; i < juce::jmin (afterQuantize.size(), afterKit.size()); ++i)
+                    kitDifference = juce::jmax (kitDifference, std::abs (afterQuantize[i] - afterKit[i]));
+
+                for (int i = 0; i < juce::jmin (a.size(), afterQuantize.size()); ++i)
+                    movedByQuantize = juce::jmax (movedByQuantize, std::abs (a[i] - afterQuantize[i]));
+
+                log ("midi kit chain: " + juce::String (ok2 ? "ok" : "FAILED " + e2) + ", onsets quantized " + juce::String (afterQuantize.size())
+                     + " kit-rebuilt " + juce::String (afterKit.size()) + ", quantized vs kit worst " + juce::String (kitDifference, 2)
+                     + " ms, moved by quantize " + juce::String (movedByQuantize, 1) + " ms"
+                     + (ok2 && afterKit.size() == afterQuantize.size() && kitDifference < 1.0 && movedByQuantize > 5.0
+                            ? " ok" : " MISMATCH"));
+            }
         }
 
         if (! juce::SystemStats::getEnvironmentVariable ("DVH_KEEP_TEST_FILES", {}).isNotEmpty())
