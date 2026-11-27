@@ -161,8 +161,49 @@ def analyze(y, sr=SR, prior_bpm=120.0, prior_sigma_oct=0.7, bpm_range=(60, 200),
     P0 = 60.0 / b0 * FPS
     s1, P1, ph1 = search(P0 * (1 + np.arange(-0.03, 0.03 + 1e-9, 0.0005)), lambda P: np.arange(0, P, 1.0))
     s2, P2, ph2 = search(P1 * (1 + np.arange(-0.0006, 0.0006 + 1e-12, 0.00002)), lambda P: ph1 + np.arange(-5, 5.001, 0.25))
-    P_s, T_s = P2 / FPS, (ph2 % P2) / FPS
     tim['fine_fit'] = time.time() - t2
+
+    # --- 3:2 tempo-family check. A grid at 2/3 (or 3/2) of the true tempo spaces its beats three (two) true
+    # 8ths apart, so every grid beat still lands on a real onset and the fit score alone cannot tell them apart
+    # (RESCENE "Pinball", true 170 BPM, locked onto 113.33 = 2/3 x 170 because the coarse prior favours 120).
+    # What does tell them apart: the half-beat positions. On the true grid the half-beats are the song's 8ths
+    # (onsets in any straight-8ths song); on the 2/3-locked grid they fall 1.5 true 8ths apart, between onsets.
+    # So refit at x1.5 and x2/3 and compare (beat + half-beat) novelty; switch only when the candidate is
+    # clearly better and its beats hit onsets about as well. Octave errors (x2, x1/2) are left alone: they stay
+    # on the beat, and the app's metronome has double / half speed for them.
+    t2b = time.time()
+
+    def grid_stats(P, ph):
+        kk = np.arange(max(0, int(np.ceil((f_first - ph) / P))), int(np.floor((f_last - ph) / P)) + 1)
+        if len(kk) < 8:
+            return 0.0, 0.0
+
+        def mean_at(positions):
+            pos = np.clip(positions, 0, n - 1.001)
+            i = pos.astype(int)
+            f = pos - i
+            return float((pooled[i] * (1 - f) + pooled[i + 1] * f).mean())
+
+        return mean_at(ph + kk * P), mean_at(ph + (kk + 0.5) * P)
+
+    fit_cur, half_cur = grid_stats(P2, ph2)
+    family = dict(switched=False, factor=1.0, fit=fit_cur, half=half_cur)
+    for factor in (1.5, 2.0 / 3.0):
+        bpm_f = 60.0 * FPS / P2 * factor
+        if not (lo - 1e-9 <= bpm_f <= hi + 1e-9):
+            continue
+        Pc = P2 / factor
+        s1c, P1c, ph1c = search(Pc * (1 + np.arange(-0.01, 0.01 + 1e-9, 0.0005)), lambda P: np.arange(0, P, 1.0))
+        s2c, P2c, ph2c = search(P1c * (1 + np.arange(-0.0006, 0.0006 + 1e-12, 0.00002)), lambda P: ph1c + np.arange(-5, 5.001, 0.25))
+        fit_c, half_c = grid_stats(P2c, ph2c)
+        family.setdefault('tried', []).append(dict(factor=factor, fit=fit_c, half=half_c))
+        if fit_c + half_c > 1.15 * (fit_cur + half_cur) and fit_c > 0.85 * fit_cur:
+            P2, ph2 = P2c, ph2c
+            fit_cur, half_cur = fit_c, half_c
+            family.update(switched=True, factor=factor, fit=fit_c, half=half_c)
+    tim['family'] = time.time() - t2b
+
+    P_s, T_s = P2 / FPS, (ph2 % P2) / FPS
 
     dur = len(y) / SR
     k = np.arange(int(np.ceil((f_first / FPS - T_s) / P_s)) - 1, int((f_last / FPS - T_s) / P_s) + 2)
@@ -225,7 +266,8 @@ def analyze(y, sr=SR, prior_bpm=120.0, prior_sigma_oct=0.7, bpm_range=(60, 200),
     tim['total'] = time.time() - t0
     out = dict(bpm=60.0 / P_s, bpm_coarse=b0, P=P_s, T=T_s, beats=beats, beats_drift=beats_d,
                downbeats=beats_d[(k % 4) == p_best], downbeat_phase=p_best,
-               downbeats_by_cue={c: beats_d[(k % 4) == p] for c, p in per_cue.items()}, z=z, timing=tim)
+               downbeats_by_cue={c: beats_d[(k % 4) == p] for c, p in per_cue.items()}, z=z, timing=tim,
+               family=family)
     if return_debug:
         out.update(ac=ac, S=S, w=w, bpms=bpms, nov=nov)
     return out
