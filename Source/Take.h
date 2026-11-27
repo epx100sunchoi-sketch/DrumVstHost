@@ -21,6 +21,7 @@ inline juce::String songDrums() { return lang::pick ("원곡 드럼.wav", "song 
 inline juce::String info() { return lang::pick ("정보.xml", "info.xml"); }
 inline juce::String midi() { return lang::pick ("연주.mid", "performance.mid"); }
 inline juce::String rawMidi() { return lang::pick ("연주 원본.mid", "performance (raw).mid"); }
+inline juce::String currentMidi() { return lang::pick ("연주 (고친 뒤).mid", "performance (current).mid"); }
 inline juce::String recordedDrum() { return lang::pick ("드럼 (녹음 그대로).wav", "drums (as recorded).wav"); }
 
 // 읽을 때: 다른 언어로 녹음한 폴더도 그대로 읽는다.
@@ -30,6 +31,10 @@ inline juce::File songDrumsIn (const juce::File& folder) { return dataChild (fol
 inline juce::File infoIn (const juce::File& folder) { return dataChild (folder, "정보.xml", "info.xml"); }
 inline juce::File midiIn (const juce::File& folder) { return dataChild (folder, "연주.mid", "performance.mid"); }
 inline juce::File rawMidiIn (const juce::File& folder) { return dataChild (folder, "연주 원본.mid", "performance (raw).mid"); }
+
+// 지금 드럼.wav를 만든 연주(박자 맞추기·고친 MIDI를 반영한 상태, 모듈 음 그대로). 다시 만들 때마다 새로 쓰고,
+// '지금 킷 소리로 다시 만들기'가 이 파일을 쓴다(없으면 연주 원본). '녹음 그대로 되돌리기'가 지운다.
+inline juce::File currentMidiIn (const juce::File& folder) { return dataChild (folder, "연주 (고친 뒤).mid", "performance (current).mid"); }
 inline juce::File recordedDrumIn (const juce::File& folder) { return dataChild (folder, "드럼 (녹음 그대로).wav", "drums (as recorded).wav"); }
 }
 

@@ -85,10 +85,16 @@ struct Rebuilt
 // 고친 MIDI(연주.mid를 이지드러머 등에서 고친 것)를 녹음과 맞춰 드럼 모듈이 보낸 것처럼 되돌린다.
 bool rebuild (const juce::File& takeFolder, const TakeInfo&, const juce::File& editedMidi, Rebuilt&, juce::String& error);
 
-// 녹음한 연주(연주 원본.mid)를 원곡 박 격자에 끌어당긴다(이지드러머 없이 앱 안에서 박자 맞추기).
+// sourceMidi(연주 원본.mid나 연주 (고친 뒤).mid: 모듈 음 그대로의 파일)를 원곡 박 격자에 끌어당긴다
+// (이지드러머 없이 앱 안에서 박자 맞추기). strength 0이면 아무 음도 옮기지 않는다(킷만 바꿔 다시 만들기).
 // stepBeats: 격자 간격(박 단위, 8분음표 0.5·16분음표 0.25·8분 셋잇단 1/3), strength: 0~1(1 = 격자에 딱 맞춤).
 // 음 켬·끔만 옮기고(표준 번호로 못 바꾸는 음은 그대로), 하이햇 음에는 원래 치던 때의 페달 값을 바로 앞에 넣는다.
-bool quantizeRaw (const juce::File& takeFolder, const TakeInfo&, double stepBeats, double strength, Rebuilt&, juce::String& error);
+bool quantizeRaw (const juce::File& sourceMidi, const TakeInfo&, double stepBeats, double strength, Rebuilt&, juce::String& error);
+
+// events(모듈 음, 샘플 위치)를 rawMidi(연주 원본.mid)와 같은 틀(같은 템포 트랙·틱 기준)로 destination에 쓴다.
+// 다시 만들기가 끝날 때마다 '연주 (고친 뒤).mid'를 이렇게 남겨, 킷만 바꿔 다시 만들어도 고친 박자가 유지되게 한다.
+bool writeRawFormat (const std::vector<RawEvent>& events, const TakeInfo&, const juce::File& rawMidi,
+                     const juce::File& destination, juce::String& error);
 
 // 모듈 음 번호 → General MIDI 드럼 음(-1 = 이 음은 표준 번호로 바꾸지 않는다: 고칠 수 없고 늘 원래대로 남는다)
 int toGeneralMidi (DrumModule::Brand, int moduleNote) noexcept;

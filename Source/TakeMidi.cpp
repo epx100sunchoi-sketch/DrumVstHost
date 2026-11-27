@@ -862,7 +862,7 @@ bool rebuild (const juce::File& folder, const TakeInfo& info, const juce::File& 
 }
 
 //============================================================================== 박자 맞추기
-bool quantizeRaw (const juce::File& folder, const TakeInfo& info, double stepBeats, double strength, Rebuilt& out, juce::String& error)
+bool quantizeRaw (const juce::File& sourceMidi, const TakeInfo& info, double stepBeats, double strength, Rebuilt& out, juce::String& error)
 {
     out = {};
     const double rate = info.sampleRate;
@@ -875,9 +875,7 @@ bool quantizeRaw (const juce::File& folder, const TakeInfo& info, double stepBea
         return false;
     }
 
-    const auto rawPath = TakeFiles::rawMidiIn (folder);
-
-    if (! rawPath.existsAsFile())
+    if (! sourceMidi.existsAsFile())
     {
         error = K ("이 녹음에는 연주 원본 MIDI가 없습니다.");
         return false;
@@ -885,7 +883,7 @@ bool quantizeRaw (const juce::File& folder, const TakeInfo& info, double stepBea
 
     juce::MidiFile raw;
 
-    if (! readMidiFile (rawPath, raw, error))
+    if (! readMidiFile (sourceMidi, raw, error))
         return false;
 
     const TempoMap tempo (raw);
@@ -984,6 +982,62 @@ bool quantizeRaw (const juce::File& folder, const TakeInfo& info, double stepBea
     }
 
     std::stable_sort (out.events.begin(), out.events.end(), [] (const RawEvent& a, const RawEvent& b) { return a.sample < b.sample; });
+    return true;
+}
+
+bool writeRawFormat (const std::vector<RawEvent>& events, const TakeInfo& info, const juce::File& rawMidi,
+                     const juce::File& destination, juce::String& error)
+{
+    const double rate = info.sampleRate;
+
+    if (rate <= 0.0)
+    {
+        error = K ("녹음 정보(정보.xml)를 읽을 수 없습니다.");
+        return false;
+    }
+
+    juce::MidiFile raw;
+
+    if (! readMidiFile (rawMidi, raw, error))
+        return false;
+
+    const TempoMap tempo (raw);
+
+    // 템포·박자표 트랙은 원본 그대로 옮긴다
+    juce::MidiMessageSequence meta;
+    meta.addEvent (juce::MidiMessage::textMetaEvent (3, "DrumVstHost"), 0.0);
+
+    for (const auto* holder : *raw.getTrack (0))
+        if (holder->message.isTempoMetaEvent() || holder->message.isTimeSignatureMetaEvent())
+            meta.addEvent (holder->message, 0.0);   // timeStamp는 message가 이미 갖고 있다
+
+    juce::MidiMessageSequence track;
+    track.addEvent (juce::MidiMessage::textMetaEvent (3, "Drum module (edited)"), 0.0);
+
+    for (const auto& e : events)
+    {
+        if (e.size == 0 || e.size > 3)
+            continue;
+
+        const double tick = tempo.tickAt ((double) e.sample / rate - info.midiStart);
+        track.addEvent (juce::MidiMessage (e.data, (int) e.size), juce::jmax (0.0, tick));
+    }
+
+    track.sort();
+    juce::MidiFile file;
+    file.setTicksPerQuarterNote (raw.getTimeFormat());
+    file.addTrack (meta);
+    file.addTrack (track);
+
+    destination.deleteFile();
+    juce::FileOutputStream out (destination);
+
+    if (! out.openedOk() || ! file.writeTo (out, 1))
+    {
+        error = K ("MIDI 파일을 쓸 수 없습니다: ") + destination.getFullPathName();
+        return false;
+    }
+
     return true;
 }
 } // namespace takemidi

@@ -474,4 +474,4 @@ MIDI 파일을 읽을 수 없습니다:\s	Cannot read the MIDI file:\s
  (격자에 딱 맞춤)	 (exactly on the grid)
 지금 킷 소리로 다시 만드는 중…	Rebuilding with the current kit…
 지금 킷 소리로 다시 만들기	Rebuild with current kit
-연주는 그대로 두고, 지금 드럼 VST에서 고른 킷 소리로 드럼을 다시 만듭니다. 킷이나 드럼 VST를 바꿔 녹음을 다시 들어 보고 싶을 때 쓰세요.	Keeps the performance as it is and rebuilds the drums with the kit chosen in the drum VST now. Use it to hear the take with a different kit or drum VST.
+연주는 그대로 두고, 지금 드럼 VST에서 고른 킷 소리로 드럼을 다시 만듭니다. 박자 맞추기나 고친 MIDI로 바꾼 연주가 있으면 그 상태 그대로입니다. 킷이나 드럼 VST를 바꿔 녹음을 다시 들어 보고 싶을 때 쓰세요.	Keeps the performance as it is and rebuilds the drums with the kit chosen in the drum VST now. If the performance was changed by Fix timing or edited MIDI, that state is kept. Use it to hear the take with a different kit or drum VST.

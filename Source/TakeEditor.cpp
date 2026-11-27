@@ -576,7 +576,7 @@ TakeEditor::TakeEditor (Engine& engineToUse, std::shared_ptr<TakePlayer> takeToU
     addChildComponent (importMidiButton);
 
     rerenderButton.setButtonText (K ("지금 킷 소리로 다시 만들기"));
-    styleButton (rerenderButton, K ("연주는 그대로 두고, 지금 드럼 VST에서 고른 킷 소리로 드럼을 다시 만듭니다. 킷이나 드럼 VST를 바꿔 녹음을 다시 들어 보고 싶을 때 쓰세요."));
+    styleButton (rerenderButton, K ("연주는 그대로 두고, 지금 드럼 VST에서 고른 킷 소리로 드럼을 다시 만듭니다. 박자 맞추기나 고친 MIDI로 바꾼 연주가 있으면 그 상태 그대로입니다. 킷이나 드럼 VST를 바꿔 녹음을 다시 들어 보고 싶을 때 쓰세요."));
     rerenderButton.onClick = [this]
     {
         if (! midiBusy && onRerenderKit != nullptr)

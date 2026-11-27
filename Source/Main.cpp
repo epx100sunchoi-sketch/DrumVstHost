@@ -643,7 +643,7 @@ private:
 
         {
             takemidi::Rebuilt q;
-            const bool ok = takemidi::quantizeRaw (folder, info, 0.5, 1.0, q, e);
+            const bool ok = takemidi::quantizeRaw (TakeFiles::rawMidiIn (folder), info, 0.5, 1.0, q, e);
             const double off = snareOffGrid (q);
             log ("take midi quantize 8th 100%: " + juce::String (ok ? "ok" : "FAILED " + e) + ", kept " + juce::String (q.kept)
                  + " moved " + juce::String (q.moved) + ", snare off grid " + juce::String (off, 2) + " ms, edges "
@@ -654,7 +654,7 @@ private:
 
         {
             takemidi::Rebuilt q;
-            const bool ok = takemidi::quantizeRaw (folder, info, 0.5, 0.5, q, e);
+            const bool ok = takemidi::quantizeRaw (TakeFiles::rawMidiIn (folder), info, 0.5, 0.5, q, e);
             const double off = snareOffGrid (q);
             log ("take midi quantize 8th 50%: " + juce::String (ok ? "ok" : "FAILED " + e) + ", moved " + juce::String (q.moved)
                  + ", snare off grid " + juce::String (off, 2) + " ms"
@@ -664,10 +664,24 @@ private:
         {
             // 세기 0 = '지금 킷 소리로 다시 만들기': 아무 음도 옮기지 않아야 한다
             takemidi::Rebuilt q;
-            const bool ok = takemidi::quantizeRaw (folder, info, 0.5, 0.0, q, e);
+            const bool ok = takemidi::quantizeRaw (TakeFiles::rawMidiIn (folder), info, 0.5, 0.0, q, e);
             log ("take midi rerender (strength 0): " + juce::String (ok ? "ok" : "FAILED " + e) + ", kept " + juce::String (q.kept)
                  + " moved " + juce::String (q.moved)
                  + (ok && q.moved == 0 && q.kept == 73 ? "  [as expected]" : "  [UNEXPECTED: want kept 73 moved 0]"));
+        }
+
+        {
+            // 박자를 맞춘 뒤 킷만 바꿔 다시 만들면 고친 박자가 유지돼야 한다:
+            // 박자 맞추기 결과 → 연주 (고친 뒤).mid로 저장 → 그 파일을 세기 0으로 읽어도 스네어가 격자 위에 남는지
+            takemidi::Rebuilt quantized, again;
+            const auto current = folder.getChildFile (TakeFiles::currentMidi());
+            const bool ok = takemidi::quantizeRaw (TakeFiles::rawMidiIn (folder), info, 0.5, 1.0, quantized, e)
+                         && takemidi::writeRawFormat (quantized.events, info, TakeFiles::rawMidiIn (folder), current, e)
+                         && takemidi::quantizeRaw (current, info, 0.5, 0.0, again, e);
+            const double off = ok ? snareOffGrid (again) : -1.0;
+            log ("take midi kit rebuild keeps timing: " + juce::String (ok ? "ok" : "FAILED " + e)
+                 + ", snare off grid " + juce::String (off, 2) + " ms, moved " + juce::String (ok ? again.moved : -1)
+                 + (ok && off >= 0.0 && off < 2.0 && again.moved == 0 ? "  [as expected]" : "  [UNEXPECTED: want on grid, moved 0]"));
         }
 
         folder.deleteRecursively();

@@ -2977,12 +2977,15 @@ void MainComponent::openTakeEditor (const juce::File& takeFolder)
 
         editor->onRerenderKit = [safe]
         {
-            // 연주는 그대로(세기 0 = 아무 음도 옮기지 않음), 지금 드럼 VST·킷 소리로만 다시 만든다
+            // 연주는 그대로(세기 0 = 아무 음도 옮기지 않음), 지금 드럼 VST·킷 소리로만 다시 만든다.
+            // 박자 맞추기·고친 MIDI를 거친 녹음이면 그 상태(연주 (고친 뒤).mid)를 그대로 쓴다.
             if (safe != nullptr)
                 safe->beginMidiJob (K ("지금 킷 소리로 다시 만드는 중…"),
                                     [] (const TakeInfo& info, const juce::File& takeFolder, takemidi::Rebuilt& out, juce::String& error)
                                     {
-                                        return takemidi::quantizeRaw (takeFolder, info, 0.5, 0.0, out, error);
+                                        const auto current = TakeFiles::currentMidiIn (takeFolder);
+                                        const auto source = current.existsAsFile() ? current : TakeFiles::rawMidiIn (takeFolder);
+                                        return takemidi::quantizeRaw (source, info, 0.5, 0.0, out, error);
                                     });
         };
 
@@ -3068,7 +3071,7 @@ void MainComponent::startMidiQuantize (double stepBeats, double strength)
     beginMidiJob (K ("박자를 맞추는 중…"),
                   [stepBeats, strength] (const TakeInfo& info, const juce::File& folder, takemidi::Rebuilt& out, juce::String& error)
                   {
-                      return takemidi::quantizeRaw (folder, info, stepBeats, strength, out, error);
+                      return takemidi::quantizeRaw (TakeFiles::rawMidiIn (folder), info, stepBeats, strength, out, error);
                   });
 }
 
@@ -3148,6 +3151,16 @@ void MainComponent::beginMidiJob (const juce::String& busyText, MidiJobPrepare p
                 ok = false;
                 error = K ("새 드럼 파일로 바꾸지 못했습니다. 녹음 폴더를 다른 프로그램이 쓰고 있는지 확인해 주세요.");
             }
+        }
+
+        if (ok)
+        {
+            // 지금 드럼.wav를 만든 연주를 남겨, 킷만 바꿔 다시 만들어도 고친 박자가 유지되게 한다(실패해도 치명적이지 않다)
+            juce::String currentError;
+
+            if (! takemidi::writeRawFormat (rebuilt.events, info, TakeFiles::rawMidiIn (folder),
+                                            folder.getChildFile (TakeFiles::currentMidi()), currentError))
+                DBG (currentError);
         }
 
         temp.deleteFile();
@@ -3233,6 +3246,8 @@ void MainComponent::restoreRecordedDrums()
         takeEditor->showMidiState (K ("되돌리지 못했습니다. 녹음 폴더를 다른 프로그램이 쓰고 있는지 확인해 주세요."), true, false);
         return;
     }
+
+    TakeFiles::currentMidiIn (folder).deleteFile();   // 고친 연주 기록도 처음 상태로 돌아간다
 
     reopenTakeEditor (folder, carry, K ("처음 녹음한 드럼으로 되돌렸습니다."));
 }
