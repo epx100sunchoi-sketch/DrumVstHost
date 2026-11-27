@@ -465,7 +465,6 @@ MIDI 파일을 읽을 수 없습니다:\s	Cannot read the MIDI file:\s
 고친 MIDI에 음이 하나도 없습니다.	The edited MIDI has no notes.
 박자를 맞추는 중…	Fixing the timing…
 박자 맞추기…	Fix timing…
-친 음을 원곡 박 격자(8분·16분음표)에 가까워지게 옮기고, 지금 고른 드럼 VST로 드럼을 다시 만듭니다. 기준은 처음 녹음한 연주이고, 림·엣지·하이햇 페달은 그대로 둡니다.	Pulls your hits toward the song's beat grid (8th or 16th notes) and rebuilds the drums with the drum VST chosen now. It starts from the performance as first recorded; rims, edges and the hi-hat pedal stay as they were.
 어느 격자에 끌어당길까요?	Pull the hits toward which grid?
 8분음표	8th notes
 16분음표	16th notes
@@ -475,3 +474,5 @@ MIDI 파일을 읽을 수 없습니다:\s	Cannot read the MIDI file:\s
 지금 킷 소리로 다시 만드는 중…	Rebuilding with the current kit…
 지금 킷 소리로 다시 만들기	Rebuild with current kit
 연주는 그대로 두고, 지금 드럼 VST에서 고른 킷 소리로 드럼을 다시 만듭니다. 박자 맞추기나 고친 MIDI로 바꾼 연주가 있으면 그 상태 그대로입니다. 킷이나 드럼 VST를 바꿔 녹음을 다시 들어 보고 싶을 때 쓰세요.	Keeps the performance as it is and rebuilds the drums with the kit chosen in the drum VST now. If the performance was changed by Fix timing or edited MIDI, that state is kept. Use it to hear the take with a different kit or drum VST.
+친 음을 원곡 박 격자(8분~32분음표·셋잇단)에 가까워지게 옮기고, 지금 고른 드럼 VST로 드럼을 다시 만듭니다. 기준은 처음 녹음한 연주이고, 림·엣지·하이햇 페달은 그대로 둡니다.	Pulls your hits toward the song's beat grid (8th to 32nd notes, or triplets) and rebuilds the drums with the drum VST chosen now. It starts from the performance as first recorded; rims, edges and the hi-hat pedal stay as they were.
+32분음표	32nd notes

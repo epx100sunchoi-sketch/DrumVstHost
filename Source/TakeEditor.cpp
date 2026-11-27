@@ -566,7 +566,7 @@ TakeEditor::TakeEditor (Engine& engineToUse, std::shared_ptr<TakePlayer> takeToU
     addChildComponent (*midiChip);
 
     quantizeButton.setButtonText (K ("박자 맞추기…"));
-    styleButton (quantizeButton, K ("친 음을 원곡 박 격자(8분·16분음표)에 가까워지게 옮기고, 지금 고른 드럼 VST로 드럼을 다시 만듭니다. 기준은 처음 녹음한 연주이고, 림·엣지·하이햇 페달은 그대로 둡니다."));
+    styleButton (quantizeButton, K ("친 음을 원곡 박 격자(8분~32분음표·셋잇단)에 가까워지게 옮기고, 지금 고른 드럼 VST로 드럼을 다시 만듭니다. 기준은 처음 녹음한 연주이고, 림·엣지·하이햇 페달은 그대로 둡니다."));
     quantizeButton.onClick = [this] { showQuantizeMenu(); };
     addChildComponent (quantizeButton);
 
@@ -743,11 +743,11 @@ void TakeEditor::showQuantizeMenu()
     // 격자(8분·16분·8분 셋잇단) × 세기. 세기 100%는 격자에 딱, 낮을수록 조금만 끌어당긴다.
     juce::PopupMenu menu;
     menu.addSectionHeader (K ("어느 격자에 끌어당길까요?"));
-    static constexpr double steps[] = { 0.5, 0.25, 1.0 / 3.0 };
+    static constexpr double steps[] = { 0.5, 0.25, 0.125, 1.0 / 3.0 };
     static constexpr int strengths[] = { 100, 75, 50 };
-    const char* names[] = { "8분음표", "16분음표", "8분음표 셋잇단" };
+    const char* names[] = { "8분음표", "16분음표", "32분음표", "8분음표 셋잇단" };
 
-    for (int g = 0; g < 3; ++g)
+    for (int g = 0; g < 4; ++g)
     {
         juce::PopupMenu sub;
 
@@ -767,7 +767,7 @@ void TakeEditor::showQuantizeMenu()
 
         const int g = (result - 100) / 10, s = (result - 100) % 10;
 
-        if (g >= 0 && g < 3 && s >= 0 && s < 3)
+        if (g >= 0 && g < 4 && s >= 0 && s < 3)
             safe->onQuantize (steps[g], strengths[s] / 100.0);
     });
 }
