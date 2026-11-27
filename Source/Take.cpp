@@ -123,6 +123,7 @@ bool TakeInfo::load (const juce::File& folder)
         midiBrand = midi->getIntAttribute ("brand", 0);
         midiBeatsPerBar = juce::jlimit (1, 16, midi->getIntAttribute ("beatsPerBar", 4));
         midiFromSong = midi->getBoolAttribute ("fromSong", false);
+        midiApplied = midi->getStringAttribute ("applied");
     }
 
     return true;
@@ -158,6 +159,9 @@ bool TakeInfo::save (const juce::File& folder) const
         midi->setAttribute ("brand", midiBrand);
         midi->setAttribute ("beatsPerBar", midiBeatsPerBar);
         midi->setAttribute ("fromSong", midiFromSong);
+
+        if (midiApplied.isNotEmpty())
+            midi->setAttribute ("applied", midiApplied);
     }
 
     return xml.writeTo (TakeFiles::infoIn (folder));

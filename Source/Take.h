@@ -51,6 +51,7 @@ struct TakeInfo
     bool hasMidi = false, midiFromSong = false;
     double midiStart = 0.0, midiBpm = 0.0;
     int midiBrand = 0, midiBeatsPerBar = 4;
+    juce::String midiApplied;   // 적용된 보정 기록, '|'로 이음: quantize:<박>:<세기%> ghosts:<양> edited kit
 
     // 다듬기 창에서 마지막으로 쓴 값
     bool edited = false;

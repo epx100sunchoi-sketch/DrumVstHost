@@ -78,8 +78,9 @@ private:
     void showQuantizeMenu();
     void showGhostMenu();
     juce::Label midiStatus;
-    juce::Rectangle<int> midiTitleArea, midiHintArea;
-    juce::String midiTempoText, midiHintText;
+    juce::Rectangle<int> midiTitleArea, midiAppliedArea, midiHintArea;
+    juce::String midiTempoText, midiAppliedText, midiHintText;
+    static juce::String describeApplied (const juce::String& codes);   // 적용된 보정 기록 → 사람이 읽는 말
     std::unique_ptr<juce::FileChooser> midiChooser;
     bool midiBusy = false;
     void chooseEditedMidi();

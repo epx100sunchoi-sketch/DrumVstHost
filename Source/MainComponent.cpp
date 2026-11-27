@@ -2986,7 +2986,8 @@ void MainComponent::openTakeEditor (const juce::File& takeFolder)
                                         const auto current = TakeFiles::currentMidiIn (takeFolder);
                                         const auto source = current.existsAsFile() ? current : TakeFiles::rawMidiIn (takeFolder);
                                         return takemidi::quantizeRaw (source, info, 0.5, 0.0, out, error);
-                                    });
+                                    },
+                                    "kit");
         };
 
         editor->onAddGhosts = [safe] (int amount)
@@ -2999,7 +3000,8 @@ void MainComponent::openTakeEditor (const juce::File& takeFolder)
                                         const auto current = TakeFiles::currentMidiIn (takeFolder);
                                         const auto source = current.existsAsFile() ? current : TakeFiles::rawMidiIn (takeFolder);
                                         return takemidi::addGhosts (source, info, amount, out, error);
-                                    });
+                                    },
+                                    "ghosts:" + juce::String (amount));
         };
 
         editor->onRestoreRecordedDrums = [safe]
@@ -3075,20 +3077,25 @@ void MainComponent::startMidiRebuild (const juce::File& editedMidi)
                   [editedMidi] (const TakeInfo& info, const juce::File& folder, takemidi::Rebuilt& out, juce::String& error)
                   {
                       return takemidi::rebuild (folder, info, editedMidi, out, error);
-                  });
+                  },
+                  "edited");
 }
 
-// 다듬기 창 '박자 맞추기': 녹음한 연주를 원곡 박 격자에 끌어당겨, 고친 MIDI와 같은 길로 드럼을 다시 만든다.
+// 다듬기 창 '박자 맞추기': 연주를 원곡 박 격자에 끌어당겨, 고친 MIDI와 같은 길로 드럼을 다시 만든다.
+// 지금 상태의 연주(연주 (고친 뒤).mid)가 기준이라 고스트 노트·고친 MIDI 위에도 쌓인다. 처음부터는 '녹음 그대로 되돌리기'로.
 void MainComponent::startMidiQuantize (double stepBeats, double strength)
 {
     beginMidiJob (K ("박자를 맞추는 중…"),
                   [stepBeats, strength] (const TakeInfo& info, const juce::File& folder, takemidi::Rebuilt& out, juce::String& error)
                   {
-                      return takemidi::quantizeRaw (TakeFiles::rawMidiIn (folder), info, stepBeats, strength, out, error);
-                  });
+                      const auto current = TakeFiles::currentMidiIn (folder);
+                      const auto source = current.existsAsFile() ? current : TakeFiles::rawMidiIn (folder);
+                      return takemidi::quantizeRaw (source, info, stepBeats, strength, out, error);
+                  },
+                  "quantize:" + juce::String (stepBeats) + ":" + juce::String (juce::roundToInt (strength * 100.0)));
 }
 
-void MainComponent::beginMidiJob (const juce::String& busyText, MidiJobPrepare prepare)
+void MainComponent::beginMidiJob (const juce::String& busyText, MidiJobPrepare prepare, const juce::String& appliedStamp)
 {
     if (takeEditor == nullptr || midiJobBusy)
         return;
@@ -3125,7 +3132,7 @@ void MainComponent::beginMidiJob (const juce::String& busyText, MidiJobPrepare p
     auto shownPercent = std::make_shared<std::atomic<int>> (-1);
     auto& engineRef = engine;
 
-    midiJob = std::make_unique<BackgroundJob> ([safe, &engineRef, folder, prepare, info, carry, shownPercent] (BackgroundJob& job)
+    midiJob = std::make_unique<BackgroundJob> ([safe, &engineRef, folder, prepare, info, carry, shownPercent, appliedStamp] (BackgroundJob& job)
     {
         takemidi::Rebuilt rebuilt;
         juce::String error;
@@ -3181,10 +3188,10 @@ void MainComponent::beginMidiJob (const juce::String& busyText, MidiJobPrepare p
         auto summary = rebuilt;
         summary.events = {};
 
-        juce::MessageManager::callAsync ([safe, folder, ok, error, summary, carry]
+        juce::MessageManager::callAsync ([safe, folder, ok, error, summary, carry, appliedStamp]
         {
             if (safe != nullptr)
-                safe->finishMidiRebuild (folder, ok, error, summary, carry);
+                safe->finishMidiRebuild (folder, ok, error, summary, carry, appliedStamp);
         });
     });
 
@@ -3203,7 +3210,7 @@ void MainComponent::showMidiProgress (int percent)
 }
 
 void MainComponent::finishMidiRebuild (const juce::File& folder, bool ok, const juce::String& error,
-                                       const takemidi::Rebuilt& summary, const TakeInfo& carry)
+                                       const takemidi::Rebuilt& summary, const TakeInfo& carry, const juce::String& appliedStamp)
 {
     midiJob.reset();   // 스레드는 이미 끝나 간다
     midiJobBusy = false;
@@ -3218,6 +3225,24 @@ void MainComponent::finishMidiRebuild (const juce::File& folder, bool ok, const 
             setSongStatus (error, true, 10);
 
         return;
+    }
+
+    // 적용된 보정 기록(정보.xml): 다듬기 창이 '적용된 보정' 줄로 보여 준다. 같은 것을 연달아 하면 한 번만 적는다.
+    if (appliedStamp.isNotEmpty())
+    {
+        TakeInfo onDisk;
+
+        if (onDisk.load (folder) && onDisk.hasMidi)
+        {
+            auto parts = juce::StringArray::fromTokens (onDisk.midiApplied, "|", "");
+            parts.removeEmptyStrings();
+
+            if (parts.isEmpty() || parts[parts.size() - 1] != appliedStamp)
+                parts.add (appliedStamp);
+
+            onDisk.midiApplied = parts.joinIntoString ("|");
+            onDisk.save (folder);
+        }
     }
 
     auto message = K ("다시 만들었습니다: 그대로 둔 음 ") + juce::String (summary.kept)
@@ -3261,6 +3286,16 @@ void MainComponent::restoreRecordedDrums()
     }
 
     TakeFiles::currentMidiIn (folder).deleteFile();   // 고친 연주 기록도 처음 상태로 돌아간다
+
+    {
+        TakeInfo onDisk;   // 적용된 보정 기록도 지운다
+
+        if (onDisk.load (folder) && onDisk.midiApplied.isNotEmpty())
+        {
+            onDisk.midiApplied.clear();
+            onDisk.save (folder);
+        }
+    }
 
     reopenTakeEditor (folder, carry, K ("처음 녹음한 드럼으로 되돌렸습니다."));
 }

@@ -685,6 +685,26 @@ private:
         }
 
         {
+            // 고스트를 먼저 넣고 박자를 맞춰도 고스트가 살아 있어야 한다(둘 다 지금 상태의 연주 기준):
+            // 고스트 넣기 → 연주 (고친 뒤).mid로 저장 → 16분음표 100% 맞추기 → 약한 스네어 24개 유지, 늦던 스네어 12개만 이동
+            takemidi::Rebuilt withGhosts, then;
+            const auto current = folder.getChildFile (TakeFiles::currentMidi());
+            const bool ok = takemidi::addGhosts (TakeFiles::rawMidiIn (folder), info, 1, withGhosts, e)
+                         && takemidi::writeRawFormat (withGhosts.events, info, TakeFiles::rawMidiIn (folder), current, e)
+                         && takemidi::quantizeRaw (current, info, 0.25, 1.0, then, e);
+            int quiet = 0;
+
+            for (const auto& ev : then.events)
+                if (ev.size == 3 && (ev.data[0] & 0xf0) == 0x90 && ev.data[2] > 0 && ev.data[1] == 38 && ev.data[2] <= 30)
+                    ++quiet;
+
+            log ("take midi ghosts then quantize: " + juce::String (ok ? "ok" : "FAILED " + e)
+                 + ", quiet snares " + juce::String (quiet) + " moved " + juce::String (ok ? then.moved : -1)
+                 + (ok && quiet == 24 && then.moved == 12 ? "  [as expected]" : "  [UNEXPECTED: want 24 ghosts kept, 12 snares moved]"));
+            current.deleteFile();
+        }
+
+        {
             // 고스트 노트 넣기(보통): 세게 친 스네어 앞뒤 빈 16분 자리에 약한 스네어가 더해지고, 기존 음은 그대로여야 한다
             takemidi::Rebuilt g;
             const bool ok = takemidi::addGhosts (TakeFiles::rawMidiIn (folder), info, 1, g, e);

@@ -105,11 +105,13 @@ private:
     void startMidiRebuild (const juce::File& editedMidi);
     void startMidiQuantize (double stepBeats, double strength);   // 다듬기 창 '박자 맞추기'(takemidi::quantizeRaw)
     using MidiJobPrepare = std::function<bool (const TakeInfo&, const juce::File& folder, takemidi::Rebuilt&, juce::String&)>;
-    void beginMidiJob (const juce::String& busyText, MidiJobPrepare prepare);
+    // appliedStamp: 성공하면 정보.xml의 적용된 보정 기록에 덧붙이는 코드(quantize:<박>:<세기%>, ghosts:<양>, edited, kit)
+    void beginMidiJob (const juce::String& busyText, MidiJobPrepare prepare, const juce::String& appliedStamp = {});
     void restoreRecordedDrums();
     void reopenTakeEditor (const juce::File& folder, const TakeInfo& carry, const juce::String& message);
     void showMidiProgress (int percent);
-    void finishMidiRebuild (const juce::File& folder, bool ok, const juce::String& error, const takemidi::Rebuilt& summary, const TakeInfo& carry);
+    void finishMidiRebuild (const juce::File& folder, bool ok, const juce::String& error, const takemidi::Rebuilt& summary,
+                            const TakeInfo& carry, const juce::String& appliedStamp);
     class BackgroundJob;
     std::unique_ptr<BackgroundJob> midiJob;
     juce::File midiJobFolder;

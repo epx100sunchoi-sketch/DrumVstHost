@@ -566,7 +566,7 @@ TakeEditor::TakeEditor (Engine& engineToUse, std::shared_ptr<TakePlayer> takeToU
     addChildComponent (*midiChip);
 
     quantizeButton.setButtonText (K ("박자 맞추기…"));
-    styleButton (quantizeButton, K ("친 음을 원곡 박 격자(8분~32분음표·셋잇단)에 가까워지게 옮기고, 지금 고른 드럼 VST로 드럼을 다시 만듭니다. 기준은 처음 녹음한 연주이고, 림·엣지·하이햇 페달은 그대로 둡니다."));
+    styleButton (quantizeButton, K ("친 음을 원곡 박 격자(8분~32분음표·셋잇단)에 가까워지게 옮기고, 지금 고른 드럼 VST로 드럼을 다시 만듭니다. 지금 상태의 연주가 기준이라 고스트 노트·고친 MIDI 위에도 쌓입니다. 처음 녹음부터 다시 하려면 '녹음 그대로 되돌리기'를 먼저 누르세요. 림·엣지·하이햇 페달은 그대로 둡니다."));
     quantizeButton.onClick = [this] { showQuantizeMenu(); };
     addChildComponent (quantizeButton);
 
@@ -616,7 +616,7 @@ TakeEditor::TakeEditor (Engine& engineToUse, std::shared_ptr<TakePlayer> takeToU
     rangeChanged();
     setStatus (K ("볼륨과 타이밍을 맞춘 뒤 '완성본 저장'을 누르세요. 저장하지 않고 닫으면 바꾼 값은 남지 않습니다."), false);
 
-    setSize (editorWidth, 830);
+    setSize (editorWidth, 852);
     startTimerHz (30);
 }
 
@@ -728,6 +728,8 @@ void TakeEditor::updateMidiRow()
             midiHintText += K (" 원곡에 맞춰 고치려면 메트로놈(박자 분석)을 켠 곡으로 녹음하세요.");
     }
 
+    midiAppliedText = hasMidi ? K ("적용된 보정: ") + describeApplied (info.midiApplied) : juce::String();
+
     resized();
     repaint();
 }
@@ -740,6 +742,42 @@ void TakeEditor::showMidiState (const juce::String& text, bool isError, bool bus
     midiStatus.setTooltip (isError ? text : juce::String());
     saveButton.setEnabled (! busy);
     updateMidiRow();
+}
+
+juce::String TakeEditor::describeApplied (const juce::String& codes)
+{
+    auto parts = juce::StringArray::fromTokens (codes, "|", "");
+    parts.removeEmptyStrings();
+
+    if (parts.isEmpty())
+        return K ("없음 (녹음 그대로)");
+
+    juce::StringArray out;
+
+    for (const auto& part : parts)
+    {
+        const auto bits = juce::StringArray::fromTokens (part, ":", "");
+
+        if (bits[0] == "quantize" && bits.size() >= 3)
+        {
+            const double step = bits[1].getDoubleValue();
+            const char* name = step > 0.45 ? "8분음표"
+                             : step > 0.3  ? "8분음표 셋잇단"
+                             : step > 0.2  ? "16분음표" : "32분음표";
+            out.add (K ("박자 맞추기") + "(" + K (name) + " " + bits[2] + "%)");
+        }
+        else if (bits[0] == "ghosts" && bits.size() >= 2)
+        {
+            const int amount = bits[1].getIntValue();
+            out.add (K ("고스트 노트") + "(" + K (amount >= 2 ? "많이" : amount == 1 ? "보통" : "조금") + ")");
+        }
+        else if (bits[0] == "edited")
+            out.add (K ("고친 MIDI"));
+        else if (bits[0] == "kit")
+            out.add (K ("킷 소리 다시 만듦"));
+    }
+
+    return out.joinIntoString (" → ");
 }
 
 void TakeEditor::showQuantizeMenu()
@@ -1039,6 +1077,12 @@ void TakeEditor::paint (juce::Graphics& g)
     g.setFont (ui::font (14.0f));
     g.drawText (midiTempoText, midiTitleArea, juce::Justification::centredRight);
     g.drawFittedText (midiHintText, midiHintArea, juce::Justification::centredLeft, 2, 1.0f);
+
+    if (midiAppliedText.isNotEmpty())
+    {
+        g.setColour (ui::text);
+        g.drawText (midiAppliedText, midiAppliedArea, juce::Justification::centredLeft);
+    }
 }
 
 void TakeEditor::resized()
@@ -1157,6 +1201,8 @@ void TakeEditor::resized()
         y += 40 + 4;
     }
 
+    midiAppliedArea = { pad, y, width, 20 };
+    y += 20 + 2;
     midiHintArea = { pad, y, width, 34 };
     y += 34 + 12;
     dividers[3] = y;
