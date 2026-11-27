@@ -36,6 +36,7 @@ public:
     std::function<void (const juce::File&)> onImportMidi;
     std::function<void (double stepBeats, double strength)> onQuantize;
     std::function<void()> onRerenderKit;   // 연주는 그대로, 지금 드럼 VST·킷 소리로 드럼.wav를 다시 만든다
+    std::function<void (int amount)> onAddGhosts;   // 약한 스네어(고스트 노트) 넣기: 0 조금, 1 보통, 2 많이
     std::function<void()> onRestoreRecordedDrums;
     void showMidiState (const juce::String& text, bool isError, bool busy);
     void setStatusText (const juce::String& text, bool isError)   { setStatus (text, isError); }
@@ -73,8 +74,9 @@ private:
     // 연주 MIDI
     class MidiChip;             // 끌어서 이지드러머·DAW에 놓는 '연주.mid'
     std::unique_ptr<MidiChip> midiChip;
-    juce::TextButton quantizeButton, importMidiButton, rerenderButton, restoreDrumsButton;
+    juce::TextButton quantizeButton, importMidiButton, rerenderButton, restoreDrumsButton, ghostButton;
     void showQuantizeMenu();
+    void showGhostMenu();
     juce::Label midiStatus;
     juce::Rectangle<int> midiTitleArea, midiHintArea;
     juce::String midiTempoText, midiHintText;

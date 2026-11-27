@@ -584,6 +584,11 @@ TakeEditor::TakeEditor (Engine& engineToUse, std::shared_ptr<TakePlayer> takeToU
     };
     addChildComponent (rerenderButton);
 
+    ghostButton.setButtonText (K ("고스트 노트 넣기…"));
+    styleButton (ghostButton, K ("세게 친 스네어 사이의 빈 16분음표 자리에 아주 약한 스네어(고스트 노트)를 넣고, 지금 드럼 VST로 드럼을 다시 만듭니다. 마음에 안 들면 '녹음 그대로 되돌리기'를 누르세요."));
+    ghostButton.onClick = [this] { showGhostMenu(); };
+    addChildComponent (ghostButton);
+
     restoreDrumsButton.setButtonText (K ("녹음 그대로 되돌리기"));
     styleButton (restoreDrumsButton, K ("고친 MIDI로 다시 만들기 전의 드럼(처음 녹음한 소리)으로 되돌립니다."));
     restoreDrumsButton.onClick = [this]
@@ -697,6 +702,8 @@ void TakeEditor::updateMidiRow()
     importMidiButton.setEnabled (! midiBusy);
     rerenderButton.setVisible (hasMidi);
     rerenderButton.setEnabled (! midiBusy);
+    ghostButton.setVisible (hasMidi);
+    ghostButton.setEnabled (! midiBusy);
     restoreDrumsButton.setVisible (TakeFiles::recordedDrumIn (folder).existsAsFile());
     restoreDrumsButton.setEnabled (! midiBusy);
 
@@ -769,6 +776,27 @@ void TakeEditor::showQuantizeMenu()
 
         if (g >= 0 && g < 4 && s >= 0 && s < 3)
             safe->onQuantize (steps[g], strengths[s] / 100.0);
+    });
+}
+
+void TakeEditor::showGhostMenu()
+{
+    if (midiBusy || onAddGhosts == nullptr)
+        return;
+
+    // 얼마나 넣을지만 고른다. 자리는 앱이 찾는다(세게 친 스네어 둘레의 빈 16분음표 자리).
+    juce::PopupMenu menu;
+    menu.addSectionHeader (K ("약한 스네어(고스트 노트)를 얼마나 넣을까요?"));
+    menu.addItem (1, K ("조금: 세게 친 스네어 바로 앞"));
+    menu.addItem (2, K ("보통: 세게 친 스네어 앞뒤"));
+    menu.addItem (3, K ("많이: 빈 16분음표 자리 전부"));
+
+    juce::Component::SafePointer<TakeEditor> safe (this);
+
+    menu.showMenuAsync (juce::PopupMenu::Options().withTargetComponent (ghostButton), [safe] (int result)
+    {
+        if (safe != nullptr && result >= 1 && result <= 3 && ! safe->midiBusy && safe->onAddGhosts != nullptr)
+            safe->onAddGhosts (result - 1);
     });
 }
 
@@ -1107,13 +1135,19 @@ void TakeEditor::resized()
 
     y += 40 + 4;
 
-    if (rerenderButton.isVisible() || restoreDrumsButton.isVisible())
+    if (rerenderButton.isVisible() || ghostButton.isVisible() || restoreDrumsButton.isVisible())
     {
         juce::Rectangle<int> row (pad, y, width, 40);
 
         if (rerenderButton.isVisible())
         {
             rerenderButton.setBounds (row.removeFromLeft (200).withSizeKeepingCentre (200, 34));
+            row.removeFromLeft (8);
+        }
+
+        if (ghostButton.isVisible())
+        {
+            ghostButton.setBounds (row.removeFromLeft (160).withSizeKeepingCentre (160, 34));
             row.removeFromLeft (8);
         }
 

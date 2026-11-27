@@ -985,6 +985,205 @@ bool quantizeRaw (const juce::File& sourceMidi, const TakeInfo& info, double ste
     return true;
 }
 
+bool addGhosts (const juce::File& sourceMidi, const TakeInfo& info, int amount, Rebuilt& out, juce::String& error)
+{
+    out = {};
+    const double rate = info.sampleRate;
+    const auto brand = (DrumModule::Brand) info.midiBrand;
+
+    if (rate <= 0.0 || info.lengthSamples <= 0)
+    {
+        error = K ("녹음 정보(정보.xml)를 읽을 수 없습니다.");
+        return false;
+    }
+
+    if (! sourceMidi.existsAsFile())
+    {
+        error = K ("이 녹음에는 연주 원본 MIDI가 없습니다.");
+        return false;
+    }
+
+    const int snare = fromGeneralMidi (brand, 38);
+
+    if (snare < 0)
+    {
+        error = K ("이 드럼 모듈 배치에는 스네어가 없어 고스트 노트를 넣지 못합니다.");
+        return false;
+    }
+
+    juce::MidiFile raw;
+
+    if (! readMidiFile (sourceMidi, raw, error))
+        return false;
+
+    const TempoMap tempo (raw);
+
+    // 기존 음은 전부 그대로 두고, 스네어를 어디서 쳤는지 박 단위로 모은다
+    struct SnareHit
+    {
+        double beat = 0.0;
+        int velocity = 0;
+    };
+
+    std::vector<SnareHit> snares;
+    std::vector<double> noteBeats;   // 모든 음 켬(연주 구간·마디 판단용)
+    int channel = -1;
+
+    for (int t = 0; t < raw.getNumTracks(); ++t)
+    {
+        for (const auto* holder : *raw.getTrack (t))
+        {
+            const auto& m = holder->message;
+
+            if (m.isMetaEvent() || m.isSysEx() || m.getRawDataSize() < 1 || m.getRawDataSize() > 3)
+                continue;
+
+            const double seconds = info.midiStart + tempo.secondsAt (m.getTimeStamp());
+
+            RawEvent e;
+            e.sample = (juce::int64) std::llround (seconds * rate);
+            e.size = (juce::uint8) m.getRawDataSize();
+            std::memcpy (e.data, m.getRawData(), e.size);
+
+            if (e.sample < 0 || e.sample >= info.lengthSamples)
+                continue;
+
+            out.events.push_back (e);
+
+            if (e.size == 3 && (e.data[0] & 0xf0) == 0x90 && e.data[2] > 0)
+            {
+                const double beat = m.getTimeStamp() / tempo.ppqn;
+                noteBeats.push_back (beat);
+                ++out.kept;
+
+                if (toGeneralMidi (brand, e.data[1]) == 38)
+                {
+                    snares.push_back ({ beat, (int) e.data[2] });
+
+                    if (channel < 0)
+                        channel = e.data[0] & 0x0f;
+                }
+            }
+        }
+    }
+
+    if (noteBeats.empty())
+    {
+        error = K ("이 연주에는 친 음이 없습니다.");
+        return false;
+    }
+
+    if (channel < 0)
+        channel = 9;
+
+    std::sort (noteBeats.begin(), noteBeats.end());
+    std::sort (snares.begin(), snares.end(), [] (const SnareHit& a, const SnareHit& b) { return a.beat < b.beat; });
+
+    // 고스트 세기: 친 스네어 세기의 가운데 값에서 많이 낮춘 값. 세게 친 스네어만 기준(백비트)으로 삼아,
+    // 이미 들어 있는 고스트 둘레에 또 넣지 않는다.
+    std::vector<double> velocities;
+
+    for (const auto& s : snares)
+        velocities.push_back ((double) s.velocity);
+
+    const double median = medianOf (velocities, 70.0);
+    const int ghostVelocity = juce::jlimit (12, 28, juce::roundToInt (median * 0.26));
+    const double anchorVelocity = juce::jmax (35.0, median * 0.55);
+
+    const auto snareNear = [&] (double beat)
+    {
+        for (const auto& s : snares)
+            if (std::abs (s.beat - beat) < 0.2)
+                return true;
+
+        return false;
+    };
+
+    std::vector<double> spots;
+
+    const auto addSpot = [&] (double beat)
+    {
+        if (beat < noteBeats.front() - 0.3 || beat > noteBeats.back() + 0.3 || snareNear (beat))
+            return;
+
+        for (const double b : spots)
+            if (std::abs (b - beat) < 0.2)
+                return;
+
+        spots.push_back (beat);
+    };
+
+    if (amount >= 2)
+    {
+        // 연주가 있는 마디의 빈 16분 자리 전부(8분음표 자리 사이, '이'와 '아')
+        const int beatsPerBar = juce::jmax (1, info.midiBeatsPerBar);
+        std::vector<int> bars;
+
+        for (const double b : noteBeats)
+            bars.push_back ((int) std::floor (b / beatsPerBar + 1.0e-6));
+
+        std::sort (bars.begin(), bars.end());
+        bars.erase (std::unique (bars.begin(), bars.end()), bars.end());
+
+        for (const int bar : bars)
+            for (int k = 1; k < beatsPerBar * 4; k += 2)
+                addSpot (bar * beatsPerBar + k * 0.25);
+    }
+    else
+    {
+        // 세게 친 스네어(백비트) 바로 앞 16분 자리, '보통'(1)은 바로 뒤도.
+        // 친 음이 격자에서 조금 벗어나 있으면(0.12박 안) 격자 자리에, 많이 벗어나 있으면 친 음 기준으로 넣는다.
+        for (const auto& s : snares)
+        {
+            if ((double) s.velocity < anchorVelocity)
+                continue;
+
+            const double snapped = std::round (s.beat * 4.0) / 4.0;
+            const double base = std::abs (s.beat - snapped) <= 0.12 ? snapped : s.beat;
+            addSpot (base - 0.25);
+
+            if (amount >= 1)
+                addSpot (base + 0.25);
+        }
+    }
+
+    std::sort (spots.begin(), spots.end());
+
+    for (const double beat : spots)
+    {
+        const double seconds = info.midiStart + tempo.secondsAt (beat * tempo.ppqn);
+        const auto sample = (juce::int64) std::llround (seconds * rate);
+
+        if (sample < 0 || sample >= info.lengthSamples)
+            continue;
+
+        RawEvent on;
+        on.sample = sample;
+        on.size = 3;
+        on.data[0] = (juce::uint8) (0x90 | channel);
+        on.data[1] = (juce::uint8) snare;
+        on.data[2] = (juce::uint8) ghostVelocity;
+
+        RawEvent off = on;
+        off.sample = juce::jmin<juce::int64> (info.lengthSamples - 1, sample + (juce::int64) std::llround (0.06 * rate));
+        off.data[0] = (juce::uint8) (0x80 | channel);
+        off.data[2] = 64;
+
+        out.events.push_back (on);
+        out.events.push_back (off);
+        ++out.added;
+    }
+
+    if (out.added == 0)
+    {
+        error = K ("고스트 노트를 넣을 자리가 없습니다. 빈 16분음표 자리가 이미 찼거나, 기준으로 삼을 만큼 세게 친 스네어가 없습니다.");
+        return false;
+    }
+
+    std::stable_sort (out.events.begin(), out.events.end(), [] (const RawEvent& a, const RawEvent& b) { return a.sample < b.sample; });
+    return true;
+}
+
 bool writeRawFormat (const std::vector<RawEvent>& events, const TakeInfo& info, const juce::File& rawMidi,
                      const juce::File& destination, juce::String& error)
 {

@@ -2989,6 +2989,19 @@ void MainComponent::openTakeEditor (const juce::File& takeFolder)
                                     });
         };
 
+        editor->onAddGhosts = [safe] (int amount)
+        {
+            // 약한 스네어(고스트 노트)를 더해 다시 만든다. 박자 맞추기·고친 MIDI를 거친 녹음이면 그 상태 위에 더한다.
+            if (safe != nullptr)
+                safe->beginMidiJob (K ("고스트 노트를 넣는 중…"),
+                                    [amount] (const TakeInfo& info, const juce::File& takeFolder, takemidi::Rebuilt& out, juce::String& error)
+                                    {
+                                        const auto current = TakeFiles::currentMidiIn (takeFolder);
+                                        const auto source = current.existsAsFile() ? current : TakeFiles::rawMidiIn (takeFolder);
+                                        return takemidi::addGhosts (source, info, amount, out, error);
+                                    });
+        };
+
         editor->onRestoreRecordedDrums = [safe]
         {
             if (safe != nullptr)

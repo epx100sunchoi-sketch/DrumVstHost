@@ -684,6 +684,26 @@ private:
                  + (ok && off >= 0.0 && off < 2.0 && again.moved == 0 ? "  [as expected]" : "  [UNEXPECTED: want on grid, moved 0]"));
         }
 
+        {
+            // 고스트 노트 넣기(보통): 세게 친 스네어 앞뒤 빈 16분 자리에 약한 스네어가 더해지고, 기존 음은 그대로여야 한다
+            takemidi::Rebuilt g;
+            const bool ok = takemidi::addGhosts (TakeFiles::rawMidiIn (folder), info, 1, g, e);
+            int quiet = 0, loud = 0;
+
+            for (const auto& ev : g.events)
+            {
+                if (ev.size != 3 || (ev.data[0] & 0xf0) != 0x90 || ev.data[2] == 0 || ev.data[1] != 38)
+                    continue;
+
+                (ev.data[2] <= 30 ? quiet : loud)++;
+            }
+
+            log ("take midi ghosts: " + juce::String (ok ? "ok" : "FAILED " + e) + ", kept " + juce::String (g.kept)
+                 + " added " + juce::String (g.added) + ", quiet snares " + juce::String (quiet) + " loud " + juce::String (loud)
+                 + (ok && g.kept == 74 && g.added == 24 && quiet == 24 && loud == 12
+                        ? "  [as expected]" : "  [UNEXPECTED: want kept 74, 24 ghosts around 12 snares]"));
+        }
+
         folder.deleteRecursively();
     }
 

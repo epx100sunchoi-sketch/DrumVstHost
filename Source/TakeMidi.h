@@ -91,6 +91,11 @@ bool rebuild (const juce::File& takeFolder, const TakeInfo&, const juce::File& e
 // 음 켬·끔만 옮기고(표준 번호로 못 바꾸는 음은 그대로), 하이햇 음에는 원래 치던 때의 페달 값을 바로 앞에 넣는다.
 bool quantizeRaw (const juce::File& sourceMidi, const TakeInfo&, double stepBeats, double strength, Rebuilt&, juce::String& error);
 
+// sourceMidi의 연주에 약한 스네어(고스트 노트)를 더한다. 세기는 세게 친 스네어의 1/4쯤.
+// amount 0: 세게 친 스네어 바로 앞 16분 자리, 1: 앞뒤, 2: 연주가 있는 마디의 빈 16분 자리 전부(8분 자리 사이).
+// 이미 스네어가 있는 자리(둘레 0.2박)에는 넣지 않는다. 기존 음은 하나도 건드리지 않는다.
+bool addGhosts (const juce::File& sourceMidi, const TakeInfo&, int amount, Rebuilt&, juce::String& error);
+
 // events(모듈 음, 샘플 위치)를 rawMidi(연주 원본.mid)와 같은 틀(같은 템포 트랙·틱 기준)로 destination에 쓴다.
 // 다시 만들기가 끝날 때마다 '연주 (고친 뒤).mid'를 이렇게 남겨, 킷만 바꿔 다시 만들어도 고친 박자가 유지되게 한다.
 bool writeRawFormat (const std::vector<RawEvent>& events, const TakeInfo&, const juce::File& rawMidi,
