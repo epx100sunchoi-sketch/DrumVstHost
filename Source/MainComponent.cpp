@@ -1113,6 +1113,7 @@ MainComponent::MainComponent (Engine& engineToUse, juce::PropertiesFile& setting
 MainComponent::~MainComponent()
 {
     stopTimer();
+    midiJob.reset();   // 고친 MIDI로 다시 만드는 중이면 멈추고 기다린다(엔진을 쓰므로 먼저)
     closeTakeEditor();
 
     if (engine.isRecording())
@@ -2785,7 +2786,7 @@ void MainComponent::toggleRecording()
 
     juce::String error;
 
-    if (! engine.startRecording (recordFolder, error))
+    if (! engine.startRecording (recordFolder, error))   // 고친 MIDI로 다시 만드는 중이면 거절한다
     {
         setSongStatus (error, true, 8);
         return;
@@ -2936,6 +2937,22 @@ void MainComponent::openTakeEditor (const juce::File& takeFolder)
         }
 
         safe->setSongStatus ({}, false);
+
+        // 다시 만들기·되돌리기 뒤에 다시 연 창이면, 바꾸던 볼륨·타이밍·구간을 이어 쓴다(파일에는 저장하지 않는다)
+        if (safe->pendingEditState.has_value() && safe->pendingEditFolder == takeFolder)
+        {
+            const auto carried = *safe->pendingEditState;
+            auto& info = take->info;
+            info.edited = carried.edited;
+            info.editDrum = carried.editDrum;
+            info.editSong = carried.editSong;
+            info.editSongDrums = carried.editSongDrums;
+            info.offsetMs = carried.offsetMs;
+            info.trimStart = carried.trimStart;
+            info.trimEnd = carried.trimEnd;
+        }
+
+        safe->pendingEditState.reset();
         safe->engine.setPreview (take);
 
         auto* editor = new TakeEditor (safe->engine, take);
@@ -2945,6 +2962,31 @@ void MainComponent::openTakeEditor (const juce::File& takeFolder)
             if (safe != nullptr)
                 safe->startTakeSeparation();
         };
+
+        editor->onImportMidi = [safe] (const juce::File& file)
+        {
+            if (safe != nullptr)
+                safe->startMidiRebuild (file);
+        };
+
+        editor->onQuantize = [safe] (double stepBeats, double strength)
+        {
+            if (safe != nullptr)
+                safe->startMidiQuantize (stepBeats, strength);
+        };
+
+        editor->onRestoreRecordedDrums = [safe]
+        {
+            if (safe != nullptr)
+                safe->restoreRecordedDrums();
+        };
+
+        if (safe->midiJobBusy && safe->midiJobFolder == takeFolder)
+            editor->showMidiState (safe->midiJobText, false, true);
+        else if (safe->pendingEditMessage.isNotEmpty() && safe->pendingEditFolder == takeFolder)
+            editor->showMidiState (safe->pendingEditMessage, false, false);
+
+        safe->pendingEditMessage.clear();
 
         if (safe->takeSeparationBusy && safe->takeSeparationFolder == takeFolder)   // 창을 닫았다 다시 열었다
             editor->showSeparationState (safe->takeSeparationText, false, true);
@@ -2983,6 +3025,213 @@ void MainComponent::closeTakeEditor()
     engine.setPreview (nullptr);
     takeWindow.reset();
     takeEditor = nullptr;
+}
+
+//==============================================================================
+// 다듬기 창의 '고친 MIDI 불러오기'. 맞추기(TakeMidi)와 다시 만들기(Engine::renderDrumsFromMidi)는 뒤 스레드에서 한다.
+class MainComponent::BackgroundJob final : public juce::Thread
+{
+public:
+    explicit BackgroundJob (std::function<void (BackgroundJob&)> work)
+        : juce::Thread ("midi rebuild"), fn (std::move (work)) {}
+
+    ~BackgroundJob() override   { stopThread (60000); }
+    void run() override         { if (fn != nullptr) fn (*this); }
+
+private:
+    std::function<void (BackgroundJob&)> fn;
+};
+
+void MainComponent::startMidiRebuild (const juce::File& editedMidi)
+{
+    beginMidiJob (K ("고친 MIDI를 원래 연주와 맞추는 중…"),
+                  [editedMidi] (const TakeInfo& info, const juce::File& folder, takemidi::Rebuilt& out, juce::String& error)
+                  {
+                      return takemidi::rebuild (folder, info, editedMidi, out, error);
+                  });
+}
+
+// 다듬기 창 '박자 맞추기': 녹음한 연주를 원곡 박 격자에 끌어당겨, 고친 MIDI와 같은 길로 드럼을 다시 만든다.
+void MainComponent::startMidiQuantize (double stepBeats, double strength)
+{
+    beginMidiJob (K ("박자를 맞추는 중…"),
+                  [stepBeats, strength] (const TakeInfo& info, const juce::File& folder, takemidi::Rebuilt& out, juce::String& error)
+                  {
+                      return takemidi::quantizeRaw (folder, info, stepBeats, strength, out, error);
+                  });
+}
+
+void MainComponent::beginMidiJob (const juce::String& busyText, MidiJobPrepare prepare)
+{
+    if (takeEditor == nullptr || midiJobBusy)
+        return;
+
+    if (engine.isRecording())
+    {
+        takeEditor->showMidiState (K ("녹음 중에는 다시 만들 수 없습니다."), true, false);
+        return;
+    }
+
+    if (engine.getPlugin() == nullptr || engine.isLoadingPlugin())
+    {
+        takeEditor->showMidiState (K ("드럼 VST를 먼저 불러와 주세요. 다시 만들 때는 지금 고른 드럼 VST와 킷을 씁니다."), true, false);
+        return;
+    }
+
+    const auto folder = takeEditor->getTakeFolder();
+    auto& take = takeEditor->getTake();
+    TakeInfo info = take.info;
+    info.sampleRate = take.getSampleRate();
+    info.lengthSamples = take.getLength();
+
+    TakeInfo carry = take.info;
+    takeEditor->captureEditState (carry);
+    takeEditor->stopPreview();
+
+    midiJob.reset();
+    midiJobBusy = true;
+    midiJobFolder = folder;
+    midiJobText = busyText;
+    takeEditor->showMidiState (midiJobText, false, true);
+
+    juce::Component::SafePointer<MainComponent> safe (this);
+    auto shownPercent = std::make_shared<std::atomic<int>> (-1);
+    auto& engineRef = engine;
+
+    midiJob = std::make_unique<BackgroundJob> ([safe, &engineRef, folder, prepare, info, carry, shownPercent] (BackgroundJob& job)
+    {
+        takemidi::Rebuilt rebuilt;
+        juce::String error;
+        bool ok = prepare (info, folder, rebuilt, error);
+        const auto temp = folder.getChildFile ("drums (rebuilding).wav");
+
+        if (ok)
+        {
+            const auto progress = [&job, safe, shownPercent] (double done)
+            {
+                const int percent = juce::jlimit (0, 100, (int) (done * 100.0));
+
+                if (shownPercent->exchange (percent) != percent)
+                    juce::MessageManager::callAsync ([safe, percent]
+                    {
+                        if (safe != nullptr)
+                            safe->showMidiProgress (percent);
+                    });
+
+                return ! job.threadShouldExit();
+            };
+
+            ok = engineRef.renderDrumsFromMidi (rebuilt.events, info.lengthSamples, info.sampleRate, temp, progress, error);
+        }
+
+        if (ok)
+        {
+            // 처음 녹음한 드럼은 한 번만 따로 남긴다(여러 번 다시 만들어도 처음 것)
+            const auto current = TakeFiles::drumIn (folder);
+            const auto recorded = TakeFiles::recordedDrumIn (folder);
+            const bool movedAway = recorded.existsAsFile() ? current.deleteFile()
+                                                           : current.moveFileTo (folder.getChildFile (TakeFiles::recordedDrum()));
+
+            if (! movedAway || ! temp.moveFileTo (current))
+            {
+                ok = false;
+                error = K ("새 드럼 파일로 바꾸지 못했습니다. 녹음 폴더를 다른 프로그램이 쓰고 있는지 확인해 주세요.");
+            }
+        }
+
+        temp.deleteFile();
+
+        auto summary = rebuilt;
+        summary.events = {};
+
+        juce::MessageManager::callAsync ([safe, folder, ok, error, summary, carry]
+        {
+            if (safe != nullptr)
+                safe->finishMidiRebuild (folder, ok, error, summary, carry);
+        });
+    });
+
+    midiJob->startThread();
+}
+
+void MainComponent::showMidiProgress (int percent)
+{
+    if (! midiJobBusy)
+        return;
+
+    midiJobText = K ("드럼을 다시 만드는 중… ") + juce::String (percent) + "%";
+
+    if (takeEditor != nullptr && takeEditor->getTakeFolder() == midiJobFolder)
+        takeEditor->showMidiState (midiJobText, false, true);
+}
+
+void MainComponent::finishMidiRebuild (const juce::File& folder, bool ok, const juce::String& error,
+                                       const takemidi::Rebuilt& summary, const TakeInfo& carry)
+{
+    midiJob.reset();   // 스레드는 이미 끝나 간다
+    midiJobBusy = false;
+    midiJobText.clear();
+    const bool editorOpen = takeEditor != nullptr && takeEditor->getTakeFolder() == folder;
+
+    if (! ok)
+    {
+        if (editorOpen)
+            takeEditor->showMidiState (error, true, false);
+        else
+            setSongStatus (error, true, 10);
+
+        return;
+    }
+
+    auto message = K ("다시 만들었습니다: 그대로 둔 음 ") + juce::String (summary.kept)
+                 + K (", 옮기거나 세기를 바꾼 음 ") + juce::String (summary.moved)
+                 + K (", 더한 음 ") + juce::String (summary.added)
+                 + K (", 뺀 음 ") + juce::String (summary.removed);
+
+    if (summary.ignored > 0)
+        message << K (", 모듈에 없는 악기라 넣지 못한 음 ") << juce::String (summary.ignored);
+
+    if (summary.barOffset != 0)
+        message << K (" (고친 MIDI가 ") << juce::String (std::abs (summary.barOffset)) << K ("마디 어긋나 있어 맞췄습니다)");
+
+    if (editorOpen)
+        reopenTakeEditor (folder, carry, message);
+    else
+        setSongStatus (message, false, 10);
+}
+
+void MainComponent::restoreRecordedDrums()
+{
+    if (takeEditor == nullptr || midiJobBusy)
+        return;
+
+    const auto folder = takeEditor->getTakeFolder();
+    const auto recorded = TakeFiles::recordedDrumIn (folder);
+
+    if (! recorded.existsAsFile())
+        return;
+
+    TakeInfo carry = takeEditor->getTake().info;
+    takeEditor->captureEditState (carry);
+    takeEditor->stopPreview();
+
+    const auto current = TakeFiles::drumIn (folder);
+
+    if (! current.deleteFile() || ! recorded.moveFileTo (current))
+    {
+        takeEditor->showMidiState (K ("되돌리지 못했습니다. 녹음 폴더를 다른 프로그램이 쓰고 있는지 확인해 주세요."), true, false);
+        return;
+    }
+
+    reopenTakeEditor (folder, carry, K ("처음 녹음한 드럼으로 되돌렸습니다."));
+}
+
+void MainComponent::reopenTakeEditor (const juce::File& folder, const TakeInfo& carry, const juce::String& message)
+{
+    pendingEditState = carry;
+    pendingEditFolder = folder;
+    pendingEditMessage = message;
+    openTakeEditor (folder);
 }
 
 //==============================================================================
@@ -3042,6 +3291,26 @@ void MainComponent::startTakeSeparation()
     }
 
     const auto song = TakeFiles::songIn (folder);
+
+    // 이미 분리해 둔 곡(곡 분석 폴더)이면 Demucs를 다시 돌리지 않고 가져다 맞춘다(cutAlignedRestForTake).
+    // 후보: 지금 불러온 곡 + 녹음 정보의 곡 이름으로 시작하는 분석 폴더.
+    juce::Array<juce::File> stemCandidates;
+
+    if (engine.hasSong())
+        if (const auto current = songcache::folderFor (engine.getSongFile()); songcache::hasStems (current))
+            stemCandidates.add (current);
+
+    {
+        TakeInfo takeInfo;
+        takeInfo.load (folder);
+        const auto prefix = juce::File::createLegalFileName (takeInfo.songName).substring (0, 40).trim();
+
+        if (prefix.isNotEmpty())
+            for (const auto& child : songcache::rootFolder().findChildFiles (juce::File::findDirectories, false))
+                if (child.getFileName().startsWith (prefix + " ") && songcache::hasStems (child) && ! stemCandidates.contains (child))
+                    stemCandidates.add (child);
+    }
+
     takeSeparationBusy = true;
     takeSeparationFolder = folder;
     showTakeSeparationState (folder, K ("분리 준비 중…"), false, true);
@@ -3049,7 +3318,7 @@ void MainComponent::startTakeSeparation()
     // 원곡 파일을 읽고(필요하면 44.1kHz로 바꾸고) 나서 분리 도구를 돌린다. 큰 파일이라 뒤에서 한다.
     juce::Component::SafePointer<MainComponent> safe (this);
 
-    juce::Thread::launch ([safe, folder, song]
+    juce::Thread::launch ([safe, folder, song, stemCandidates]
     {
         juce::String error;
         double rate = 0.0;
@@ -3076,6 +3345,25 @@ void MainComponent::startTakeSeparation()
             ok = writeResampledCopy (song, input = work.getChildFile ("input.wav"), 44100.0, error);
         else
             ok = true;
+
+        if (ok)
+        {
+            for (const auto& candidate : stemCandidates)
+            {
+                juce::String detail;
+                const auto reused = work.getChildFile ("no_drums.wav");
+
+                if (cutAlignedRestForTake (input, candidate, reused, detail))
+                {
+                    juce::MessageManager::callAsync ([safe, folder, reused, rate]
+                    {
+                        if (safe != nullptr)
+                            safe->completeTakeSeparation (folder, reused, rate);
+                    });
+                    return;
+                }
+            }
+        }
 
         juce::MessageManager::callAsync ([safe, folder, input, rate, ok, error]
         {
@@ -3115,29 +3403,7 @@ void MainComponent::runTakeSeparation (const juce::File& folder, const juce::Fil
             return;
         }
 
-        safe->showTakeSeparationState (folder, K ("마무리하는 중…"), false, true);
-
-        // 원곡 드럼 = 원곡 − (드럼을 뺀 원곡). 큰 파일이라 뒤에서 만든다.
-        juce::Thread::launch ([safe, folder, work, separated, takeRate]
-        {
-            juce::String error;
-            auto rest = separated;
-            bool ok = true;
-
-            if (std::abs (takeRate - 44100.0) > 0.5)
-                ok = writeResampledCopy (separated, rest = work.getChildFile ("no_drums_take.wav"), takeRate, error);
-
-            if (ok)
-                ok = makeExactDrumStem (TakeFiles::songIn (folder), rest, songDrumsDestination (folder), error);
-
-            work.deleteRecursively();
-
-            juce::MessageManager::callAsync ([safe, folder, ok, error]
-            {
-                if (safe != nullptr)
-                    safe->finishTakeSeparation (folder, ok, ok ? juce::String() : K ("드럼을 분리하지 못했습니다"), error);
-            });
-        });
+        safe->completeTakeSeparation (folder, separated, takeRate);
     };
 
     const juce::StringArray command { getAnalysisPython().getFullPathName(), "-I", "-X", "utf8", "-u",
@@ -3149,6 +3415,35 @@ void MainComponent::runTakeSeparation (const juce::File& folder, const juce::Fil
 
     if (! started)
         finishTakeSeparation (folder, false, K ("드럼을 분리하지 못했습니다"), K ("파이썬을 실행하지 못했습니다."));
+}
+
+// 분리 결과(드럼을 뺀 원곡, 44.1kHz)로 원곡 드럼 = 원곡 − 그것을 만든다. Demucs가 끝났을 때와 분리 재사용 모두 이 길로 온다.
+void MainComponent::completeTakeSeparation (const juce::File& folder, const juce::File& separated, double takeRate)
+{
+    showTakeSeparationState (folder, K ("마무리하는 중…"), false, true);
+    const auto work = takeSeparationWork();
+    juce::Component::SafePointer<MainComponent> safe (this);
+
+    juce::Thread::launch ([safe, folder, work, separated, takeRate]
+    {
+        juce::String error;
+        auto rest = separated;
+        bool ok = true;
+
+        if (std::abs (takeRate - 44100.0) > 0.5)
+            ok = writeResampledCopy (separated, rest = work.getChildFile ("no_drums_take.wav"), takeRate, error);
+
+        if (ok)
+            ok = makeExactDrumStem (TakeFiles::songIn (folder), rest, songDrumsDestination (folder), error);
+
+        work.deleteRecursively();
+
+        juce::MessageManager::callAsync ([safe, folder, ok, error]
+        {
+            if (safe != nullptr)
+                safe->finishTakeSeparation (folder, ok, ok ? juce::String() : K ("드럼을 분리하지 못했습니다"), error);
+        });
+    });
 }
 
 void MainComponent::finishTakeSeparation (const juce::File& folder, bool ok, const juce::String& message, const juce::String& details)

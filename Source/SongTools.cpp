@@ -267,6 +267,301 @@ bool makeExactDrumStem (const juce::File& original, const juce::File& rest, cons
     return true;
 }
 
+juce::File songcache::rootFolder()
+{
+    return dataChild (appFolder(), "곡 분석", "Song analysis");
+}
+
+//==============================================================================
+// '원곡 드럼 분리'의 분리 결과 재사용(SongTools.h 설명). 자리 찾기는 소리를 1/16로 줄여 거칠게 훑고 원래 크기로 다듬는다.
+namespace
+{
+bool readWav44 (const juce::File& file, std::vector<float>& left, std::vector<float>& right, juce::String& why)
+{
+    juce::AudioFormatManager formats;
+    formats.registerBasicFormats();
+    std::unique_ptr<juce::AudioFormatReader> reader (formats.createReaderFor (file));
+
+    if (reader == nullptr || reader->lengthInSamples <= 0)
+    {
+        why = "cannot read " + file.getFileName();
+        return false;
+    }
+
+    if (std::abs (reader->sampleRate - 44100.0) > 0.5)
+    {
+        why = file.getFileName() + " is not 44.1kHz";
+        return false;
+    }
+
+    const int n = (int) juce::jmin<juce::int64> (reader->lengthInSamples, (juce::int64) 44100 * 60 * 30);
+    juce::AudioBuffer<float> buffer (2, n);
+    reader->read (&buffer, 0, n, 0, true, true);
+    left.assign (buffer.getReadPointer (0), buffer.getReadPointer (0) + n);
+    right.assign (buffer.getReadPointer (1), buffer.getReadPointer (1) + n);
+    return true;
+}
+
+std::vector<float> decimated (const std::vector<float>& left, const std::vector<float>& right, int factor)
+{
+    std::vector<float> out;
+    out.reserve (left.size() / (size_t) factor + 1);
+
+    for (size_t i = 0; i + (size_t) factor <= left.size(); i += (size_t) factor)
+    {
+        float sum = 0.0f;
+
+        for (int k = 0; k < factor; ++k)
+            sum += left[i + (size_t) k] + right[i + (size_t) k];
+
+        out.push_back (sum / (2.0f * (float) factor));
+    }
+
+    return out;
+}
+} // namespace
+
+bool cutAlignedRestForTake (const juce::File& takeSong44, const juce::File& cacheFolder,
+                            const juce::File& restOut, juce::String& detail)
+{
+    std::vector<float> takeL, takeR, origL, origR, restL, restR;
+
+    if (! readWav44 (takeSong44, takeL, takeR, detail)
+        || ! readWav44 (songcache::original (cacheFolder), origL, origR, detail)
+        || ! readWav44 (songcache::rest (cacheFolder), restL, restR, detail))
+        return false;
+
+    const auto takeN = (juce::int64) takeL.size();
+    const auto origN = (juce::int64) origL.size();
+
+    if (takeN < 44100 * 2 || origN < 44100 * 2)
+    {
+        detail = "too short";
+        return false;
+    }
+
+    // --- 자리 찾기(거칠게): 녹음에서 소리가 가장 큰 2초 창을 원곡 전체에서 찾는다.
+    constexpr int factor = 16;   // 거친 탐색 비용(원곡 길이 × 창)을 줄인다. 다듬기에서 ±2칸을 다시 본다.
+    const auto takeD = decimated (takeL, takeR, factor);
+    const auto origD = decimated (origL, origR, factor);
+    const int windowD = 2 * 44100 / factor;
+
+    if ((int) takeD.size() < windowD + 1 || (int) origD.size() < windowD + 1)
+    {
+        detail = "too short";
+        return false;
+    }
+
+    int windowStartD = 0;
+    {
+        double energy = 0.0, best = -1.0;
+
+        for (int i = 0; i < windowD; ++i)
+            energy += (double) takeD[(size_t) i] * takeD[(size_t) i];
+
+        for (int s = 0; s + windowD < (int) takeD.size(); ++s)
+        {
+            if (energy > best)
+            {
+                best = energy;
+                windowStartD = s;
+            }
+
+            energy += (double) takeD[(size_t) (s + windowD)] * takeD[(size_t) (s + windowD)]
+                    - (double) takeD[(size_t) s] * takeD[(size_t) s];
+        }
+
+        if (best < 1.0e-6)
+        {
+            detail = "take is silent";
+            return false;
+        }
+    }
+
+    double windowEnergy = 0.0;
+
+    for (int i = 0; i < windowD; ++i)
+        windowEnergy += (double) takeD[(size_t) (windowStartD + i)] * takeD[(size_t) (windowStartD + i)];
+
+    int bestOffsetD = 0;
+    double bestScore = -1.0;
+
+    for (int o = 0; o + windowD <= (int) origD.size(); ++o)
+    {
+        double dot = 0.0, originEnergy = 0.0;
+        const float* a = takeD.data() + windowStartD;
+        const float* b = origD.data() + o;
+
+        for (int i = 0; i < windowD; ++i)
+        {
+            dot += (double) a[i] * b[i];
+            originEnergy += (double) b[i] * b[i];
+        }
+
+        const double score = dot / std::sqrt (juce::jmax (1.0e-12, windowEnergy * originEnergy));
+
+        if (score > bestScore)
+        {
+            bestScore = score;
+            bestOffsetD = o - windowStartD;   // 원곡 위치 = 녹음 위치 + offset
+        }
+    }
+
+    if (bestScore < 0.6)
+    {
+        detail = "no match (score " + juce::String (bestScore, 2) + ")";
+        return false;
+    }
+
+    // --- 자리 다듬기(원래 크기): 거친 자리 주변 ±2칸에서 잔차가 가장 작은 자리
+    juce::int64 offset = (juce::int64) bestOffsetD * factor;
+    {
+        const juce::int64 windowStart = (juce::int64) windowStartD * factor;
+        const int window = 44100;
+        double bestResidual = -1.0;
+        juce::int64 bestFine = offset;
+
+        for (juce::int64 o = offset - 2 * factor; o <= offset + 2 * factor; ++o)
+        {
+            double residual = 0.0;
+
+            for (int i = 0; i < window; ++i)
+            {
+                const juce::int64 t = windowStart + i, s = t + o;
+                const float orig = s >= 0 && s < origN ? origL[(size_t) s] : 0.0f;
+                const double difference = (double) takeL[(size_t) t] - orig;
+                residual += difference * difference;
+            }
+
+            if (bestResidual < 0.0 || residual < bestResidual)
+            {
+                bestResidual = residual;
+                bestFine = o;
+            }
+        }
+
+        offset = bestFine;
+    }
+
+    // --- 구간별 확인: 0.25초 단위로 녹음과 원곡(그 자리)의 잔차를 재서, 맞는 구간만 분리 결과를 쓴다.
+    constexpr int block = 11025;
+    const int blocks = (int) ((takeN + block - 1) / block);
+    std::vector<char> useCache ((size_t) blocks, 0);
+    float peak = 0.0f;
+
+    for (const float v : takeL)
+        peak = juce::jmax (peak, std::abs (v));
+
+    const double quiet = (double) block * (double) peak * (double) peak * 1.0e-6;
+    int loud = 0, loudMatched = 0;
+
+    for (int b = 0; b < blocks; ++b)
+    {
+        const juce::int64 start = (juce::int64) b * block;
+        const int n = (int) juce::jmin<juce::int64> (block, takeN - start);
+        double takeEnergy = 0.0, origEnergy = 0.0, residual = 0.0;
+
+        for (int i = 0; i < n; ++i)
+        {
+            const juce::int64 t = start + i, s = t + offset;
+            const double tv = takeL[(size_t) t];
+            const double ov = s >= 0 && s < origN ? origL[(size_t) s] : 0.0;
+            takeEnergy += tv * tv;
+            origEnergy += ov * ov;
+            residual += (tv - ov) * (tv - ov);
+        }
+
+        const bool bothQuiet = takeEnergy <= quiet && origEnergy <= quiet;
+        const bool matched = bothQuiet || residual <= 0.02 * juce::jmax (takeEnergy, origEnergy);
+        useCache[(size_t) b] = (char) (matched ? 1 : 0);
+
+        if (takeEnergy > quiet)
+        {
+            ++loud;
+            loudMatched += matched ? 1 : 0;
+        }
+    }
+
+    detail = "offset " + juce::String (offset) + " smp (score " + juce::String (bestScore, 2) + "), matched "
+           + juce::String (loudMatched) + "/" + juce::String (loud) + " loud blocks";
+
+    if (loud < 8 || loudMatched < loud * 9 / 10)
+        return false;
+
+    // --- 쓰기: 맞는 구간은 분리 결과(드럼을 뺀 원곡), 아닌 구간은 녹음 그대로(= 원곡 드럼 0). 경계는 10ms 섞는다.
+    const auto partial = restOut.getSiblingFile (restOut.getFileNameWithoutExtension() + ".part.wav");
+    PartialFile guard { partial };
+    auto writer = makeFloatWavWriter (partial, 44100.0);
+
+    if (writer == nullptr)
+    {
+        detail = "cannot write " + restOut.getFileName();
+        return false;
+    }
+
+    const auto restN = (juce::int64) restL.size();
+    const auto sourceAt = [&] (juce::int64 t, bool cache, int channel)
+    {
+        if (! cache)
+            return channel == 0 ? takeL[(size_t) t] : takeR[(size_t) t];
+
+        const juce::int64 s = t + offset;
+
+        if (s < 0 || s >= restN)
+            return 0.0f;
+
+        return channel == 0 ? restL[(size_t) s] : restR[(size_t) s];
+    };
+
+    juce::AudioBuffer<float> out (2, block);
+    constexpr int fade = 441;
+
+    for (int b = 0; b < blocks; ++b)
+    {
+        const juce::int64 start = (juce::int64) b * block;
+        const int n = (int) juce::jmin<juce::int64> (block, takeN - start);
+        const bool cache = useCache[(size_t) b] != 0;
+        const bool previous = b > 0 ? useCache[(size_t) b - 1] != 0 : cache;
+
+        for (int ch = 0; ch < 2; ++ch)
+        {
+            float* p = out.getWritePointer (ch);
+
+            for (int i = 0; i < n; ++i)
+            {
+                const juce::int64 t = start + i;
+
+                if (previous != cache && i < fade)
+                {
+                    const float mix = (float) i / (float) fade;
+                    p[i] = sourceAt (t, previous, ch) * (1.0f - mix) + sourceAt (t, cache, ch) * mix;
+                }
+                else
+                {
+                    p[i] = sourceAt (t, cache, ch);
+                }
+            }
+        }
+
+        if (! writer->writeFromAudioSampleBuffer (out, 0, n))
+        {
+            detail = "cannot write " + restOut.getFileName();
+            return false;
+        }
+    }
+
+    writer.reset();
+
+    if (! partial.moveFileTo (restOut))
+    {
+        detail = "cannot rename " + restOut.getFileName();
+        return false;
+    }
+
+    guard.keep = true;
+    return true;
+}
+
 //==============================================================================
 bool BeatMap::loadJson (const juce::File& file)
 {

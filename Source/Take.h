@@ -9,6 +9,8 @@
 //   원곡 드럼.wav  원곡.wav 안에 들어 있는 원곡 드럼(32비트 실수). 드럼을 분리한 곡을 녹음했거나, 다듬기 창에서
 //                  '원곡 드럼 분리'를 했을 때만 있다. 원곡.wav − 이것 = 드럼을 뺀 원곡.
 //   정보.xml  녹음할 때의 볼륨·지연, 다듬기 창에서 마지막으로 쓴 값
+//   연주.mid · 연주 원본.mid  연주한 MIDI(TakeMidi.h). 이지드러머 등에서 고친 MIDI로 드럼.wav를 다시 만들 수 있다.
+//   드럼 (녹음 그대로).wav  드럼.wav를 고친 MIDI로 다시 만들었을 때만 있다(처음 녹음한 드럼, '녹음 그대로 되돌리기')
 namespace TakeFiles
 {
 // 새로 만들 때의 이름(화면 언어에 따라 한국어·영어)
@@ -17,12 +19,18 @@ inline juce::String drum() { return lang::pick ("드럼.wav", "drums.wav"); }
 inline juce::String song() { return lang::pick ("원곡.wav", "song.wav"); }
 inline juce::String songDrums() { return lang::pick ("원곡 드럼.wav", "song drums.wav"); }
 inline juce::String info() { return lang::pick ("정보.xml", "info.xml"); }
+inline juce::String midi() { return lang::pick ("연주.mid", "performance.mid"); }
+inline juce::String rawMidi() { return lang::pick ("연주 원본.mid", "performance (raw).mid"); }
+inline juce::String recordedDrum() { return lang::pick ("드럼 (녹음 그대로).wav", "drums (as recorded).wav"); }
 
 // 읽을 때: 다른 언어로 녹음한 폴더도 그대로 읽는다.
 inline juce::File drumIn (const juce::File& folder) { return dataChild (folder, "드럼.wav", "drums.wav"); }
 inline juce::File songIn (const juce::File& folder) { return dataChild (folder, "원곡.wav", "song.wav"); }
 inline juce::File songDrumsIn (const juce::File& folder) { return dataChild (folder, "원곡 드럼.wav", "song drums.wav"); }
 inline juce::File infoIn (const juce::File& folder) { return dataChild (folder, "정보.xml", "info.xml"); }
+inline juce::File midiIn (const juce::File& folder) { return dataChild (folder, "연주.mid", "performance.mid"); }
+inline juce::File rawMidiIn (const juce::File& folder) { return dataChild (folder, "연주 원본.mid", "performance (raw).mid"); }
+inline juce::File recordedDrumIn (const juce::File& folder) { return dataChild (folder, "드럼 (녹음 그대로).wav", "drums (as recorded).wav"); }
 }
 
 struct TakeInfo
@@ -33,6 +41,11 @@ struct TakeInfo
     float latencyMs = -1.0f;                      // 녹음할 때의 추정 지연
     juce::String songName;
     juce::Time recordedAt;
+
+    // 연주 MIDI(TakeMidi.h). 틱 0 = 녹음 시각 midiStart초. midiBrand는 DrumModule::Brand(음 번호를 바꾸는 표)
+    bool hasMidi = false, midiFromSong = false;
+    double midiStart = 0.0, midiBpm = 0.0;
+    int midiBrand = 0, midiBeatsPerBar = 4;
 
     // 다듬기 창에서 마지막으로 쓴 값
     bool edited = false;

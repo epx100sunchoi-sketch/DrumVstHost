@@ -364,6 +364,62 @@ private:
 };
 
 //==============================================================================
+//==============================================================================
+// '연주.mid' 표: 끌어서 이지드러머 Song Track·DAW에 놓는다(파일을 넘기는 끌기). 누르면 탐색기에서 그 파일을 보여 준다.
+class TakeEditor::MidiChip final : public juce::Component,
+                                   public juce::SettableTooltipClient
+{
+public:
+    juce::File file;
+
+    void paint (juce::Graphics& g) override
+    {
+        auto area = getLocalBounds().toFloat().reduced (0.5f, 3.5f);
+        g.setColour (hover ? ui::controlHi : ui::control);
+        g.fillRoundedRectangle (area, 6.0f);
+        g.setColour (ui::accent.withAlpha (hover ? 0.9f : 0.6f));
+        g.drawRoundedRectangle (area, 6.0f, 1.2f);
+
+        // 끌 수 있다는 표시(점 여섯 개)
+        g.setColour (ui::textDim);
+        const float x0 = area.getX() + 12.0f, yMid = area.getCentreY();
+
+        for (int column = 0; column < 2; ++column)
+            for (int row = -1; row <= 1; ++row)
+                g.fillEllipse (x0 + column * 5.0f, yMid + row * 5.0f - 1.5f, 3.0f, 3.0f);
+
+        g.setColour (ui::text);
+        g.setFont (ui::font (15.0f, true));
+        g.drawText (file.getFileName(), area.withTrimmedLeft (30.0f).withTrimmedRight (8.0f), juce::Justification::centredLeft, true);
+    }
+
+    void mouseEnter (const juce::MouseEvent&) override   { hover = true; repaint(); }
+    void mouseExit (const juce::MouseEvent&) override    { hover = false; repaint(); }
+
+    void mouseDrag (const juce::MouseEvent& e) override
+    {
+        if (dragging || e.getDistanceFromDragStart() < 6 || ! file.existsAsFile())
+            return;
+
+        dragging = true;
+        juce::Component::SafePointer<MidiChip> safe (this);
+        juce::DragAndDropContainer::performExternalDragDropOfFiles ({ file.getFullPathName() }, false, this, [safe]
+        {
+            if (safe != nullptr)
+                safe->dragging = false;
+        });
+    }
+
+    void mouseUp (const juce::MouseEvent& e) override
+    {
+        if (! e.mouseWasDraggedSinceMouseDown() && file.existsAsFile())
+            file.revealToUser();
+    }
+
+private:
+    bool hover = false, dragging = false;
+};
+
 TakeEditor::TakeEditor (Engine& engineToUse, std::shared_ptr<TakePlayer> takeToUse)
     : engine (engineToUse), take (std::move (takeToUse))
 {
@@ -503,6 +559,35 @@ TakeEditor::TakeEditor (Engine& engineToUse, std::shared_ptr<TakePlayer> takeToU
     saveButton.onClick = [this] { exportFinal(); };
     addAndMakeVisible (saveButton);
 
+    // 연주 MIDI: 이지드러머 등으로 끌어가 고친 뒤 다시 불러온다
+    midiChip = std::make_unique<MidiChip>();
+    midiChip->file = TakeFiles::midiIn (take->getFolder());
+    midiChip->setTooltip (K ("이지드러머 Song Track이나 DAW로 끌어다 놓으세요. 친 음을 표준 드럼 음 번호(GM)로, 원곡 박자를 템포로 적은 MIDI입니다. 누르면 폴더에서 보여 줍니다."));
+    addChildComponent (*midiChip);
+
+    quantizeButton.setButtonText (K ("박자 맞추기…"));
+    styleButton (quantizeButton, K ("친 음을 원곡 박 격자(8분·16분음표)에 가까워지게 옮기고, 지금 고른 드럼 VST로 드럼을 다시 만듭니다. 기준은 처음 녹음한 연주이고, 림·엣지·하이햇 페달은 그대로 둡니다."));
+    quantizeButton.onClick = [this] { showQuantizeMenu(); };
+    addChildComponent (quantizeButton);
+
+    importMidiButton.setButtonText (K ("고친 MIDI 불러오기…"));
+    styleButton (importMidiButton, K ("이지드러머 등에서 고친 MIDI 파일로 드럼 소리를 다시 만듭니다. 지금 고른 드럼 VST와 킷을 씁니다. 고친 MIDI를 이 창에 끌어다 놓아도 됩니다."));
+    importMidiButton.onClick = [this] { chooseEditedMidi(); };
+    addChildComponent (importMidiButton);
+
+    restoreDrumsButton.setButtonText (K ("녹음 그대로 되돌리기"));
+    styleButton (restoreDrumsButton, K ("고친 MIDI로 다시 만들기 전의 드럼(처음 녹음한 소리)으로 되돌립니다."));
+    restoreDrumsButton.onClick = [this]
+    {
+        if (onRestoreRecordedDrums != nullptr)
+            onRestoreRecordedDrums();
+    };
+    addChildComponent (restoreDrumsButton);
+
+    styleLabel (midiStatus, 14.0f, ui::textDim);
+    addAndMakeVisible (midiStatus);
+    updateMidiRow();
+
     // 처음 값 적용
     applyVolumes();
     applyTiming();
@@ -517,7 +602,7 @@ TakeEditor::TakeEditor (Engine& engineToUse, std::shared_ptr<TakePlayer> takeToU
     rangeChanged();
     setStatus (K ("볼륨과 타이밍을 맞춘 뒤 '완성본 저장'을 누르세요. 저장하지 않고 닫으면 바꾼 값은 남지 않습니다."), false);
 
-    setSize (editorWidth, 656);
+    setSize (editorWidth, 786);
     startTimerHz (30);
 }
 
@@ -566,7 +651,12 @@ void TakeEditor::attachSeparatedSongDrums (const juce::File& songDrumsFile)
 
 void TakeEditor::saveEditState()
 {
-    auto& info = take->info;
+    captureEditState (take->info);
+    take->info.save (take->getFolder());
+}
+
+void TakeEditor::captureEditState (TakeInfo& info) const
+{
     info.edited = true;
     info.editDrum = (float) (drumVolume->getValue() / 100.0);
     info.editSong = (float) (songVolume->getValue() / 100.0);
@@ -580,8 +670,138 @@ void TakeEditor::saveEditState()
 
     if (info.lengthSamples <= 0)
         info.lengthSamples = take->getLength();
+}
 
-    info.save (take->getFolder());
+//============================================================================== 연주 MIDI
+void TakeEditor::updateMidiRow()
+{
+    const auto& folder = take->getFolder();
+    const auto& info = take->info;
+    const bool hasMidi = info.hasMidi && TakeFiles::rawMidiIn (folder).existsAsFile();
+    const bool hasGmFile = hasMidi && TakeFiles::midiIn (folder).existsAsFile();
+
+    midiChip->file = TakeFiles::midiIn (folder);
+    midiChip->setVisible (hasGmFile);
+    quantizeButton.setVisible (hasMidi);
+    quantizeButton.setEnabled (! midiBusy);
+    importMidiButton.setVisible (hasMidi);
+    importMidiButton.setEnabled (! midiBusy);
+    restoreDrumsButton.setVisible (TakeFiles::recordedDrumIn (folder).existsAsFile());
+    restoreDrumsButton.setEnabled (! midiBusy);
+
+    if (! hasMidi)
+    {
+        midiTempoText = {};
+        midiHintText = K ("이 녹음에는 연주 MIDI가 없습니다. 0.2.4부터는 녹음할 때 연주 MIDI도 함께 남습니다.");
+    }
+    else
+    {
+        const auto bars = juce::String (info.midiBeatsPerBar) + "/4";
+
+        midiTempoText = info.midiFromSong
+                            ? K ("원곡 박자로 적음 · 약 ") + juce::String (juce::roundToInt (info.midiBpm)) + " BPM · " + bars
+                            : K ("원곡 박자를 몰라 120 BPM으로 적음");
+
+        midiHintText = "'" + midiChip->file.getFileName()
+                     + K ("' 파일을 이지드러머 Song Track에 끌어다 놓고 박자를 맞추거나(Quantize) 고스트 노트를 넣은 뒤, 고친 MIDI를 이 창에 끌어다 놓으세요. ")
+                     + K ("원래 친 음과 짝지어 림·엣지·하이햇 페달은 그대로 살립니다.");
+
+        if (! info.midiFromSong)
+            midiHintText += K (" 원곡에 맞춰 고치려면 메트로놈(박자 분석)을 켠 곡으로 녹음하세요.");
+    }
+
+    resized();
+    repaint();
+}
+
+void TakeEditor::showMidiState (const juce::String& text, bool isError, bool busy)
+{
+    midiBusy = busy;
+    midiStatus.setColour (juce::Label::textColourId, isError ? ui::red : ui::textDim);
+    midiStatus.setText (text, juce::dontSendNotification);
+    midiStatus.setTooltip (isError ? text : juce::String());
+    saveButton.setEnabled (! busy);
+    updateMidiRow();
+}
+
+void TakeEditor::showQuantizeMenu()
+{
+    if (midiBusy || onQuantize == nullptr)
+        return;
+
+    // 격자(8분·16분·8분 셋잇단) × 세기. 세기 100%는 격자에 딱, 낮을수록 조금만 끌어당긴다.
+    juce::PopupMenu menu;
+    menu.addSectionHeader (K ("어느 격자에 끌어당길까요?"));
+    static constexpr double steps[] = { 0.5, 0.25, 1.0 / 3.0 };
+    static constexpr int strengths[] = { 100, 75, 50 };
+    const char* names[] = { "8분음표", "16분음표", "8분음표 셋잇단" };
+
+    for (int g = 0; g < 3; ++g)
+    {
+        juce::PopupMenu sub;
+
+        for (int s = 0; s < 3; ++s)
+            sub.addItem (100 + g * 10 + s, K ("세기 ") + juce::String (strengths[s]) + "%"
+                                             + (strengths[s] == 100 ? K (" (격자에 딱 맞춤)") : juce::String()));
+
+        menu.addSubMenu (K (names[g]), sub);
+    }
+
+    juce::Component::SafePointer<TakeEditor> safe (this);
+
+    menu.showMenuAsync (juce::PopupMenu::Options().withTargetComponent (quantizeButton), [safe] (int result)
+    {
+        if (safe == nullptr || result < 100 || safe->midiBusy || safe->onQuantize == nullptr)
+            return;
+
+        const int g = (result - 100) / 10, s = (result - 100) % 10;
+
+        if (g >= 0 && g < 3 && s >= 0 && s < 3)
+            safe->onQuantize (steps[g], strengths[s] / 100.0);
+    });
+}
+
+void TakeEditor::chooseEditedMidi()
+{
+    if (midiBusy)
+        return;
+
+    midiChooser = std::make_unique<juce::FileChooser> (K ("고친 MIDI 파일 고르기"),
+                                                       juce::File::getSpecialLocation (juce::File::userDesktopDirectory),
+                                                       "*.mid;*.midi");
+    juce::Component::SafePointer<TakeEditor> safe (this);
+
+    midiChooser->launchAsync (juce::FileBrowserComponent::openMode | juce::FileBrowserComponent::canSelectFiles,
+                              [safe] (const juce::FileChooser& chooser)
+                              {
+                                  if (safe == nullptr)
+                                      return;
+
+                                  const auto file = chooser.getResult();
+
+                                  if (file.existsAsFile() && safe->onImportMidi != nullptr)
+                                      safe->onImportMidi (file);
+                              });
+}
+
+bool TakeEditor::isInterestedInFileDrag (const juce::StringArray& files)
+{
+    return files.size() == 1 && juce::File (files[0]).hasFileExtension ("mid;midi") && take->info.hasMidi;
+}
+
+void TakeEditor::filesDropped (const juce::StringArray& files, int, int)
+{
+    if (midiBusy || files.isEmpty())
+        return;
+
+    const juce::File file (files[0]);
+
+    // 이 녹음의 연주.mid를 그대로 다시 놓은 경우(끌어가다 이 창에 놓음)는 무시한다
+    if (file == TakeFiles::midiIn (take->getFolder()) || file == TakeFiles::rawMidiIn (take->getFolder()))
+        return;
+
+    if (onImportMidi != nullptr)
+        onImportMidi (file);
 }
 
 void TakeEditor::runSnapshotDemo()
@@ -771,6 +991,15 @@ void TakeEditor::paint (juce::Graphics& g)
     g.setFont (ui::font (14.0f));
     g.drawText (K ("드럼이 원곡보다 늦게(밀려) 들리면 − 쪽으로, 급하게(당겨) 들리면 + 쪽으로 옮기세요."),
                 hintArea, juce::Justification::centredLeft);
+
+    g.setColour (ui::text);
+    g.setFont (ui::font (17.0f, true));
+    g.drawText (K ("연주 MIDI 고치기"), midiTitleArea, juce::Justification::centredLeft);
+
+    g.setColour (ui::textDim);
+    g.setFont (ui::font (14.0f));
+    g.drawText (midiTempoText, midiTitleArea, juce::Justification::centredRight);
+    g.drawFittedText (midiHintText, midiHintArea, juce::Justification::centredLeft, 2, 1.0f);
 }
 
 void TakeEditor::resized()
@@ -840,6 +1069,37 @@ void TakeEditor::resized()
 
     y += 32 + 12;
     dividers[2] = y;
+    y += 14;
+
+    midiTitleArea = { pad, y, width, 24 };
+    y += 24 + 6;
+
+    {
+        juce::Rectangle<int> row (pad, y, width, 40);
+
+        if (midiChip->isVisible())
+        {
+            midiChip->setBounds (row.removeFromLeft (170));
+            row.removeFromLeft (8);
+            quantizeButton.setBounds (row.removeFromLeft (140).withSizeKeepingCentre (140, 34));
+            row.removeFromLeft (8);
+            importMidiButton.setBounds (row.removeFromLeft (180).withSizeKeepingCentre (180, 34));
+            row.removeFromLeft (8);
+        }
+
+        if (restoreDrumsButton.isVisible())
+        {
+            restoreDrumsButton.setBounds (row.removeFromLeft (170).withSizeKeepingCentre (170, 34));
+            row.removeFromLeft (10);
+        }
+
+        midiStatus.setBounds (row);
+    }
+
+    y += 40 + 4;
+    midiHintArea = { pad, y, width, 34 };
+    y += 34 + 12;
+    dividers[3] = y;
     y += 14;
 
     {

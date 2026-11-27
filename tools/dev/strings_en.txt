@@ -421,3 +421,54 @@ ms 빠르게 했습니다. 탐을 쳐 보고 자글거리면 한 단계 낮추�
 ms 빠르게(실험) 쓰는 중: 탐을 칠 때 자글거리면 한 단계 낮추세요	 ms faster (experimental): if the toms crackle, go one step lower
 · 드라이버 여유: Low Latency보다\s	· Driver margin:\s
 ms 짧게(더 빠르게, 실험)	 ms shorter than Low Latency (Faster, experimental)
+고친 MIDI로 드럼을 다시 만드는 중에는 드럼 VST를 바꿀 수 없습니다. 끝난 뒤에 다시 골라 주세요.	You cannot change the drum VST while the drums are being rebuilt from edited MIDI. Choose it again when it is done.
+고친 MIDI로 드럼을 다시 만드는 중입니다. 끝난 뒤에 녹음해 주세요.	The drums are being rebuilt from edited MIDI. Record when it is done.
+드럼 VST를 먼저 불러와 주세요. 다시 만들 때는 지금 고른 드럼 VST와 킷을 씁니다.	Load a drum VST first. Rebuilding uses the drum VST and kit chosen now.
+소리 장치가 열려 있어야 다시 만들 수 있습니다.	The audio device has to be open to rebuild the drums.
+녹음할 때와 지금 소리 장치의 샘플레이트가 달라 다시 만들 수 없습니다(녹음\s	Cannot rebuild: the audio device's sample rate is not the one this take was recorded at (recorded at\s
+ Hz, 지금\s	 Hz, now\s
+녹음 중에는 다시 만들 수 없습니다.	You cannot rebuild the drums while recording.
+이미 다시 만드는 중입니다.	Already rebuilding.
+드럼 파일을 쓸 수 없습니다:\s	Cannot write the drum file:\s
+다시 만드는 중에 드럼 VST가 바뀌어 멈췄습니다.	Stopped: the drum VST changed while rebuilding.
+다시 만들기를 멈췄습니다.	Rebuilding stopped.
+고친 MIDI를 원래 연주와 맞추는 중…	Matching the edited MIDI to what you played…
+새 드럼 파일로 바꾸지 못했습니다. 녹음 폴더를 다른 프로그램이 쓰고 있는지 확인해 주세요.	Could not swap in the new drum file. Check whether another program is using the take folder.
+드럼을 다시 만드는 중…\s	Rebuilding the drums…\s
+다시 만들었습니다: 그대로 둔 음\s	Rebuilt: notes unchanged\s
+, 옮기거나 세기를 바꾼 음\s	, moved or velocity changed\s
+, 더한 음\s	, added\s
+, 뺀 음\s	, removed\s
+, 모듈에 없는 악기라 넣지 못한 음\s	, left out (instrument not on the module)\s
+ (고친 MIDI가\s	 (the edited MIDI was\s
+마디 어긋나 있어 맞췄습니다)	 bars off; realigned)
+되돌리지 못했습니다. 녹음 폴더를 다른 프로그램이 쓰고 있는지 확인해 주세요.	Could not restore. Check whether another program is using the take folder.
+처음 녹음한 드럼으로 되돌렸습니다.	Restored the drums as first recorded.
+이지드러머 Song Track이나 DAW로 끌어다 놓으세요. 친 음을 표준 드럼 음 번호(GM)로, 원곡 박자를 템포로 적은 MIDI입니다. 누르면 폴더에서 보여 줍니다.	Drag this into the EZdrummer Song Track or a DAW. It is what you played as MIDI, with standard drum note numbers (GM) and the song's beats as the tempo. Click to show it in its folder.
+고친 MIDI 불러오기…	Load edited MIDI…
+이지드러머 등에서 고친 MIDI 파일로 드럼 소리를 다시 만듭니다. 지금 고른 드럼 VST와 킷을 씁니다. 고친 MIDI를 이 창에 끌어다 놓아도 됩니다.	Rebuilds the drum sound from a MIDI file edited in EZdrummer or elsewhere, using the drum VST and kit chosen now. You can also drop the edited MIDI onto this window.
+녹음 그대로 되돌리기	Back to as recorded
+고친 MIDI로 다시 만들기 전의 드럼(처음 녹음한 소리)으로 되돌립니다.	Goes back to the drums as first recorded, before they were rebuilt from edited MIDI.
+이 녹음에는 연주 MIDI가 없습니다. 0.2.4부터는 녹음할 때 연주 MIDI도 함께 남습니다.	This take has no performance MIDI. From version 0.2.4 on, every take also saves the MIDI of what you played.
+원곡 박자로 적음 · 약\s	Written to the song's beats · about\s
+원곡 박자를 몰라 120 BPM으로 적음	Song beats unknown, written at 120 BPM
+' 파일을 이지드러머 Song Track에 끌어다 놓고 박자를 맞추거나(Quantize) 고스트 노트를 넣은 뒤, 고친 MIDI를 이 창에 끌어다 놓으세요.\s	': drag it into the EZdrummer Song Track, fix the timing (Quantize) or add ghost notes, then drop the edited MIDI onto this window.\s
+원래 친 음과 짝지어 림·엣지·하이햇 페달은 그대로 살립니다.	Notes are matched to what you played, so rims, edges and the hi-hat pedal stay as they were.
+ 원곡에 맞춰 고치려면 메트로놈(박자 분석)을 켠 곡으로 녹음하세요.	 To fix it against the song, record with a song that has the metronome (beat analysis) on.
+고친 MIDI 파일 고르기	Choose the edited MIDI file
+연주 MIDI 고치기	Edit performance MIDI
+MIDI 파일을 쓸 수 없습니다:\s	Cannot write the MIDI file:\s
+MIDI 파일을 읽을 수 없습니다:\s	Cannot read the MIDI file:\s
+박자 단위가 아닌(SMPTE) MIDI 파일은 읽을 수 없습니다:\s	MIDI files timed in SMPTE (not in beats) cannot be read:\s
+녹음 정보(정보.xml)를 읽을 수 없습니다.	Cannot read the take information (info.xml).
+이 녹음에는 연주 원본 MIDI가 없습니다.	This take has no raw performance MIDI.
+고친 MIDI에 음이 하나도 없습니다.	The edited MIDI has no notes.
+박자를 맞추는 중…	Fixing the timing…
+박자 맞추기…	Fix timing…
+친 음을 원곡 박 격자(8분·16분음표)에 가까워지게 옮기고, 지금 고른 드럼 VST로 드럼을 다시 만듭니다. 기준은 처음 녹음한 연주이고, 림·엣지·하이햇 페달은 그대로 둡니다.	Pulls your hits toward the song's beat grid (8th or 16th notes) and rebuilds the drums with the drum VST chosen now. It starts from the performance as first recorded; rims, edges and the hi-hat pedal stay as they were.
+어느 격자에 끌어당길까요?	Pull the hits toward which grid?
+8분음표	8th notes
+16분음표	16th notes
+8분음표 셋잇단	8th-note triplets
+세기\s	Strength\s
+ (격자에 딱 맞춤)	 (exactly on the grid)

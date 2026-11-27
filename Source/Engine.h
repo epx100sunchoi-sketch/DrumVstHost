@@ -5,6 +5,7 @@
 #include "Dsp.h"
 #include "SongTools.h"
 #include "Take.h"
+#include "TakeMidi.h"
 
 class StemPairSource;   // Engine.cpp
 
@@ -79,7 +80,11 @@ public:
 
     // 오디오 스레드. 쌓인 신호를 delayMs만큼 늦춰 블록에 놓고, 가장 오래 기다린 시간(ms)을 돌려준다(없으면 -1).
     // now는 이 콜백이 시작된 시각(Time::getMillisecondCounterHiRes)이다.
-    double drainInto (juce::MidiBuffer& destination, int numSamples, double sampleRate, double delayMs, double now) noexcept;
+    // raw가 있으면 같은 자리에 패드 배치 전(모듈이 보낸 음 번호) 신호도 놓는다(녹음의 연주 MIDI).
+    double drainInto (juce::MidiBuffer& destination, juce::MidiBuffer* raw, int numSamples, double sampleRate, double delayMs, double now) noexcept;
+
+    // 모듈 음 번호를 지금 패드 배치대로 바꾼다(다시 만들기). 넘기지 않는 음이면 false.
+    bool mapForPlugin (juce::uint8* data, int size) const noexcept;
 
 private:
     struct Event
@@ -87,6 +92,7 @@ private:
         double time = 0.0;
         juce::uint8 data[3] {};
         juce::uint8 size = 0;
+        juce::uint8 rawNote = 0;   // 패드 배치 전 음 번호(음 신호일 때)
     };
 
     static constexpr int capacity = 2048;
@@ -282,6 +288,13 @@ public:
     double getRecordedSeconds() const noexcept;
     const juce::File& getLastTakeFolder() const noexcept           { return lastTakeFolder; }
 
+    // 고친 연주 MIDI로 드럼 소리를 다시 만든다(TakeMidi.h). 뒤 스레드에서 부른다. 지금 불러온 드럼 VST와 킷, 패드 배치,
+    // 드럼 채널 EQ·컴프레서를 그대로 써서 녹음할 때와 같은 자리(플러그인 지연 포함)에 놓는다. 그동안 패드 소리는 나지 않는다.
+    // progress(0..1)가 false를 돌려주면 멈춘다. 녹음할 때와 소리 장치의 샘플레이트가 같아야 한다.
+    bool renderDrumsFromMidi (const std::vector<takemidi::RawEvent>& events, juce::int64 lengthSamples, double takeSampleRate,
+                              const juce::File& destination, const std::function<bool (double)>& progress, juce::String& error);
+    bool isRenderingDrums() const noexcept                          { return renderingDrums.load(); }
+
     //============================================================================== 녹음 다듬기 미리 듣기
     void setPreview (std::shared_ptr<TakePlayer>);
     TakePlayer* getPreview() const noexcept                        { return preview; }
@@ -367,7 +380,7 @@ private:
 
     // MIDI
     MidiInbox midiInbox;
-    juce::MidiBuffer incomingMidi, chunkMidi, uiMidi;
+    juce::MidiBuffer incomingMidi, incomingRaw, chunkMidi, uiMidi;
     juce::SpinLock uiMidiLock;
     std::atomic<juce::uint32> midiNoteCount { 0 };
     std::atomic<float> maxMidiWaitMs { 0.0f };
@@ -476,6 +489,23 @@ private:
     double recordSampleRate = 0.0;
     juce::File recordFolder, lastTakeFolder;
     TakeInfo recordInfo;
+
+    // 녹음의 연주 MIDI: 오디오 스레드가 recordLock 안에서 미리 잡아 둔 칸에 채우고, 녹음을 멈춘 뒤 메시지 스레드가 파일로 쓴다.
+    // 칸이 모자라면 그 뒤 신호는 버린다(26만 개: 1초에 100개씩 40분 넘게).
+    static constexpr size_t recMidiCapacity = 1 << 18, recSpanCapacity = 4096;
+    std::vector<takemidi::RawEvent> recMidi;
+    std::vector<takemidi::SongSpan> recSpans;
+    size_t recMidiCount = 0, recSpanCount = 0;
+    double recLastSongTime = 0.0;
+    int recLastChunk = 0;
+    bool recLastRolling = false, recSpanStarted = false;
+    BeatMap recBeats;                        // 녹음을 시작할 때의 원곡 박
+    double recClickOffset = 0.0, recGridShift = 0.0;
+    DrumModule::Brand recBrand = DrumModule::Brand::none;
+    void writeRecordedMidi();
+
+    // 다시 만들기(renderDrumsFromMidi) 중에는 오디오 스레드가 플러그인을 건너뛴다.
+    std::atomic<bool> renderingDrums { false };
 
     // 저장돼 있던 값(시작할 때 화면이 가져다 쓴다)
     juce::String savedPluginPath, savedSongPath;

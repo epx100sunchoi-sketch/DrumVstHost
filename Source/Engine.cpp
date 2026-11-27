@@ -266,6 +266,7 @@ void MidiInbox::receive (const juce::MidiMessage& message, double time)
     event.time = time;
     event.size = (juce::uint8) size;
     std::memcpy (event.data, message.getRawData(), (size_t) size);
+    event.rawNote = size >= 2 ? event.data[1] : 0;
 
     if (mapped != keepNote)
         event.data[1] = mapped;
@@ -273,7 +274,7 @@ void MidiInbox::receive (const juce::MidiMessage& message, double time)
     fifo.finishedWrite (1);
 }
 
-double MidiInbox::drainInto (juce::MidiBuffer& destination, int numSamples, double sampleRate, double delayMs, double now) noexcept
+double MidiInbox::drainInto (juce::MidiBuffer& destination, juce::MidiBuffer* raw, int numSamples, double sampleRate, double delayMs, double now) noexcept
 {
     const int ready = fifo.getNumReady();
 
@@ -336,10 +337,41 @@ double MidiInbox::drainInto (juce::MidiBuffer& destination, int numSamples, doub
         const int pos = juce::jlimit (lastPos, lastIndex, juce::roundToInt ((event.time - reference) * 0.001 * sampleRate));
         lastPos = pos;
         destination.addEvent (event.data, (int) event.size, pos);
+
+        if (raw != nullptr)
+        {
+            juce::uint8 original[3] { event.data[0], event.data[1], event.data[2] };
+
+            if (event.size >= 2)
+                original[1] = event.rawNote;
+
+            raw->addEvent (original, (int) event.size, pos);
+        }
     }
 
     fifo.finishedRead (total);
     return waited;
+}
+
+bool MidiInbox::mapForPlugin (juce::uint8* data, int size) const noexcept
+{
+    if (size != 3)
+        return true;
+
+    const int status = data[0] & 0xf0;
+
+    if ((status == 0x90 || status == 0x80 || status == 0xa0) && data[1] < 128 && noteMapOn.load (std::memory_order_relaxed))
+    {
+        const auto to = noteMap[data[1]].load (std::memory_order_relaxed);
+
+        if (to == dropNote)
+            return false;
+
+        if (to < 128)
+            data[1] = to;
+    }
+
+    return true;
 }
 
 //==============================================================================
@@ -380,6 +412,7 @@ Engine::Engine (bool openAudioDevice, juce::PropertiesFile* settings)
     song.volume = 0.7f;
 
     incomingMidi.ensureSize (4096);
+    incomingRaw.ensureSize (4096);
     chunkMidi.ensureSize (4096);
     uiMidi.ensureSize (1024);
 
@@ -844,6 +877,12 @@ bool Engine::loadPlugin (const juce::String& pathToLoad, const juce::MemoryBlock
     if (pluginLoadInProgress)
     {
         error = K ("다른 플러그인을 불러오는 중입니다. 잠시 뒤에 다시 골라 주세요.");
+        return false;
+    }
+
+    if (renderingDrums.load())
+    {
+        error = K ("고친 MIDI로 드럼을 다시 만드는 중에는 드럼 VST를 바꿀 수 없습니다. 끝난 뒤에 다시 골라 주세요.");
         return false;
     }
 
@@ -1473,6 +1512,12 @@ void Engine::setPosition (double seconds)
 //==============================================================================
 bool Engine::startRecording (const juce::File& parentFolder, juce::String& error)
 {
+    if (renderingDrums.load())
+    {
+        error = K ("고친 MIDI로 드럼을 다시 만드는 중입니다. 끝난 뒤에 녹음해 주세요.");
+        return false;
+    }
+
     stopRecording();
 
     if (preview != nullptr)
@@ -1537,6 +1582,26 @@ bool Engine::startRecording (const juce::File& parentFolder, juce::String& error
     recordInfo.songName   = hasSong() ? songFile.getFileNameWithoutExtension() : juce::String();
     recordInfo.recordedAt = juce::Time::getCurrentTime();
 
+    // 연주 MIDI: 칸을 미리 잡고 원곡 박·메트로놈 시점·지연·모듈 종류를 적어 둔다(오디오 스레드는 아직 쓰지 않는다)
+    recMidi.assign (recMidiCapacity, {});
+    recSpans.assign (recSpanCapacity, {});
+    recMidiCount = 0;
+    recSpanCount = 0;
+    recSpanStarted = false;
+    recLastRolling = false;
+    recLastSongTime = 0.0;
+    recLastChunk = 0;
+
+    {
+        const juce::SpinLock::ScopedLockType lock (beatLock);
+        recBeats = beatMapValid.load() ? beatMap : BeatMap();
+    }
+
+    recClickOffset = metronomeOffsetMs.load() / 1000.0;
+    const auto latency = getLatencyBreakdown();
+    recGridShift = latency.isValid() ? latency.toMs (latency.buffer + latency.driverExtra + latency.midiWait) / 1000.0 : 0.0;
+    recBrand = identifyDrumModule (midiInputDevices).brand;
+
     mixWriter  = std::move (newMix);
     drumWriter = std::move (newDrum);
     songWriter = std::move (newSong);
@@ -1579,6 +1644,7 @@ void Engine::stopRecording()
     if (wasRecording && recordFolder != juce::File())
     {
         recordInfo.lengthSamples = recordedSamples.load();
+        writeRecordedMidi();
         recordInfo.save (recordFolder);
         lastTakeFolder = recordFolder;
     }
@@ -1589,6 +1655,220 @@ void Engine::stopRecording()
 double Engine::getRecordedSeconds() const noexcept
 {
     return recordSampleRate > 0.0 ? (double) recordedSamples.load() / recordSampleRate : 0.0;
+}
+
+// 녹음을 멈춘 뒤(오디오 스레드가 더는 쓰지 않을 때) 연주 MIDI를 녹음 폴더에 쓴다. 친 음이 없으면 쓰지 않는다.
+void Engine::writeRecordedMidi()
+{
+    takemidi::Recording r;
+    r.sampleRate = recordSampleRate;
+    r.lengthSamples = recordInfo.lengthSamples;
+    r.brand = recBrand;
+    r.events.assign (recMidi.begin(), recMidi.begin() + (std::ptrdiff_t) juce::jmin (recMidiCount, recMidi.size()));
+    r.spans.assign (recSpans.begin(), recSpans.begin() + (std::ptrdiff_t) juce::jmin (recSpanCount, recSpans.size()));
+    r.beats = recBeats;
+    r.clickOffsetSeconds = recClickOffset;
+    r.gridShiftSeconds = recGridShift;
+
+    std::vector<takemidi::RawEvent>().swap (recMidi);   // 녹음 동안 잡아 둔 칸을 돌려준다
+    std::vector<takemidi::SongSpan>().swap (recSpans);
+    recMidiCount = recSpanCount = 0;
+
+    takemidi::Written written;
+    juce::String error;
+
+    if (takemidi::writeTakeMidi (r, recordFolder, written, error))
+    {
+        recordInfo.hasMidi = true;
+        recordInfo.midiStart = written.startSeconds;
+        recordInfo.midiBpm = written.bpm;
+        recordInfo.midiBrand = (int) r.brand;
+        recordInfo.midiBeatsPerBar = written.beatsPerBar;
+        recordInfo.midiFromSong = written.fromSong;
+    }
+    else if (error.isNotEmpty())
+    {
+        DBG (error);
+    }
+}
+
+bool Engine::renderDrumsFromMidi (const std::vector<takemidi::RawEvent>& events, juce::int64 lengthSamples, double takeSampleRate,
+                                  const juce::File& destination, const std::function<bool (double)>& progress, juce::String& error)
+{
+    if (plugin == nullptr)
+    {
+        error = K ("드럼 VST를 먼저 불러와 주세요. 다시 만들 때는 지금 고른 드럼 VST와 킷을 씁니다.");
+        return false;
+    }
+
+    if (sampleRate <= 0.0 || maxBlock <= 0)
+    {
+        error = K ("소리 장치가 열려 있어야 다시 만들 수 있습니다.");
+        return false;
+    }
+
+    if (std::abs (takeSampleRate - sampleRate) > 0.5)
+    {
+        error = K ("녹음할 때와 지금 소리 장치의 샘플레이트가 달라 다시 만들 수 없습니다(녹음 ") + juce::String (takeSampleRate, 0)
+              + K (" Hz, 지금 ") + juce::String (sampleRate, 0) + " Hz).";
+        return false;
+    }
+
+    if (isRecording())
+    {
+        error = K ("녹음 중에는 다시 만들 수 없습니다.");
+        return false;
+    }
+
+    if (renderingDrums.exchange (true))
+    {
+        error = K ("이미 다시 만드는 중입니다.");
+        return false;
+    }
+
+    // 이제 오디오 스레드는 플러그인을 건너뛴다. 이미 처리 중인 블록이 끝나기를 기다린다.
+    { const juce::SpinLock::ScopedLockType lock (pluginLock); }
+
+    const auto finish = [this] (juce::AudioPluginInstance* used)
+    {
+        {
+            const juce::SpinLock::ScopedLockType lock (pluginLock);
+
+            if (used != nullptr && plugin.get() == used)
+            {
+                used->setNonRealtime (false);
+                used->reset();
+            }
+        }
+
+        renderingDrums = false;
+    };
+
+    juce::AudioPluginInstance* used = nullptr;
+    int channels = 0;
+    std::vector<OutBus> buses;
+
+    {
+        const juce::SpinLock::ScopedLockType lock (pluginLock);
+        used = plugin.get();
+        channels = pluginBuffer.getNumChannels();
+        buses = pluginBuses;
+
+        if (used != nullptr)
+        {
+            used->setNonRealtime (true);   // 디스크에서 샘플을 읽는 플러그인도 빠짐없이 내게
+            used->reset();
+        }
+    }
+
+    if (used == nullptr || channels <= 0)
+    {
+        finish (used);
+        error = K ("드럼 VST를 먼저 불러와 주세요. 다시 만들 때는 지금 고른 드럼 VST와 킷을 씁니다.");
+        return false;
+    }
+
+    destination.deleteFile();
+    std::unique_ptr<juce::OutputStream> stream = destination.createOutputStream();
+    std::unique_ptr<juce::AudioFormatWriter> writer;
+
+    if (stream != nullptr)
+    {
+        auto options = juce::AudioFormatWriterOptions().withSampleRate (takeSampleRate).withNumChannels (2)
+                           .withBitsPerSample (32).withSampleFormat (juce::AudioFormatWriterOptions::SampleFormat::floatingPoint);
+        juce::WavAudioFormat wav;
+        writer = wav.createWriterFor (stream, options);
+    }
+
+    if (writer == nullptr)
+    {
+        finish (used);
+        error = K ("드럼 파일을 쓸 수 없습니다: ") + destination.getFullPathName();
+        return false;
+    }
+
+    const int block = maxBlock;
+    juce::AudioBuffer<float> buffer (channels, block);
+    std::vector<float> left ((size_t) block), right ((size_t) block);
+    Strip strip;
+    strip.prepare (takeSampleRate);
+    juce::MidiBuffer midi;
+    midi.ensureSize (4096);
+    size_t next = 0;
+    bool ok = true;
+
+    for (juce::int64 position = 0; position < lengthSamples; position += block)
+    {
+        const int n = (int) juce::jmin<juce::int64> (block, lengthSamples - position);
+        midi.clear();
+
+        for (; next < events.size() && events[next].sample < position + n; ++next)
+        {
+            const auto& e = events[next];
+
+            if (e.size == 0 || e.size > 3)
+                continue;
+
+            juce::uint8 data[3] { e.data[0], e.data[1], e.data[2] };
+
+            if (midiInbox.mapForPlugin (data, (int) e.size) && MidiInbox::shouldForward (data, (int) e.size))
+                midi.addEvent (data, (int) e.size, (int) juce::jmax<juce::int64> (0, e.sample - position));
+        }
+
+        {
+            const juce::SpinLock::ScopedLockType lock (pluginLock);
+
+            if (plugin.get() != used)
+            {
+                error = K ("다시 만드는 중에 드럼 VST가 바뀌어 멈췄습니다.");
+                ok = false;
+                break;
+            }
+
+            buffer.setSize (channels, n, false, false, true);
+            buffer.clear();
+            used->processBlock (buffer, midi);
+        }
+
+        std::fill (left.begin(), left.begin() + n, 0.0f);
+        std::fill (right.begin(), right.begin() + n, 0.0f);
+
+        for (const auto& bus : buses)
+        {
+            if (bus.start + bus.count > channels)
+                break;
+
+            const float* a = buffer.getReadPointer (bus.start);
+            const float* b = bus.count > 1 ? buffer.getReadPointer (bus.start + 1) : a;
+            juce::FloatVectorOperations::add (left.data(), a, n);
+            juce::FloatVectorOperations::add (right.data(), b, n);
+        }
+
+        strip.processTone (left.data(), right.data(), n, drum);   // 녹음할 때처럼 드럼 채널 EQ·컴프레서까지(볼륨은 빼고)
+        const float* channelsOut[] = { left.data(), right.data() };
+
+        if (! writer->writeFromFloatArrays (channelsOut, 2, n))
+        {
+            error = K ("드럼 파일을 쓸 수 없습니다: ") + destination.getFullPathName();
+            ok = false;
+            break;
+        }
+
+        if (progress != nullptr && ! progress ((double) (position + n) / (double) lengthSamples))
+        {
+            error = K ("다시 만들기를 멈췄습니다.");
+            ok = false;
+            break;
+        }
+    }
+
+    writer.reset();
+    finish (used);
+
+    if (! ok)
+        destination.deleteFile();
+
+    return ok;
 }
 
 //==============================================================================
@@ -1946,8 +2226,9 @@ void Engine::audioDeviceIOCallbackWithContext (const float* const*, int,
             juce::FloatVectorOperations::clear (outputChannelData[ch], numSamples);
 
     incomingMidi.clear();
+    incomingRaw.clear();
 
-    const double waited = midiInbox.drainInto (incomingMidi, numSamples, sampleRate, midiDelayMs (maxBlock, sampleRate), callbackStart);
+    const double waited = midiInbox.drainInto (incomingMidi, &incomingRaw, numSamples, sampleRate, midiDelayMs (maxBlock, sampleRate), callbackStart);
 
     // 최댓값 갱신(읽는 쪽이 0으로 비우는 것과 겹쳐도 값이 사라지지 않게 비교-교환)
     for (auto current = maxMidiWaitMs.load (std::memory_order_relaxed); waited > (double) current;)
@@ -1986,7 +2267,8 @@ void Engine::processChunk (int offset, int numSamples, float* const* out, int nu
     juce::FloatVectorOperations::clear (drumL, numSamples);
     juce::FloatVectorOperations::clear (drumR, numSamples);
 
-    // --- 드럼: MIDI → VST 악기
+    // --- 드럼: MIDI → VST 악기(고친 MIDI로 다시 만드는 동안은 건너뛴다: 같은 플러그인을 그쪽이 쓴다)
+    if (! renderingDrums.load (std::memory_order_acquire))
     {
         const juce::SpinLock::ScopedTryLockType lock (pluginLock);
 
@@ -2204,6 +2486,41 @@ void Engine::processChunk (int offset, int numSamples, float* const* out, int nu
                 const float* songDrums[] = { stemBuffer.getReadPointer (4), stemBuffer.getReadPointer (5) };
                 activeSongDrumWriter->write (songDrums, numSamples);
             }
+
+            // 연주 MIDI: 모듈이 보낸 신호를 이 블록에 놓인 자리 그대로(녹음 첫 샘플부터 센 위치)
+            const auto base = recordedSamples.load (std::memory_order_relaxed);
+
+            for (auto it = incomingRaw.findNextSamplePosition (offset); it != incomingRaw.cend(); ++it)
+            {
+                const auto meta = *it;
+
+                if (meta.samplePosition >= offset + numSamples)
+                    break;
+
+                if (meta.numBytes < 1 || meta.numBytes > 3)
+                    continue;
+
+                if (recMidiCount < recMidi.size())
+                {
+                    auto& e = recMidi[recMidiCount++];
+                    e.sample = base + (meta.samplePosition - offset);
+                    e.size = (juce::uint8) meta.numBytes;
+                    std::memcpy (e.data, meta.data, (size_t) meta.numBytes);
+                }
+            }
+
+            // 원곡 위치: 흐르기 시작했거나 멈췄거나 건너뛰었을 때만 적는다(예비박도 흐르는 것으로 센다)
+            const bool rolling = songRolling || countIn.remaining > 0;
+            const bool jumped = rolling ? std::abs (songTime - (recLastSongTime + recLastChunk / sampleRate)) > 2.0 / sampleRate
+                                        : songTime != recLastSongTime;
+
+            if ((! recSpanStarted || rolling != recLastRolling || jumped) && recSpanCount < recSpans.size())
+                recSpans[recSpanCount++] = { base, songTime, rolling };
+
+            recSpanStarted = true;
+            recLastRolling = rolling;
+            recLastSongTime = songTime;
+            recLastChunk = numSamples;
 
             recordedSamples.fetch_add (numSamples, std::memory_order_relaxed);
         }

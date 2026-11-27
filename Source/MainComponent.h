@@ -92,12 +92,32 @@ private:
     // 다듬기 창의 '원곡 드럼 분리': 녹음 폴더의 원곡.wav를 Demucs로 나눠 원곡 드럼.wav를 만든다(한 번에 한 녹음).
     void startTakeSeparation();
     void runTakeSeparation (const juce::File& folder, const juce::File& input, double takeRate);
+    void completeTakeSeparation (const juce::File& folder, const juce::File& separated, double takeRate);
     void finishTakeSeparation (const juce::File& folder, bool ok, const juce::String& message, const juce::String& details);
     void showTakeSeparationState (const juce::File& folder, const juce::String& text, bool isError, bool busy);
     std::unique_ptr<ProcessJob> takeSeparationJob;
     juce::File takeSeparationFolder;
     juce::String takeSeparationText;   // 다듬기 창을 다시 열었을 때 보여 줄 진행 상황
     bool takeSeparationBusy = false;
+
+    // 다듬기 창의 '고친 MIDI 불러오기': 고친 연주 MIDI를 원래 녹음과 맞춘 뒤(TakeMidi.h) 지금 드럼 VST로 드럼.wav를 다시 만든다.
+    // 처음 녹음한 드럼은 '드럼 (녹음 그대로).wav'로 남기고, 끝나면 다듬기 창을 다시 연다(바꾸던 볼륨·타이밍은 이어 쓴다).
+    void startMidiRebuild (const juce::File& editedMidi);
+    void startMidiQuantize (double stepBeats, double strength);   // 다듬기 창 '박자 맞추기'(takemidi::quantizeRaw)
+    using MidiJobPrepare = std::function<bool (const TakeInfo&, const juce::File& folder, takemidi::Rebuilt&, juce::String&)>;
+    void beginMidiJob (const juce::String& busyText, MidiJobPrepare prepare);
+    void restoreRecordedDrums();
+    void reopenTakeEditor (const juce::File& folder, const TakeInfo& carry, const juce::String& message);
+    void showMidiProgress (int percent);
+    void finishMidiRebuild (const juce::File& folder, bool ok, const juce::String& error, const takemidi::Rebuilt& summary, const TakeInfo& carry);
+    class BackgroundJob;
+    std::unique_ptr<BackgroundJob> midiJob;
+    juce::File midiJobFolder;
+    juce::String midiJobText;
+    bool midiJobBusy = false;
+    std::optional<TakeInfo> pendingEditState;   // 다시 여는 다듬기 창에 이어 쓸 값(pendingEditFolder의 녹음일 때만)
+    juce::File pendingEditFolder;
+    juce::String pendingEditMessage;
 
     void setSongStatus (const juce::String& text, bool isError, int secondsToShow = 0);
 

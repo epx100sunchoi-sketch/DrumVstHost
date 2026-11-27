@@ -18,7 +18,16 @@ inline juce::File rest (const juce::File& folder)       { return folder.getChild
 inline juce::File drums (const juce::File& folder)      { return folder.getChildFile ("drums.wav"); }
 inline juce::File work (const juce::File& folder)       { return folder.getChildFile ("work"); }
 bool hasStems (const juce::File& folder);
+juce::File rootFolder();                                // <앱 폴더>\곡 분석
 }
+
+// 다듬기 창 '원곡 드럼 분리'가 Demucs를 다시 돌리지 않게, 이미 분리해 둔 곡(곡 분석 폴더)을 녹음 자리에 맞춰 쓴다.
+// takeSong44(녹음의 원곡, 44.1kHz)와 cacheFolder의 original.wav를 소리로 맞춰 보고(자리 찾기 + 구간별 잔차 확인),
+// 거의 전부 맞아떨어질 때만 no_drums.wav를 같은 자리로 잘라 restOut(44.1kHz, 녹음과 같은 길이)에 쓴다.
+// 맞지 않는 구간(원곡이 아직 안 나온 앞부분 등)은 녹음 소리를 그대로 두어 '원곡 드럼 = 0'이 되게 한다.
+// 녹음 때 원곡 EQ를 썼거나 다른 곡이면 false를 돌려준다(그냥 Demucs로 분리하면 된다). detail에 판단 근거를 적는다.
+bool cutAlignedRestForTake (const juce::File& takeSong44, const juce::File& cacheFolder,
+                            const juce::File& restOut, juce::String& detail);
 
 // 분석·분리에 쓸 파이썬(Demucs·librosa가 든 가상환경)을 찾는다. 설정 값 → 앱 폴더 → 알려진 위치 순서.
 juce::File findAnalysisPython (const juce::String& configuredPath);

@@ -306,6 +306,9 @@ private:
         render (0.3, d, m);
 
         testRecording();
+        testTakeMidi();
+        testStemReuse();
+        testMidiRecording();
         testTakeRates();
         engine->pause();
         testMidiInput();
@@ -361,7 +364,7 @@ private:
                 inbox->receive (juce::MidiMessage::noteOn (10, note++, (juce::uint8) 100), now - waited);
 
             juce::MidiBuffer buffer;
-            inbox->drainInto (buffer, block, rate, Engine::midiDelayMs (block, rate), now);
+            inbox->drainInto (buffer, nullptr, block, rate, Engine::midiDelayMs (block, rate), now);
 
             juce::StringArray positions;
 
@@ -387,6 +390,527 @@ private:
         check ("buffer 512 @48k, waited 2.0 ms", 512, 48000.0, { 2.0 }, "272");
         check ("buffer 512 @48k, waited 9.0 ms", 512, 48000.0, { 9.0 }, "0");
         check ("buffer 512 @48k, stale 60 ms", 512, 48000.0, { 60.0 }, "");
+    }
+
+    // 연주 MIDI(TakeMidi): 원곡 박자로 쓴 템포·마디, 고치지 않은 MIDI 되돌리기, 박자 맞춤·고스트 노트·지운 음, 마디가 밀린 MIDI
+    static int countNoteOns (const std::vector<takemidi::RawEvent>& events, int note)
+    {
+        int n = 0;
+
+        for (const auto& e : events)
+            if (e.size == 3 && (e.data[0] & 0xf0) == 0x90 && e.data[2] > 0 && (note < 0 || e.data[1] == note))
+                ++n;
+
+        return n;
+    }
+
+    void testTakeMidi()
+    {
+        const auto folder = report.getSiblingFile ("selftest-take-midi");
+        folder.deleteRecursively();
+        folder.createDirectory();
+
+        takemidi::Recording r;
+        r.sampleRate = 44100.0;
+        r.lengthSamples = (juce::int64) (20.0 * r.sampleRate);
+        r.brand = DrumModule::Brand::yamaha;
+        r.gridShiftSeconds = 0.010;
+        r.beats.bpm = 120.0;
+
+        for (int k = 0; k < 60; ++k)   // 원곡 0.25초부터 120BPM, 마디 첫 박은 1번 박부터 4박마다(못갖춘마디)
+        {
+            r.beats.beats.push_back (0.25 + 0.5 * k);
+            r.beats.downbeat.push_back ((char) (k % 4 == 1 ? 1 : 0));
+        }
+
+        r.spans.push_back ({ 0, 1.0, true });   // 녹음 0초 = 원곡 1초
+
+        const auto beatTime = [] (double k) { return 0.25 + 0.5 * k - 1.0 + 0.010; };
+        const auto add = [&] (double seconds, int b0, int b1, int b2)
+        {
+            takemidi::RawEvent e;
+            e.sample = (juce::int64) std::llround (seconds * r.sampleRate);
+            e.size = 3;
+            e.data[0] = (juce::uint8) b0;
+            e.data[1] = (juce::uint8) b1;
+            e.data[2] = (juce::uint8) b2;
+            r.events.push_back (e);
+        };
+        const auto note = [&] (double seconds, int number, int velocity)
+        {
+            add (seconds, 0x99, number, velocity);
+            add (seconds + 0.03, 0x89, number, 0);
+        };
+
+        add (beatTime (3.5), 0xb9, 4, 126);   // 하이햇 닫힘
+
+        for (int k = 4; k < 28; ++k)
+        {
+            note (beatTime (k), 42, 70);                            // 몸통(박)
+
+            if (k == 20)
+            {
+                add (beatTime (k + 0.5) - 0.05, 0xb9, 4, 0);        // 열고
+                note (beatTime (k + 0.5), 46, 80);                  // 열린 하이햇
+                add (beatTime (k + 1.0) - 0.02, 0xb9, 4, 126);      // 다시 닫음
+            }
+            else
+            {
+                note (beatTime (k + 0.5), 79, 65);                  // 엣지(반 박)
+            }
+
+            if (k % 2 == 0)
+                note (beatTime (k), 36, 100);
+            else
+                note (beatTime (k) + 0.015, 38, 95);                // 스네어는 15ms 늦게
+        }
+
+        note (beatTime (24.25), 15, 90);   // 탐 1 림
+        note (beatTime (25.25), 60, 90);   // GM으로 못 바꾸는 음(늘 원래대로 남아야 한다)
+
+        std::stable_sort (r.events.begin(), r.events.end(), [] (const auto& a, const auto& b) { return a.sample < b.sample; });
+
+        takemidi::Written written;
+        juce::String e;
+        const bool wrote = takemidi::writeTakeMidi (r, folder, written, e);
+        const auto grid = takemidi::makeGrid (r);
+        const double downTick = grid.beatAt (beatTime (5)) * takemidi::ppq;   // 녹음 안의 첫 마디 첫 박
+        const double barTicks = 4.0 * takemidi::ppq;
+        const bool aligned = std::abs (downTick - barTicks * std::round (downTick / barTicks)) < 1.0;
+
+        log ("take midi write: " + juce::String (wrote ? "ok" : "FAILED " + e) + ", " + juce::String (written.bpm, 1) + " BPM "
+             + juce::String (written.beatsPerBar) + "/4, from song " + juce::String ((int) written.fromSong) + ", start "
+             + juce::String (written.startSeconds, 3) + " s, notes " + juce::String (written.notes) + ", first downbeat tick "
+             + juce::String (downTick, 1) + (aligned ? " ok" : " MISALIGNED"));
+
+        TakeInfo info;
+        info.sampleRate = r.sampleRate;
+        info.lengthSamples = r.lengthSamples;
+        info.hasMidi = true;
+        info.midiStart = written.startSeconds;
+        info.midiBrand = (int) r.brand;
+        info.midiBeatsPerBar = written.beatsPerBar;
+        info.midiFromSong = written.fromSong;
+
+        // 고치지 않은 연주.mid를 그대로 불러오면 원래 신호(엣지·림 포함)와 같아야 한다
+        {
+            takemidi::Rebuilt same;
+            const bool ok = takemidi::rebuild (folder, info, TakeFiles::midiIn (folder), same, e);
+            int found = 0, total = 0;
+
+            for (const auto& a : r.events)
+            {
+                if ((a.data[0] & 0xf0) != 0x90 || a.data[2] == 0)
+                    continue;
+
+                ++total;
+
+                for (const auto& b : same.events)
+                {
+                    if ((b.data[0] & 0xf0) == 0x90 && b.data[2] > 0 && b.data[1] == a.data[1] && b.data[2] == a.data[2]
+                        && std::abs ((double) (b.sample - a.sample)) < 0.001 * r.sampleRate)
+                    {
+                        ++found;
+                        break;
+                    }
+                }
+            }
+
+            log ("take midi unchanged: " + juce::String (ok ? "ok" : "FAILED " + e) + ", kept " + juce::String (same.kept) + " moved "
+                 + juce::String (same.moved) + " added " + juce::String (same.added) + " removed " + juce::String (same.removed)
+                 + ", notes back " + juce::String (found) + "/" + juce::String (total)
+                 + (found == total && same.moved == 0 && same.added == 0 && same.removed == 0 ? " ok" : " MISMATCH"));
+        }
+
+        // 이지드러머에서 고친 것처럼: 다른 PPQ(480), 8분음표로 박자 맞춤, 킥 하나 지움, 16분 고스트 스네어 하나 더함
+        juce::MidiFile gmFile;
+        {
+            juce::FileInputStream in (TakeFiles::midiIn (folder));
+            gmFile.readFrom (in);
+        }
+
+        const auto makeEdited = [&] (double shiftBeats, const juce::File& out)
+        {
+            juce::MidiFile edited;
+            edited.setTicksPerQuarterNote (480);
+            juce::MidiMessageSequence notes;
+            bool droppedKick = false;
+
+            for (int i = 0; i < gmFile.getNumTracks(); ++i)
+            {
+                for (const auto* holder : *gmFile.getTrack (i))
+                {
+                    const auto& m = holder->message;
+
+                    if (! m.isNoteOn())
+                        continue;
+
+                    if (m.getNoteNumber() == 36 && ! droppedKick)
+                    {
+                        droppedKick = true;
+                        continue;
+                    }
+
+                    const double beat = std::round (m.getTimeStamp() / takemidi::ppq * 2.0) / 2.0 + shiftBeats;
+                    notes.addEvent (juce::MidiMessage::noteOn (10, m.getNoteNumber(), m.getVelocity()), beat * 480.0);
+                    notes.addEvent (juce::MidiMessage::noteOff (10, m.getNoteNumber()), beat * 480.0 + 30.0);
+                }
+            }
+
+            const double ghostBeat = std::round (grid.beatAt (beatTime (10.75)) * 4.0) / 4.0 + shiftBeats;
+            notes.addEvent (juce::MidiMessage::noteOn (10, 38, (juce::uint8) 25), ghostBeat * 480.0);
+            notes.addEvent (juce::MidiMessage::noteOff (10, 38), ghostBeat * 480.0 + 30.0);
+            notes.sort();
+            notes.updateMatchedPairs();
+            edited.addTrack (notes);
+            out.deleteFile();
+            juce::FileOutputStream stream (out);
+            edited.writeTo (stream, 1);
+            return ghostBeat - shiftBeats;
+        };
+
+        const auto describe = [&] (const takemidi::Rebuilt& q, double ghostBeat)
+        {
+            // 스네어는 박에 맞았는지, 엣지·림·GM에 없는 음은 그대로인지, 열린 하이햇 바로 앞 페달 값이 0인지
+            int snaresOnBeat = 0, snares = 0, pedalOpen = -1, ghostOk = 0;
+
+            for (size_t i = 0; i < q.events.size(); ++i)
+            {
+                const auto& ev = q.events[i];
+
+                if ((ev.data[0] & 0xf0) != 0x90 || ev.data[2] == 0)
+                    continue;
+
+                const double seconds = (double) ev.sample / r.sampleRate;
+                const double beat = grid.beatAt (seconds);
+
+                if (ev.data[1] == 38 && ev.data[2] == 25)
+                    ghostOk = std::abs (beat - ghostBeat) * 0.5 < 0.001 ? 1 : 0;
+                else if (ev.data[1] == 38)
+                {
+                    ++snares;
+                    snaresOnBeat += std::abs (beat - std::round (beat)) * 0.5 < 0.001 ? 1 : 0;
+                }
+
+                if (ev.data[1] == 46 && i > 0 && (q.events[i - 1].data[0] & 0xf0) == 0xb0 && q.events[i - 1].data[1] == 4)
+                    pedalOpen = q.events[i - 1].data[2];
+            }
+
+            return "kept " + juce::String (q.kept) + " moved " + juce::String (q.moved) + " added " + juce::String (q.added)
+                 + " removed " + juce::String (q.removed) + " ignored " + juce::String (q.ignored) + " bar offset " + juce::String (q.barOffset)
+                 + ", snares on beat " + juce::String (snaresOnBeat) + "/" + juce::String (snares)
+                 + ", edges " + juce::String (countNoteOns (q.events, 79)) + "/" + juce::String (countNoteOns (r.events, 79))
+                 + ", tom rim " + juce::String (countNoteOns (q.events, 15)) + ", unmapped " + juce::String (countNoteOns (q.events, 60))
+                 + ", open hat pedal " + juce::String (pedalOpen) + ", ghost " + juce::String (ghostOk);
+        };
+
+        {
+            const auto edited = folder.getChildFile ("edited.mid");
+            const double ghostBeat = makeEdited (0.0, edited);
+            takemidi::Rebuilt q;
+            const bool ok = takemidi::rebuild (folder, info, edited, q, e);
+            const bool expected = ok && q.added == 1 && q.removed == 1 && q.moved == 13 && countNoteOns (q.events, 79) == countNoteOns (r.events, 79)
+                               && countNoteOns (q.events, 15) == 1 && countNoteOns (q.events, 60) == 1;
+            log ("take midi quantized: " + juce::String (ok ? "ok" : "FAILED " + e) + ", " + describe (q, ghostBeat)
+                 + (expected ? "  [as expected]" : "  [UNEXPECTED: want moved 13 (12 snares + rim), added 1, removed 1, edges/rim/unmapped kept, pedal 0, ghost 1]"));
+        }
+
+        {
+            const auto edited = folder.getChildFile ("edited shifted.mid");
+            const double ghostBeat = makeEdited (8.0, edited);   // 2마디 뒤에 놓았다가 끌어낸 MIDI
+            takemidi::Rebuilt q;
+            const bool ok = takemidi::rebuild (folder, info, edited, q, e);
+            log ("take midi shifted 2 bars: " + juce::String (ok ? "ok" : "FAILED " + e) + ", " + describe (q, ghostBeat)
+                 + (ok && q.barOffset == -2 && q.added == 1 && q.removed == 1 ? "  [as expected]" : "  [UNEXPECTED: want bar offset -2]"));
+        }
+
+        // 앱 안 박자 맞추기(quantizeRaw): 8분음표 100% → 15ms 늦던 스네어가 격자에 붙는다. 50% → 절반(약 7.5ms)만 간다.
+        const auto snareOffGrid = [&] (const takemidi::Rebuilt& q)
+        {
+            double worst = 0.0;
+
+            for (const auto& ev : q.events)
+            {
+                if (ev.size != 3 || (ev.data[0] & 0xf0) != 0x90 || ev.data[2] == 0 || ev.data[1] != 38)
+                    continue;
+
+                const double beat = grid.beatAt ((double) ev.sample / r.sampleRate);
+                worst = juce::jmax (worst, std::abs (beat * 2.0 - std::round (beat * 2.0)) * 0.25);   // 8분 격자에서 벗어난 초(120BPM)
+            }
+
+            return worst * 1000.0;
+        };
+
+        {
+            takemidi::Rebuilt q;
+            const bool ok = takemidi::quantizeRaw (folder, info, 0.5, 1.0, q, e);
+            const double off = snareOffGrid (q);
+            log ("take midi quantize 8th 100%: " + juce::String (ok ? "ok" : "FAILED " + e) + ", kept " + juce::String (q.kept)
+                 + " moved " + juce::String (q.moved) + ", snare off grid " + juce::String (off, 2) + " ms, edges "
+                 + juce::String (countNoteOns (q.events, 79)) + ", unmapped " + juce::String (countNoteOns (q.events, 60))
+                 + (ok && q.moved == 13 && off < 2.0 && countNoteOns (q.events, 79) == countNoteOns (r.events, 79)
+                        ? "  [as expected]" : "  [UNEXPECTED: want moved 13 (12 snares + tom rim), snares within 2 ms, edges kept]"));
+        }
+
+        {
+            takemidi::Rebuilt q;
+            const bool ok = takemidi::quantizeRaw (folder, info, 0.5, 0.5, q, e);
+            const double off = snareOffGrid (q);
+            log ("take midi quantize 8th 50%: " + juce::String (ok ? "ok" : "FAILED " + e) + ", moved " + juce::String (q.moved)
+                 + ", snare off grid " + juce::String (off, 2) + " ms"
+                 + (ok && off > 5.0 && off < 10.0 ? "  [as expected: about half of 15 ms]" : "  [UNEXPECTED: want about 7.5 ms]"));
+        }
+
+        folder.deleteRecursively();
+    }
+
+    // '원곡 드럼 분리' 재사용(cutAlignedRestForTake): 이미 분리해 둔 곡을 녹음 자리에 맞춰 잘라 쓰는지.
+    // 가짜 곡(사인 둘 = 밴드, 0.5초마다 잡음 버스트 = 드럼)을 만들어, 무음 0.3초 + 곡 3~15초를 녹음이라 치고 확인한다.
+    void testStemReuse()
+    {
+        const auto folder = report.getSiblingFile ("selftest-stem-reuse");
+        folder.deleteRecursively();
+        const auto cache = folder.getChildFile ("cache");
+        cache.createDirectory();
+
+        const double sr = 44100.0;
+        const int songN = (int) (20.0 * sr);
+        std::vector<float> restS ((size_t) songN), drumS ((size_t) songN), origS ((size_t) songN);
+        juce::Random random (4242);
+
+        for (int i = 0; i < songN; ++i)
+        {
+            const double time = i / sr;
+            restS[(size_t) i] = 0.2f * (float) std::sin (2.0 * juce::MathConstants<double>::pi * 220.0 * time)
+                              + 0.1f * (float) std::sin (2.0 * juce::MathConstants<double>::pi * 331.0 * time);
+        }
+
+        const int burst = (int) (0.03 * sr);
+
+        for (int k = 0; k < 40; ++k)
+            for (int i = 0; i < burst && k * 22050 + i < songN; ++i)
+                drumS[(size_t) (k * 22050 + i)] = 0.5f * (random.nextFloat() * 2.0f - 1.0f) * (1.0f - (float) i / (float) burst);
+
+        for (int i = 0; i < songN; ++i)
+            origS[(size_t) i] = restS[(size_t) i] + drumS[(size_t) i];
+
+        const auto writeStereo = [] (const juce::File& file, const std::vector<float>& signal, int offset, int count, int silence, float gain)
+        {
+            file.deleteFile();
+            std::unique_ptr<juce::OutputStream> stream = file.createOutputStream();
+
+            if (stream == nullptr)
+                return false;
+
+            juce::WavAudioFormat wav;
+            std::unique_ptr<juce::AudioFormatWriter> writer (
+                wav.createWriterFor (stream, juce::AudioFormatWriterOptions().withSampleRate (44100.0).withNumChannels (2)
+                                                 .withBitsPerSample (32).withSampleFormat (juce::AudioFormatWriterOptions::SampleFormat::floatingPoint)));
+
+            if (writer == nullptr)
+                return false;
+
+            juce::AudioBuffer<float> buffer (2, silence + count);
+            buffer.clear();
+
+            for (int i = 0; i < count; ++i)
+            {
+                const float v = gain * signal[(size_t) (offset + i)];
+                buffer.setSample (0, silence + i, v);
+                buffer.setSample (1, silence + i, v);
+            }
+
+            return writer->writeFromAudioSampleBuffer (buffer, 0, buffer.getNumSamples());
+        };
+
+        const int offset = (int) (3.0 * sr), takeCount = (int) (12.0 * sr), prefix = (int) (0.3 * sr);
+        const auto takeFile = folder.getChildFile ("take song.wav");
+        bool wrote = writeStereo (songcache::original (cache), origS, 0, songN, 0, 1.0f)
+                  && writeStereo (songcache::rest (cache), restS, 0, songN, 0, 1.0f)
+                  && writeStereo (songcache::drums (cache), drumS, 0, songN, 0, 1.0f)
+                  && writeStereo (takeFile, origS, offset, takeCount, prefix, 1.0f);
+
+        if (! wrote)
+        {
+            log ("stem reuse: FAILED writing test files");
+            folder.deleteRecursively();
+            return;
+        }
+
+        const auto restOut = folder.getChildFile ("rest out.wav");
+        juce::String detail;
+        const bool ok = cutAlignedRestForTake (takeFile, cache, restOut, detail);
+        double worstDrum = -1.0;
+        float prefixPeak = 0.0f;
+
+        if (ok)
+        {
+            juce::AudioFormatManager formats;
+            formats.registerBasicFormats();
+            std::unique_ptr<juce::AudioFormatReader> reader (formats.createReaderFor (restOut));
+
+            if (reader != nullptr)
+            {
+                const int n = (int) reader->lengthInSamples;
+                juce::AudioBuffer<float> rest (2, n);
+                reader->read (&rest, 0, n, 0, true, true);
+
+                // 녹음 − 결과 = 원곡 드럼이어야 한다. 무음 앞부분과 (판정 단위가 걸치는) 경계 한 칸은 빼고 본다.
+                const int checkFrom = ((prefix / 11025) + 1) * 11025 + 441;
+                worstDrum = 0.0;
+
+                for (int i = 0; i < juce::jmin (n, prefix + takeCount); ++i)
+                {
+                    const float take = i < prefix ? 0.0f : origS[(size_t) (offset + i - prefix)];
+                    const float computed = take - rest.getSample (0, i);
+
+                    if (i < prefix)
+                        prefixPeak = juce::jmax (prefixPeak, std::abs (computed));
+                    else if (i >= checkFrom)
+                        worstDrum = juce::jmax (worstDrum, (double) std::abs (computed - drumS[(size_t) (offset + i - prefix)]));
+                }
+            }
+        }
+
+        log ("stem reuse: " + juce::String (ok ? "ok" : "FAILED") + " (" + detail + "), drum error peak "
+             + juce::String (worstDrum, 4) + ", silent prefix peak " + juce::String (prefixPeak, 4)
+             + (ok && worstDrum >= 0.0 && worstDrum < 1.0e-3 && prefixPeak < 1.0e-3 ? " ok" : " MISMATCH"));
+
+        // 소리가 다르면(1.3배 크게 녹음된 셈) 재사용하지 않고 물러나야 한다(그냥 Demucs로 가게).
+        const auto louder = folder.getChildFile ("take louder.wav");
+        juce::String detail2;
+        const bool refused = ! writeStereo (louder, origS, offset, takeCount, prefix, 1.3f)
+                          || ! cutAlignedRestForTake (louder, cache, folder.getChildFile ("rest2.wav"), detail2);
+        log ("stem reuse louder take: " + juce::String (refused ? "refused ok" : "ACCEPTED (MISMATCH)") + " (" + detail2 + ")");
+
+        folder.deleteRecursively();
+    }
+
+    // 녹음할 때 패드 신호(드럼 모듈 경로)가 연주 MIDI로 남는지, 그 MIDI로 드럼을 다시 만들면 녹음과 같은 자리에 소리가 나는지
+    void testMidiRecording()
+    {
+        const auto folder = report.getSiblingFile ("selftest-midi-recording");
+        folder.deleteRecursively();
+        juce::String error;
+        float d = 0.0f, m = 0.0f;
+
+        if (! engine->startRecording (folder, error))
+        {
+            log ("midi recording: FAILED " + error);
+            return;
+        }
+
+        render (0.2, d, m);
+        float loudest = 0.0f;
+
+        for (int i = 0; i < 6; ++i)
+        {
+            const int number = i % 2 == 0 ? 36 : 38;
+            engine->injectMidiForTest (juce::MidiMessage::noteOn (10, number, (juce::uint8) 100));
+            render (0.05, d, m);
+            loudest = juce::jmax (loudest, d);
+            engine->injectMidiForTest (juce::MidiMessage::noteOff (10, number));
+            render (0.35, d, m);
+            loudest = juce::jmax (loudest, d);
+        }
+
+        log ("midi recording: drum peak while playing " + dbText (loudest));
+
+        engine->stopRecording();
+        const auto take = engine->getLastTakeFolder();
+        TakeInfo info;
+        info.load (take);
+
+        juce::MidiFile raw;
+        int rawNotes = 0;
+
+        if (juce::FileInputStream in (TakeFiles::rawMidiIn (take)); in.openedOk() && raw.readFrom (in))
+            for (int t = 0; t < raw.getNumTracks(); ++t)
+                for (const auto* holder : *raw.getTrack (t))
+                    rawNotes += holder->message.isNoteOn() ? 1 : 0;
+
+        log ("midi recording: raw notes " + juce::String (rawNotes) + "/6, gm file " + juce::String (TakeFiles::midiIn (take).existsAsFile() ? "yes" : "NO")
+             + ", info midi " + juce::String ((int) info.hasMidi) + ", start " + juce::String (info.midiStart, 3) + " s, "
+             + juce::String (info.midiBpm, 1) + " BPM" + (rawNotes == 6 && info.hasMidi ? " ok" : " MISMATCH"));
+
+        // 플러그인이 있으면: 고치지 않은 MIDI로 다시 만든 드럼이 녹음된 드럼과 같은 자리에서 시작하는지
+        if (engine->getPlugin() != nullptr && info.hasMidi)
+        {
+            takemidi::Rebuilt same;
+            juce::String e;
+            const auto rendered = take.getChildFile ("rendered.wav");
+            const bool ok = takemidi::rebuild (take, info, TakeFiles::midiIn (take), same, e)
+                         && engine->renderDrumsFromMidi (same.events, info.lengthSamples, info.sampleRate, rendered, nullptr, e);
+
+            juce::String onsetDebug;
+            const auto onsets = [&onsetDebug] (const juce::File& file)
+            {
+                juce::AudioFormatManager formats;
+                formats.registerBasicFormats();
+                std::unique_ptr<juce::AudioFormatReader> reader (formats.createReaderFor (file));
+                juce::Array<double> found;
+
+                if (reader == nullptr)
+                    return found;
+
+                juce::AudioBuffer<float> buffer (2, (int) reader->lengthInSamples);
+                const bool read = reader->read (&buffer, 0, (int) reader->lengthInSamples, 0, true, true);
+                const float peak = buffer.getMagnitude (0, buffer.getNumSamples());
+
+                if (! read)
+                    onsetDebug << " [" << file.getFileName() << " not read]";
+
+                // 소리 시작: 10%를 넘은 샘플 중 앞서 10%를 넘은 지 150ms가 지난 것
+                const int gap = (int) (0.15 * reader->sampleRate);
+                int lastLoud = -gap - 1;
+
+                for (int i = 0; i < buffer.getNumSamples(); ++i)
+                {
+                    const float v = juce::jmax (std::abs (buffer.getSample (0, i)), std::abs (buffer.getSample (1, i)));
+
+                    if (v > peak * 0.1f)
+                    {
+                        if (i - lastLoud > gap)
+                            found.add (i * 1000.0 / reader->sampleRate);
+
+                        lastLoud = i;
+                    }
+                }
+
+                return found;
+            };
+
+            const auto a = onsets (TakeFiles::drumIn (take));
+            const auto b = onsets (rendered);
+
+            const auto peakOf = [] (const juce::File& file)
+            {
+                juce::AudioFormatManager formats;
+                formats.registerBasicFormats();
+                std::unique_ptr<juce::AudioFormatReader> reader (formats.createReaderFor (file));
+                juce::Range<float> range[2];
+
+                if (reader == nullptr)
+                    return -1.0f;
+
+                reader->readMaxLevels (0, reader->lengthInSamples, range, 2);
+                return juce::jmax (std::abs (range[0].getStart()), std::abs (range[0].getEnd()));
+            };
+
+            log ("midi re-render: recorded drum peak " + dbText (peakOf (TakeFiles::drumIn (take))) + ", rendered peak "
+                 + dbText (peakOf (rendered)) + ", events " + juce::String ((int) same.events.size()));
+            double worst = 0.0;
+
+            for (int i = 0; i < juce::jmin (a.size(), b.size()); ++i)
+                worst = juce::jmax (worst, std::abs (a[i] - b[i]));
+
+            log ("midi re-render: " + juce::String (ok ? "ok" : "FAILED " + e) + ", onsets recorded " + juce::String (a.size())
+                 + " rendered " + juce::String (b.size()) + ", worst difference " + juce::String (worst, 2) + " ms" + onsetDebug
+                 + (ok && a.size() == b.size() && worst < 1.0 ? " ok" : " MISMATCH"));
+        }
+
+        if (! juce::SystemStats::getEnvironmentVariable ("DVH_KEEP_TEST_FILES", {}).isNotEmpty())
+            folder.deleteRecursively();
     }
 
     // 녹음(믹스·드럼·원곡) → 테이크 불러오기 → 볼륨·타이밍·구간을 바꿔 저장 → 다시 읽어 확인

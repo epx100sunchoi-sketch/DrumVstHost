@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.22)
-project(DrumVstHost VERSION 0.2.3 LANGUAGES C CXX)
+project(DrumVstHost VERSION 0.2.4 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -22,6 +22,7 @@ target_sources(DrumVstHost PRIVATE
     Source/Main.cpp
     Source/Engine.cpp
     Source/Take.cpp
+    Source/TakeMidi.cpp
     Source/TakeEditor.cpp
     Source/Look.cpp
     Source/MainComponent.cpp

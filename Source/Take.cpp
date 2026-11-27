@@ -115,6 +115,16 @@ bool TakeInfo::load (const juce::File& folder)
         trimEnd   = readInt64 (*edit, "trimEnd", 0);
     }
 
+    if (const auto* midi = xml->getChildByName ("MIDI"))
+    {
+        hasMidi = true;
+        midiStart = midi->getDoubleAttribute ("start", 0.0);
+        midiBpm = midi->getDoubleAttribute ("bpm", 0.0);
+        midiBrand = midi->getIntAttribute ("brand", 0);
+        midiBeatsPerBar = juce::jlimit (1, 16, midi->getIntAttribute ("beatsPerBar", 4));
+        midiFromSong = midi->getBoolAttribute ("fromSong", false);
+    }
+
     return true;
 }
 
@@ -138,6 +148,16 @@ bool TakeInfo::save (const juce::File& folder) const
         edit->setAttribute ("offsetMs", offsetMs);
         edit->setAttribute ("trimStart", juce::String (trimStart));
         edit->setAttribute ("trimEnd", juce::String (trimEnd));
+    }
+
+    if (hasMidi)
+    {
+        auto* midi = xml.createNewChildElement ("MIDI");
+        midi->setAttribute ("start", midiStart);
+        midi->setAttribute ("bpm", midiBpm);
+        midi->setAttribute ("brand", midiBrand);
+        midi->setAttribute ("beatsPerBar", midiBeatsPerBar);
+        midi->setAttribute ("fromSong", midiFromSong);
     }
 
     return xml.writeTo (TakeFiles::infoIn (folder));
