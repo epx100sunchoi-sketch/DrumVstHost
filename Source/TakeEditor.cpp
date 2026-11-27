@@ -960,7 +960,13 @@ void TakeEditor::exportFinal()
     const auto folder = take->getFolder();
     const bool asMp3 = formatBox.getSelectedId() != formatWav;
     const auto format = asMp3 ? TakePlayer::ExportFormat::mp3 : TakePlayer::ExportFormat::wav24;
-    const auto file = folder.getNonexistentChildFile (folder.getFileName() + lang::pick (" 완성", " final"), asMp3 ? ".mp3" : ".wav", true);
+    // 파일 이름: "<원곡> - <테이크 폴더> 완성". 원곡 없이 녹음했으면 폴더 이름만.
+    auto baseName = folder.getFileName();
+
+    if (const auto song = juce::File::createLegalFileName (take->info.songName).substring (0, 60).trim(); song.isNotEmpty())
+        baseName = song + " - " + baseName;
+
+    const auto file = folder.getNonexistentChildFile (baseName + lang::pick (" 완성", " final"), asMp3 ? ".mp3" : ".wav", true);
 
     saveButton.setEnabled (false);
     setStatus (K ("저장하는 중…"), false);
