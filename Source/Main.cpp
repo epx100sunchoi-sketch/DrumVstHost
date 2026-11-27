@@ -661,6 +661,15 @@ private:
                  + (ok && off > 5.0 && off < 10.0 ? "  [as expected: about half of 15 ms]" : "  [UNEXPECTED: want about 7.5 ms]"));
         }
 
+        {
+            // 세기 0 = '지금 킷 소리로 다시 만들기': 아무 음도 옮기지 않아야 한다
+            takemidi::Rebuilt q;
+            const bool ok = takemidi::quantizeRaw (folder, info, 0.5, 0.0, q, e);
+            log ("take midi rerender (strength 0): " + juce::String (ok ? "ok" : "FAILED " + e) + ", kept " + juce::String (q.kept)
+                 + " moved " + juce::String (q.moved)
+                 + (ok && q.moved == 0 && q.kept == 73 ? "  [as expected]" : "  [UNEXPECTED: want kept 73 moved 0]"));
+        }
+
         folder.deleteRecursively();
     }
 

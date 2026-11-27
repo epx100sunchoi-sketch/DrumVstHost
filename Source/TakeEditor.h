@@ -35,6 +35,7 @@ public:
     // 연주 MIDI: 고친 MIDI 파일로 드럼을 다시 만들기, 앱 안 박자 맞추기, 녹음 그대로 되돌리기. 메인 창이 작업을 돌리고 결과를 알려 준다.
     std::function<void (const juce::File&)> onImportMidi;
     std::function<void (double stepBeats, double strength)> onQuantize;
+    std::function<void()> onRerenderKit;   // 연주는 그대로, 지금 드럼 VST·킷 소리로 드럼.wav를 다시 만든다
     std::function<void()> onRestoreRecordedDrums;
     void showMidiState (const juce::String& text, bool isError, bool busy);
     void setStatusText (const juce::String& text, bool isError)   { setStatus (text, isError); }
@@ -72,7 +73,7 @@ private:
     // 연주 MIDI
     class MidiChip;             // 끌어서 이지드러머·DAW에 놓는 '연주.mid'
     std::unique_ptr<MidiChip> midiChip;
-    juce::TextButton quantizeButton, importMidiButton, restoreDrumsButton;
+    juce::TextButton quantizeButton, importMidiButton, rerenderButton, restoreDrumsButton;
     void showQuantizeMenu();
     juce::Label midiStatus;
     juce::Rectangle<int> midiTitleArea, midiHintArea;

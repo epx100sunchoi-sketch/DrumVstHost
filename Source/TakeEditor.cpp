@@ -575,6 +575,15 @@ TakeEditor::TakeEditor (Engine& engineToUse, std::shared_ptr<TakePlayer> takeToU
     importMidiButton.onClick = [this] { chooseEditedMidi(); };
     addChildComponent (importMidiButton);
 
+    rerenderButton.setButtonText (K ("지금 킷 소리로 다시 만들기"));
+    styleButton (rerenderButton, K ("연주는 그대로 두고, 지금 드럼 VST에서 고른 킷 소리로 드럼을 다시 만듭니다. 킷이나 드럼 VST를 바꿔 녹음을 다시 들어 보고 싶을 때 쓰세요."));
+    rerenderButton.onClick = [this]
+    {
+        if (! midiBusy && onRerenderKit != nullptr)
+            onRerenderKit();
+    };
+    addChildComponent (rerenderButton);
+
     restoreDrumsButton.setButtonText (K ("녹음 그대로 되돌리기"));
     styleButton (restoreDrumsButton, K ("고친 MIDI로 다시 만들기 전의 드럼(처음 녹음한 소리)으로 되돌립니다."));
     restoreDrumsButton.onClick = [this]
@@ -602,7 +611,7 @@ TakeEditor::TakeEditor (Engine& engineToUse, std::shared_ptr<TakePlayer> takeToU
     rangeChanged();
     setStatus (K ("볼륨과 타이밍을 맞춘 뒤 '완성본 저장'을 누르세요. 저장하지 않고 닫으면 바꾼 값은 남지 않습니다."), false);
 
-    setSize (editorWidth, 786);
+    setSize (editorWidth, 830);
     startTimerHz (30);
 }
 
@@ -686,6 +695,8 @@ void TakeEditor::updateMidiRow()
     quantizeButton.setEnabled (! midiBusy);
     importMidiButton.setVisible (hasMidi);
     importMidiButton.setEnabled (! midiBusy);
+    rerenderButton.setVisible (hasMidi);
+    rerenderButton.setEnabled (! midiBusy);
     restoreDrumsButton.setVisible (TakeFiles::recordedDrumIn (folder).existsAsFile());
     restoreDrumsButton.setEnabled (! midiBusy);
 
@@ -1081,22 +1092,37 @@ void TakeEditor::resized()
         {
             midiChip->setBounds (row.removeFromLeft (170));
             row.removeFromLeft (8);
+        }
+
+        if (quantizeButton.isVisible())
+        {
             quantizeButton.setBounds (row.removeFromLeft (140).withSizeKeepingCentre (140, 34));
             row.removeFromLeft (8);
             importMidiButton.setBounds (row.removeFromLeft (180).withSizeKeepingCentre (180, 34));
             row.removeFromLeft (8);
         }
 
-        if (restoreDrumsButton.isVisible())
-        {
-            restoreDrumsButton.setBounds (row.removeFromLeft (170).withSizeKeepingCentre (170, 34));
-            row.removeFromLeft (10);
-        }
-
         midiStatus.setBounds (row);
     }
 
     y += 40 + 4;
+
+    if (rerenderButton.isVisible() || restoreDrumsButton.isVisible())
+    {
+        juce::Rectangle<int> row (pad, y, width, 40);
+
+        if (rerenderButton.isVisible())
+        {
+            rerenderButton.setBounds (row.removeFromLeft (200).withSizeKeepingCentre (200, 34));
+            row.removeFromLeft (8);
+        }
+
+        if (restoreDrumsButton.isVisible())
+            restoreDrumsButton.setBounds (row.removeFromLeft (170).withSizeKeepingCentre (170, 34));
+
+        y += 40 + 4;
+    }
+
     midiHintArea = { pad, y, width, 34 };
     y += 34 + 12;
     dividers[3] = y;

@@ -2975,6 +2975,17 @@ void MainComponent::openTakeEditor (const juce::File& takeFolder)
                 safe->startMidiQuantize (stepBeats, strength);
         };
 
+        editor->onRerenderKit = [safe]
+        {
+            // 연주는 그대로(세기 0 = 아무 음도 옮기지 않음), 지금 드럼 VST·킷 소리로만 다시 만든다
+            if (safe != nullptr)
+                safe->beginMidiJob (K ("지금 킷 소리로 다시 만드는 중…"),
+                                    [] (const TakeInfo& info, const juce::File& takeFolder, takemidi::Rebuilt& out, juce::String& error)
+                                    {
+                                        return takemidi::quantizeRaw (takeFolder, info, 0.5, 0.0, out, error);
+                                    });
+        };
+
         editor->onRestoreRecordedDrums = [safe]
         {
             if (safe != nullptr)
