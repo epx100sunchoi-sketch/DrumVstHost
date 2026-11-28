@@ -695,12 +695,13 @@ private:
             int quiet = 0;
 
             for (const auto& ev : then.events)
-                if (ev.size == 3 && (ev.data[0] & 0xf0) == 0x90 && ev.data[2] > 0 && ev.data[1] == 38 && ev.data[2] <= 30)
+                if (ev.size == 3 && (ev.data[0] & 0xf0) == 0x90 && ev.data[2] > 0 && ev.data[1] == 38 && ev.data[2] <= 45)
                     ++quiet;
 
             log ("take midi ghosts then quantize: " + juce::String (ok ? "ok" : "FAILED " + e)
-                 + ", quiet snares " + juce::String (quiet) + " moved " + juce::String (ok ? then.moved : -1)
-                 + (ok && quiet == 24 && then.moved == 12 ? "  [as expected]" : "  [UNEXPECTED: want 24 ghosts kept, 12 snares moved]"));
+                 + ", quiet snares " + juce::String (quiet) + " (added " + juce::String (withGhosts.added) + ") moved " + juce::String (ok ? then.moved : -1)
+                 + (ok && quiet == withGhosts.added && then.moved >= 12 && then.moved <= 12 + withGhosts.added
+                        ? "  [as expected]" : "  [UNEXPECTED: want all ghosts kept, 12 snares + off-grid ghosts moved]"));
             current.deleteFile();
         }
 
@@ -715,13 +716,13 @@ private:
                 if (ev.size != 3 || (ev.data[0] & 0xf0) != 0x90 || ev.data[2] == 0 || ev.data[1] != 38)
                     continue;
 
-                (ev.data[2] <= 30 ? quiet : loud)++;
+                (ev.data[2] <= 45 ? quiet : loud)++;
             }
 
             log ("take midi ghosts: " + juce::String (ok ? "ok" : "FAILED " + e) + ", kept " + juce::String (g.kept)
                  + " added " + juce::String (g.added) + ", quiet snares " + juce::String (quiet) + " loud " + juce::String (loud)
-                 + (ok && g.kept == 74 && g.added == 24 && quiet == 24 && loud == 12
-                        ? "  [as expected]" : "  [UNEXPECTED: want kept 74, 24 ghosts around 12 snares]"));
+                 + (ok && g.kept == 74 && g.added >= 12 && g.added <= 60 && quiet == g.added && loud == 12
+                        ? "  [as expected]" : "  [UNEXPECTED: want kept 74, 12~60 quiet ghosts, loud 12]"));
         }
 
         folder.deleteRecursively();

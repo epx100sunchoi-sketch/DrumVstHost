@@ -585,7 +585,7 @@ TakeEditor::TakeEditor (Engine& engineToUse, std::shared_ptr<TakePlayer> takeToU
     addChildComponent (rerenderButton);
 
     ghostButton.setButtonText (K ("고스트 노트 넣기…"));
-    styleButton (ghostButton, K ("세게 친 스네어 사이의 빈 16분음표 자리에 아주 약한 스네어(고스트 노트)를 넣고, 지금 드럼 VST로 드럼을 다시 만듭니다. 마음에 안 들면 '녹음 그대로 되돌리기'를 누르세요."));
+    styleButton (ghostButton, K ("실제 드러머 연주에서 배운 분포로, 세게 친 스네어(백비트) 둘레의 빈 16분음표 자리에 아주 약한 스네어(고스트 노트)를 넣고, 지금 드럼 VST로 드럼을 다시 만듭니다. 자리·세기·타이밍이 자리마다 조금씩 달라 사람이 친 것처럼 들립니다. 마음에 안 들면 '녹음 그대로 되돌리기'를 누르세요."));
     ghostButton.onClick = [this] { showGhostMenu(); };
     addChildComponent (ghostButton);
 
@@ -825,9 +825,9 @@ void TakeEditor::showGhostMenu()
     // 얼마나 넣을지만 고른다. 자리는 앱이 찾는다(세게 친 스네어 둘레의 빈 16분음표 자리).
     juce::PopupMenu menu;
     menu.addSectionHeader (K ("약한 스네어(고스트 노트)를 얼마나 넣을까요?"));
-    menu.addItem (1, K ("조금: 세게 친 스네어 바로 앞"));
-    menu.addItem (2, K ("보통: 세게 친 스네어 앞뒤"));
-    menu.addItem (3, K ("많이: 빈 16분음표 자리 전부"));
+    menu.addItem (1, K ("조금: 백비트 옆에 하나씩"));
+    menu.addItem (2, K ("보통: 백비트 둘레 두셋, 마디마다 다르게"));
+    menu.addItem (3, K ("많이: 드래그처럼 붙는 쌍까지 촘촘히"));
 
     juce::Component::SafePointer<TakeEditor> safe (this);
 

@@ -91,8 +91,10 @@ bool rebuild (const juce::File& takeFolder, const TakeInfo&, const juce::File& e
 // 음 켬·끔만 옮기고(표준 번호로 못 바꾸는 음은 그대로), 하이햇 음에는 원래 치던 때의 페달 값을 바로 앞에 넣는다.
 bool quantizeRaw (const juce::File& sourceMidi, const TakeInfo&, double stepBeats, double strength, Rebuilt&, juce::String& error);
 
-// sourceMidi의 연주에 약한 스네어(고스트 노트)를 더한다. 세기는 세게 친 스네어의 1/4쯤.
-// amount 0: 세게 친 스네어 바로 앞 16분 자리, 1: 앞뒤, 2: 연주가 있는 마디의 빈 16분 자리 전부(8분 자리 사이).
+// sourceMidi의 연주에 약한 스네어(고스트 노트)를 더한다. 자리·세기·타이밍은 실제 드러머 연주
+// (Groove MIDI Dataset)에서 배운 분포를 따른다: 백비트 바로 옆이 가장 흔하고, 세기는 백비트의 19~38%,
+// 타이밍은 ±0.02박쯤 흔들리고, 일부는 16분 둘씩 붙는다(드래그). 같은 연주에는 늘 같은 결과가 나온다.
+// amount 0: 백비트마다 하나, 1: 둘레 두셋, 2: 촘촘히.
 // 이미 스네어가 있는 자리(둘레 0.2박)에는 넣지 않는다. 기존 음은 하나도 건드리지 않는다.
 bool addGhosts (const juce::File& sourceMidi, const TakeInfo&, int amount, Rebuilt&, juce::String& error);
 

@@ -1079,16 +1079,44 @@ bool addGhosts (const juce::File& sourceMidi, const TakeInfo& info, int amount, 
     std::sort (noteBeats.begin(), noteBeats.end());
     std::sort (snares.begin(), snares.end(), [] (const SnareHit& a, const SnareHit& b) { return a.beat < b.beat; });
 
-    // 고스트 세기: 친 스네어 세기의 가운데 값에서 많이 낮춘 값. 세게 친 스네어만 기준(백비트)으로 삼아,
-    // 이미 들어 있는 고스트 둘레에 또 넣지 않는다.
+    // 세게 친 스네어(백비트)만 기준으로 삼아, 이미 들어 있는 고스트 둘레에 또 넣지 않는다.
+    // 자리·세기·타이밍 규칙은 실제 드러머 연주에서 배웠다(Groove MIDI Dataset: 4/4 비트 연주 338개, 고스트 47,443개).
     std::vector<double> velocities;
 
     for (const auto& s : snares)
         velocities.push_back ((double) s.velocity);
 
     const double median = medianOf (velocities, 70.0);
-    const int ghostVelocity = juce::jlimit (12, 28, juce::roundToInt (median * 0.26));
     const double anchorVelocity = juce::jmax (35.0, median * 0.55);
+
+    std::vector<double> anchorVels;
+
+    for (const auto& s : snares)
+        if ((double) s.velocity >= anchorVelocity)
+            anchorVels.push_back ((double) s.velocity);
+
+    const double anchorMedian = medianOf (anchorVels, median);
+
+    // 자리마다 늘 같은 값이 나오는 섞음수(0~1): 같은 연주에 다시 넣어도 같은 결과가 나온다
+    const auto hash01 = [] (double beat, int salt)
+    {
+        auto h = (juce::uint32) ((juce::int64) std::llround (beat * 96.0) * 2654435761LL + (juce::int64) salt * 40503LL);
+        h ^= h >> 15; h *= 2246822519u; h ^= h >> 13; h *= 3266489917u; h ^= h >> 16;
+        return (double) (h & 0xffffffu) / (double) 0xffffffu;
+    };
+
+    // 백비트에서 16분 off만큼 떨어진 자리에 고스트가 올 비율(데이터): 바로 뒤 +1이 가장 흔하다
+    const auto weightAt = [] (int off)
+    {
+        switch (off)
+        {
+            case -1: return 0.139;  case +1: return 0.188;
+            case -2: return 0.121;  case +2: return 0.117;
+            case -3: return 0.099;  case +3: return 0.116;
+            case -4: return 0.035;  case +4: return 0.043;
+            default: return 0.0;
+        }
+    };
 
     const auto snareNear = [&] (double beat)
     {
@@ -1113,37 +1141,42 @@ bool addGhosts (const juce::File& sourceMidi, const TakeInfo& info, int amount, 
         spots.push_back (beat);
     };
 
-    if (amount >= 2)
+    // 백비트마다: 데이터에서 가장 흔한 바로 옆 자리(뒤 61%, 앞 39%)에 하나는 꼭 넣고,
+    // 나머지 자리(16분 ±4까지)는 데이터 비율 × 양(amount)에 따라 뽑는다. 마디마다 패턴이 달라진다.
+    // 친 음이 격자에서 조금 벗어나 있으면(0.12박 안) 격자 자리에, 많이 벗어나 있으면 친 음 기준으로 넣는다.
+    const double density = amount >= 2 ? 3.0 : amount == 1 ? 1.7 : 1.0;
+
+    for (const auto& s : snares)
     {
-        // 연주가 있는 마디의 빈 16분 자리 전부(8분음표 자리 사이, '이'와 '아')
-        const int beatsPerBar = juce::jmax (1, info.midiBeatsPerBar);
-        std::vector<int> bars;
+        if ((double) s.velocity < anchorVelocity)
+            continue;
 
-        for (const double b : noteBeats)
-            bars.push_back ((int) std::floor (b / beatsPerBar + 1.0e-6));
+        const double snapped = std::round (s.beat * 4.0) / 4.0;
+        const double base = std::abs (s.beat - snapped) <= 0.12 ? snapped : s.beat;
 
-        std::sort (bars.begin(), bars.end());
-        bars.erase (std::unique (bars.begin(), bars.end()), bars.end());
+        const int primary = hash01 (base, 10) < 0.39 ? -1 : +1;
+        addSpot (base + primary * 0.25);
 
-        for (const int bar : bars)
-            for (int k = 1; k < beatsPerBar * 4; k += 2)
-                addSpot (bar * beatsPerBar + k * 0.25);
+        if (amount < 1)
+            continue;
+
+        for (int off = -4; off <= 4; ++off)
+            if (off != 0 && off != primary && hash01 (base + off * 0.25, 11) < (density - 1.0) * weightAt (off))
+                addSpot (base + off * 0.25);
     }
-    else
+
+    // 16분 둘씩 붙은 고스트(드래그 느낌): 데이터에서 29%가 쌍으로 나온다
+    if (amount >= 1)
     {
-        // 세게 친 스네어(백비트) 바로 앞 16분 자리, '보통'(1)은 바로 뒤도.
-        // 친 음이 격자에서 조금 벗어나 있으면(0.12박 안) 격자 자리에, 많이 벗어나 있으면 친 음 기준으로 넣는다.
-        for (const auto& s : snares)
+        const auto chosen = spots;
+
+        for (const double b : chosen)
         {
-            if ((double) s.velocity < anchorVelocity)
-                continue;
+            if (hash01 (b, 12) < 0.15)
+                addSpot (b - 0.25);
 
-            const double snapped = std::round (s.beat * 4.0) / 4.0;
-            const double base = std::abs (s.beat - snapped) <= 0.12 ? snapped : s.beat;
-            addSpot (base - 0.25);
-
-            if (amount >= 1)
-                addSpot (base + 0.25);
+            if (hash01 (b, 13) < 0.15)
+                addSpot (b + 0.25);
         }
     }
 
@@ -1151,7 +1184,11 @@ bool addGhosts (const juce::File& sourceMidi, const TakeInfo& info, int amount, 
 
     for (const double beat : spots)
     {
-        const double seconds = info.midiStart + tempo.secondsAt (beat * tempo.ppqn);
+        // 세기: 백비트 가운데 세기의 19~38%(데이터 분포), 타이밍: ±0.02박쯤, 살짝 뒤로 끌리는 쪽 — 자리마다 다르다
+        const int velocity = juce::jlimit (10, 40, juce::roundToInt (anchorMedian * (0.19 + 0.19 * hash01 (beat, 2))));
+        const double playedBeat = juce::jmax (0.0, beat + 0.005 + (hash01 (beat, 3) * 2.0 - 1.0) * 0.02);
+
+        const double seconds = info.midiStart + tempo.secondsAt (playedBeat * tempo.ppqn);
         const auto sample = (juce::int64) std::llround (seconds * rate);
 
         if (sample < 0 || sample >= info.lengthSamples)
@@ -1162,7 +1199,7 @@ bool addGhosts (const juce::File& sourceMidi, const TakeInfo& info, int amount, 
         on.size = 3;
         on.data[0] = (juce::uint8) (0x90 | channel);
         on.data[1] = (juce::uint8) snare;
-        on.data[2] = (juce::uint8) ghostVelocity;
+        on.data[2] = (juce::uint8) velocity;
 
         RawEvent off = on;
         off.sample = juce::jmin<juce::int64> (info.lengthSamples - 1, sample + (juce::int64) std::llround (0.06 * rate));
